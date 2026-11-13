@@ -29,6 +29,14 @@ Utilities
 - *deduplicate* removes subtitles with duplicate content. If you have subtitles
   which mistakenly repeat the same content in different subs at roughly the
   same time, you can run this tool to remove them.
+- *diff* compares two SRT revisions along the time axis and reports, for each
+  interval, whether the text is equal, different, or only present on one side.
+  Time is measured in seconds rather than subtitle entries, so moving sentence
+  boundaries or repeating one sentence across several entries does not count as
+  a text change. Each interval also shows how many subtitles are active at once
+  on each side, making changes in the number of simultaneous speakers visible.
+  Swapping the two input files preserves the total differing duration and only
+  reverses the direction of one-sided intervals.
 - *fixed-timeshift* does fixed time correction. For example, if you have a
   movie that is consistently out of sync by two seconds, you can run this tool
   to shift the entire subtitle two seconds ahead or behind.

@@ -1,0 +1,346 @@
+#!/usr/bin/env python
+
+"""Compare two SRT files along the time axis.
+
+Differences are measured in seconds of timeline rather than in subtitle
+entries. Moving sentence boundaries, wrapping lines differently, or showing
+the same sentence more than once therefore does not count as a text change.
+Each emitted interval says whether the text is equal, different, or only
+present on one side, together with how many subtitles are simultaneously
+active on each side (the number of simultaneous speakers).
+"""
+
+import datetime
+import json
+import logging
+from collections import namedtuple
+
+import srt
+import srt_tools.utils
+
+log = logging.getLogger(__name__)
+
+DiffInterval = namedtuple(
+    "DiffInterval",
+    "start end kind count_a count_b texts_a texts_b",
+)
+
+EQUAL = "equal"
+DIFFERENT = "different"
+ONLY_A = "only_a"
+ONLY_B = "only_b"
+
+KINDS = (EQUAL, DIFFERENT, ONLY_A, ONLY_B)
+DIFF_KINDS = (DIFFERENT, ONLY_A, ONLY_B)
+
+ZERO = datetime.timedelta(0)
+
+
+def make_normalizer(case_sensitive):
+    """Build the text normaliser used before any comparison.
+
+    Whitespace runs (including SRT line wraps) are collapsed, and text is
+    case folded unless case-sensitive comparison was requested.
+    """
+
+    def normalize(content):
+        text = content if case_sensitive else content.casefold()
+        return " ".join(text.split())
+
+    return normalize
+
+
+def _signature(distinct_texts):
+    """Return (full texts, word tokens, characters) signatures.
+
+    The token and character fallbacks let a sentence split across several
+    subtitles compare equal to the same sentence kept in one subtitle.
+    """
+    tokens = set()
+    characters = set()
+    for text in distinct_texts:
+        tokens.update(text.split())
+        characters.update(char for char in text if not char.isspace())
+    return frozenset(distinct_texts), frozenset(tokens), frozenset(characters)
+
+
+def texts_equal(texts_a, texts_b):
+    """Compare two sets of normalised subtitle texts.
+
+    Equal when the distinct full texts match, or alternatively when the word
+    tokens (or, for unsegmented scripts, the characters) match, so that
+    re-segmentation and repeated displays do not look like text edits.
+    """
+    full_a, tokens_a, chars_a = _signature(texts_a)
+    full_b, tokens_b, chars_b = _signature(texts_b)
+
+    if full_a == full_b:
+        return True
+    if tokens_a and tokens_a == tokens_b:
+        return True
+    return bool(chars_a) and chars_a == chars_b
+
+
+def _connected_components(subs_a, subs_b):
+    """Group all subtitles that overlap transitively in time."""
+    entries = [(sub.start, sub.end, 0, sub) for sub in subs_a]
+    entries += [(sub.start, sub.end, 1, sub) for sub in subs_b]
+    entries = [entry for entry in entries if entry[1] > entry[0]]
+    entries.sort(key=lambda entry: (entry[0], entry[1]))
+
+    components = []
+    current = None
+    for start, end, side, sub in entries:
+        if current is None or start >= current["end"]:
+            current = {"start": start, "end": end, "entries": []}
+            components.append(current)
+        if end > current["end"]:
+            current["end"] = end
+        current["entries"].append((side, sub))
+    return components
+
+
+def _active(entries, side, start, end):
+    return [
+        sub
+        for entry_side, sub in entries
+        if entry_side == side and sub.start <= start and sub.end >= end
+    ]
+
+
+def _distinct_texts(subs, normalize):
+    return frozenset(
+        text for text in (normalize(sub.content) for sub in subs) if text
+    )
+
+
+def _compare_component(component, normalize):
+    entries = component["entries"]
+    comp_equal = texts_equal(
+        _distinct_texts(
+            [sub for side, sub in entries if side == 0], normalize
+        ),
+        _distinct_texts(
+            [sub for side, sub in entries if side == 1], normalize
+        ),
+    )
+
+    boundaries = sorted(
+        {boundary for _, sub in entries for boundary in (sub.start, sub.end)}
+    )
+
+    intervals = []
+    for start, end in zip(boundaries, boundaries[1:]):
+        if end <= start:
+            continue
+
+        active_a = _active(entries, 0, start, end)
+        active_b = _active(entries, 1, start, end)
+        texts_a = _distinct_texts(active_a, normalize)
+        texts_b = _distinct_texts(active_b, normalize)
+
+        if active_a and active_b:
+            kind = EQUAL if comp_equal or texts_a == texts_b else DIFFERENT
+        elif active_a:
+            kind = ONLY_A
+        else:
+            kind = ONLY_B
+
+        intervals.append(
+            DiffInterval(
+                start, end, kind, len(active_a), len(active_b), texts_a, texts_b
+            )
+        )
+    return intervals
+
+
+def _merge_adjacent(intervals):
+    """Join neighbouring intervals with an identical measured state."""
+    merged = []
+    for interval in intervals:
+        if merged:
+            previous = merged[-1]
+            if (
+                previous.end == interval.start
+                and previous.kind == interval.kind
+                and previous.count_a == interval.count_a
+                and previous.count_b == interval.count_b
+                and previous.texts_a == interval.texts_a
+                and previous.texts_b == interval.texts_b
+            ):
+                merged[-1] = previous._replace(end=interval.end)
+                continue
+        merged.append(interval)
+    return merged
+
+
+def compare_subtitles(subs_a, subs_b, normalize=None):
+    """Compare two subtitle iterables and return merged DiffIntervals."""
+    if normalize is None:
+        normalize = make_normalizer(case_sensitive=False)
+
+    intervals = []
+    for component in _connected_components(list(subs_a), list(subs_b)):
+        intervals.extend(_compare_component(component, normalize))
+    return _merge_adjacent(intervals)
+
+
+def summarize(intervals):
+    """Total duration per kind, including an aggregate total_different."""
+    totals = {kind: ZERO for kind in KINDS}
+    for interval in intervals:
+        totals[interval.kind] += interval.end - interval.start
+    totals["total_different"] = sum(
+        (totals[kind] for kind in DIFF_KINDS), ZERO
+    )
+    return totals
+
+
+def _timestamp(delta):
+    return srt.timedelta_to_srt_timestamp(delta)
+
+
+def _format_texts(texts):
+    return " / ".join(sorted(texts))
+
+
+def format_text_report(intervals, totals, label_a, label_b):
+    """Render the plain-text report printed by the CLI."""
+    lines = [
+        "srt diff report",
+        "A: {}".format(label_a),
+        "B: {}".format(label_b),
+        "",
+        "start          end            kind       duration   spk A/B  A text | B text",
+    ]
+
+    for interval in intervals:
+        lines.append(
+            "{start}  {end}  {kind:<9} {duration:>7.3f}s  "
+            "{na:>2}/{nb:<2}   {a} | {b}".format(
+                start=_timestamp(interval.start),
+                end=_timestamp(interval.end),
+                kind=interval.kind,
+                duration=(interval.end - interval.start).total_seconds(),
+                na=interval.count_a,
+                nb=interval.count_b,
+                a=_format_texts(interval.texts_a),
+                b=_format_texts(interval.texts_b),
+            )
+        )
+
+    lines.extend(
+        [
+            "",
+            "Summary (seconds):",
+            "  equal:       {:7.3f}".format(totals[EQUAL].total_seconds()),
+            "  different:   {:7.3f}".format(totals[DIFFERENT].total_seconds()),
+            "  only A:      {:7.3f}".format(totals[ONLY_A].total_seconds()),
+            "  only B:      {:7.3f}".format(totals[ONLY_B].total_seconds()),
+            "  total diff:  {:7.3f}".format(
+                totals["total_different"].total_seconds()
+            ),
+            "  covered:     {:7.3f}".format(
+                sum((totals[kind] for kind in KINDS), ZERO).total_seconds()
+            ),
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def interval_to_dict(interval):
+    """Render one interval as a JSON-serialisable dict."""
+    return {
+        "start": interval.start.total_seconds(),
+        "end": interval.end.total_seconds(),
+        "start_ts": _timestamp(interval.start),
+        "end_ts": _timestamp(interval.end),
+        "kind": interval.kind,
+        "speakers_a": interval.count_a,
+        "speakers_b": interval.count_b,
+        "texts_a": sorted(interval.texts_a),
+        "texts_b": sorted(interval.texts_b),
+    }
+
+
+def format_json_report(intervals, totals, label_a, label_b):
+    """Render the machine-readable report printed by the CLI."""
+    report = {
+        "file_a": label_a,
+        "file_b": label_b,
+        "intervals": [interval_to_dict(interval) for interval in intervals],
+        "summary_seconds": {
+            kind: totals[kind].total_seconds() for kind in KINDS
+        },
+    }
+    report["summary_seconds"]["total_different"] = totals[
+        "total_different"
+    ].total_seconds()
+    report["summary_seconds"]["covered"] = sum(
+        (totals[kind] for kind in KINDS), ZERO
+    ).total_seconds()
+    return json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+
+
+def _stream_label(stream):
+    if stream == srt_tools.utils.STDIN_BYTESTREAM or stream == "-":
+        return "<stdin>"
+    return stream
+
+
+def parse_args():
+    examples = {
+        "Compare two revisions and print a time-based report":
+            "srt diff -i old.srt -i new.srt",
+        "Emit machine-readable JSON instead of plain text":
+            "srt diff -i old.srt -i new.srt --json",
+    }
+    parser = srt_tools.utils.basic_parser(
+        description=__doc__, examples=examples, multi_input=True
+    )
+    parser.add_argument(
+        "--case-sensitive",
+        action="store_true",
+        help="compare text case-sensitively (whitespace is still normalised)",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="write the report as JSON instead of plain text",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    logging.basicConfig(level=args.log_level)
+
+    labels = [_stream_label(stream) for stream in args.input]
+    srt_tools.utils.set_basic_args(args)
+
+    if len(args.input) != 2:
+        raise SystemExit(
+            "srt diff needs exactly two --input files, got {}".format(
+                len(args.input)
+            )
+        )
+
+    normalize = make_normalizer(args.case_sensitive)
+    intervals = compare_subtitles(
+        list(args.input[0]), list(args.input[1]), normalize
+    )
+    totals = summarize(intervals)
+
+    if args.json:
+        output = format_json_report(intervals, totals, labels[0], labels[1])
+    else:
+        output = format_text_report(intervals, totals, labels[0], labels[1])
+
+    try:
+        args.output.write(output)
+    except (UnicodeEncodeError, TypeError):  # Python 2 fallback
+        args.output.write(output.encode(args.encoding))
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()

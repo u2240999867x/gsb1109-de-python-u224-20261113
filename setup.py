@@ -20,6 +20,7 @@ setup(
     scripts=[
         "srt_tools/srt",
         "srt_tools/srt-deduplicate",
+        "srt_tools/srt-diff",
         "srt_tools/srt-normalise",
         "srt_tools/srt-fixed-timeshift",
         "srt_tools/srt-linear-timeshift",
