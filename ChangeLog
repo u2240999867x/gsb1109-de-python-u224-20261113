@@ -4,6 +4,14 @@ ChangeLog
 2.10.1 (unreleased)
 -------------------
 
+*New:*
+
+    * Add ``semantic_version.reconciliation``: reconcile re-published
+      (same-name, re-built) releases against scoped correction notices,
+      reporting which source snapshots to re-fetch, which to reuse, and which
+      digest-less legacy batches to confirm. Re-importing a notice is
+      idempotent and never schedules another round.
+
 *Minor:*
 
     * `112 <https://github.com/rbarrois/python-semanticversion/issues/112>`_:

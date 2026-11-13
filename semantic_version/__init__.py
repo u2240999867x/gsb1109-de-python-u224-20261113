@@ -4,6 +4,16 @@
 
 
 from .base import compare, match, validate, SimpleSpec, NpmSpec, Spec, SpecItem, Version
+from .reconciliation import (
+    KNOWN_FIELDS,
+    ArtifactDigest,
+    Build,
+    CorrectionNotice,
+    ReconciliationReport,
+    Reconciler,
+    SourceRecord,
+    reconcile,
+)
 
 
 __author__ = "Raphaël Barrois <raphael.barrois+semver@polytechnique.org>"

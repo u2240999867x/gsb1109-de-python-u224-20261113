@@ -726,5 +726,123 @@ Each of those ``Spec`` classes provides a shared set of methods to work with ver
 
 
 
+Reconciling re-published releases
+---------------------------------
+
+A version name can be re-published with a rebuilt artifact: the name stays the
+same while the content changes.  Different sources then disagree, some rolling
+back to the original build and others keeping the new one.  The
+:mod:`semantic_version.reconciliation` helpers reconcile daily
+:class:`SourceRecord` snapshots against scoped :class:`CorrectionNotice`
+objects.
+
+A notice only affects a bounded :class:`SimpleSpec` version range and a set of
+``fields``; every record outside that range or not carrying the corrected
+fields is left untouched.  Records are classified into snapshots that must be
+re-fetched, snapshots that can be reused, and legacy batches that require
+manual confirmation.
+
+.. class:: Build(label, digest)
+
+    A single build published under a version name, identified by its content
+    ``digest``.
+
+.. class:: ArtifactDigest(build_label[, digest=None])
+
+    Summary of a collected artifact.  A ``digest`` of :data:`None` marks a
+    legacy batch that only recorded the version name.
+
+    .. method:: has_summary()
+
+        Whether a content digest was recorded.
+
+.. class:: SourceRecord(source, date, version, artifact)
+
+    One daily collection snapshot.  ``version`` accepts a :class:`Version` or
+    a version string; ``artifact`` accepts an :class:`ArtifactDigest` or a
+    ``(build_label, digest)`` tuple.
+
+.. class:: CorrectionNotice(notice_id, version_range, fields, expected_build, builds[, affected_versions=None])
+
+    A scoped correction.  ``version_range`` is a :class:`SimpleSpec`
+    expression, ``fields`` is an iterable from :data:`KNOWN_FIELDS`, and
+    ``builds`` lists every known :class:`Build`.  ``notice_id`` makes
+    re-importing the same notice idempotent.
+
+    .. method:: builds_clean_differently()
+
+        Whether the known builds have distinct digests, i.e. whether a batch
+        without a digest could be cleaned differently depending on the build.
+
+.. class:: Reconciler()
+
+    Accumulates notices and produces a report.
+
+    .. method:: add_notice(notice)
+
+        Register a notice; return :data:`False` (without scheduling anything)
+        when its ``notice_id`` was already imported.
+
+    .. method:: reconcile(records)
+
+        Return a :class:`ReconciliationReport` classifying every record.
+
+.. class:: ReconciliationReport()
+
+    .. attribute:: refetch_records
+
+        Snapshots whose observed digest differs from the expected build and
+        therefore must be re-fetched.
+
+    .. attribute:: reusable_records
+
+        Snapshots already carrying the expected build, or legacy batches whose
+        competing builds clean identically.
+
+    .. attribute:: unconfirmed_records
+
+        Legacy batches without a digest (or with an unknown build label) that
+        must be confirmed manually because the builds would clean
+        differently.
+
+    .. method:: refetch_dates([source])
+
+        Sorted dates requiring a re-fetch, optionally restricted to one source.
+
+.. function:: reconcile(records, notices)
+
+    Convenience wrapper that imports ``notices`` once and reconciles
+    ``records`` in a single call.
+
+A typical flow:
+
+.. code-block:: pycon
+
+    >>> original = Build('build.1', 'sha256-aaa')
+    >>> rebuilt = Build('build.2', 'sha256-bbb')
+    >>> notice = CorrectionNotice(
+    ...     'N-1', '>=2.4.0,<2.5.0', ('build',), rebuilt,
+    ...     (original, rebuilt), affected_versions=('2.4.1',))
+    >>> records = [
+    ...     SourceRecord('alpha', '2026-11-01', '2.4.1',
+    ...                  ArtifactDigest('build.2', 'sha256-bbb')),
+    ...     SourceRecord('beta', '2026-11-01', '2.4.1',
+    ...                  ArtifactDigest('build.1', 'sha256-aaa')),
+    ...     SourceRecord('beta', '2026-10-30', '2.4.1', ArtifactDigest(None)),
+    ... ]
+    >>> reconciler = Reconciler()
+    >>> reconciler.add_notice(notice)
+    True
+    >>> reconciler.add_notice(notice)  # re-import schedules nothing
+    False
+    >>> report = reconciler.reconcile(records)
+    >>> report.refetch_dates('beta')
+    ['2026-11-01']
+    >>> [r.source for r in report.reusable_records]
+    ['alpha']
+    >>> [r.source for r in report.unconfirmed_records]
+    ['beta']
+
+
 .. _SemVer: http://semver.org/
 .. _`compatible release clauses`: https://www.python.org/dev/peps/pep-0440/#compatible-release
