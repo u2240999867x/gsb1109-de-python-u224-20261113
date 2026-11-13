@@ -518,6 +518,568 @@ def read_data_section_iterative_normal_engine(
         yield curve_arr
 
 
+class WrappedDataRepair(object):
+    """Record of repairs made while reading a wrapped (``WRAP=YES``) data section.
+
+    A wrapped depth step occupies several physical lines. If a cell is dropped
+    from one depth step, every following column is shifted until a depth line
+    is encountered which can be recognised as a valid re-alignment point.
+    This object records every depth step affected, the raw lines it occupies,
+    and how it was handled.
+
+    Attributes:
+        activated (bool): True if at least one depth step needed repair.
+        frames (list of dict): one entry per affected depth step, with keys:
+
+            * ``frame_index`` (int): zero-based position of the depth step
+            * ``depth``: index value used for the depth step (NaN if it could
+              not be determined)
+            * ``first_line`` / ``last_line`` (int): 1-based range of raw file
+              lines the depth step's tokens were read from
+            * ``kind`` (str): one of ``missing_depth_anchor`` (the depth line
+              was absent but all values were recovered),
+              ``padded_missing_cells`` (one or more cells were missing; the
+              depth step is retained as null values),
+              ``inserted_gap`` (a depth step with no usable tokens, inserted
+              to keep the depth sequence intact), or
+              ``short_final_frame`` (the file ended mid-depth-step)
+            * ``missing_cells`` (int): number of cells that could not be
+              assigned to a column
+
+    """
+
+    def __init__(self):
+        self.activated = False
+        self.frames = []
+
+    @property
+    def raw_line_range(self):
+        """tuple: the first and last raw file line involved in any repair."""
+        if not self.frames:
+            return None
+        return (
+            min(frame["first_line"] for frame in self.frames),
+            max(frame["last_line"] for frame in self.frames),
+        )
+
+    def add_frame(
+        self, frame_index, depth, first_line, last_line, kind, missing_cells=0
+    ):
+        self.activated = True
+        self.frames.append(
+            {
+                "frame_index": frame_index,
+                "depth": depth,
+                "first_line": first_line,
+                "last_line": last_line,
+                "kind": kind,
+                "missing_cells": missing_cells,
+            }
+        )
+
+    def __len__(self):
+        return len(self.frames)
+
+    def __repr__(self):
+        if not self.activated:
+            return "WrappedDataRepair(no repairs needed)"
+        lines = [
+            "WrappedDataRepair: {} depth step(s) affected, raw lines {}-{}".format(
+                len(self.frames), self.raw_line_range[0], self.raw_line_range[1]
+            )
+        ]
+        for frame in self.frames:
+            lines.append(
+                "  frame {frame_index} (depth {depth}): {kind} on raw lines "
+                "{first_line}-{last_line}".format(**frame)
+            )
+        return "\n".join(lines)
+
+
+def _to_float(value):
+    """Convert a header value to a finite np.float64, or return None."""
+    if value is None:
+        return None
+    try:
+        result = np.float64(value)
+    except (ValueError, TypeError):
+        return None
+    return result if np.isfinite(result) else None
+
+
+def _convert_token(item):
+    """Convert one token to np.float64 if possible, otherwise leave as str."""
+    try:
+        return np.float64(item)
+    except ValueError:
+        return item
+
+
+def _tokenize_wrapped_data(
+    file_obj, line_nos, regexp_subs, ignore_data_comments, line_splitter
+):
+    """Flatten a wrapped data section into a tagged stream of tokens.
+
+    Returns:
+        tokens (list of (value, line_no) tuples): every data token in file
+            order, tagged with its zero-based source line number (the rest
+            of the reader adds one when quoting a physical line).
+        anchor_positions (dict): maps the token stream position of each line
+            that held a single numeric token to its (value, line_no). Such a
+            line is a depth anchor in a properly formatted wrapped section,
+            although a continuation line carrying one final value looks the
+            same; candidates are validated against the depth sequence later.
+
+    """
+    title = file_obj.readline()
+    tokens = []
+    anchor_positions = {}
+    for line_no, line in enumerate(file_obj, start=line_nos[0] + 1):
+        line = line.strip("\n").strip()
+        if line.startswith(ignore_data_comments):
+            continue
+        for pattern, sub_str in regexp_subs:
+            line = re.sub(pattern, sub_str, line)
+        line = line.replace(chr(26), "")
+        if len(line) == 0:
+            continue
+        items = [_convert_token("".join(t)) for t in line_splitter(line)]
+        start_position = len(tokens)
+        tokens.extend((item, line_no) for item in items)
+        if len(items) == 1 and isinstance(items[0], np.float64):
+            anchor_positions[start_position] = (items[0], line_no)
+        if line_no == line_nos[1]:
+            break
+    return tokens, anchor_positions
+
+
+def read_wrapped_data_section(
+    file_obj,
+    line_nos,
+    regexp_subs,
+    value_null_subs,
+    ignore_data_comments,
+    n_columns,
+    dtypes,
+    line_splitter,
+    step=None,
+    step_tolerance=None,
+    repair=False,
+    repair_report=None,
+):
+    """Read a wrapped (``WRAP=YES``) data section, optionally repairing it.
+
+    Depth steps are rebuilt as frames using the declared number of columns
+    (``n_columns``), the depth direction and step from the header, a tolerance
+    for matching depth anchors, and the depth anchor lines themselves as
+    re-alignment points.
+
+    Arguments:
+        file_obj: file-like object open at the start of the data section.
+        line_nos (tuple): first and last line number of the section.
+        regexp_subs (list): regex substitutions applied to each line.
+        value_null_subs (list): numerical values replaced by numpy.nan.
+        ignore_data_comments (str): comment prefix for data lines.
+        n_columns (int): declared number of columns (from the ~C section).
+        dtypes (list, "auto", False): per-column data type specification.
+        line_splitter (function): line tokenizer for the configured delimiter.
+        step (float or None): the declared STEP value; its sign gives the
+            depth direction. If None, the step is inferred from the first two
+            depth anchors.
+        step_tolerance (float or None): maximum absolute difference accepted
+            when matching a depth anchor against the expected depth sequence.
+            If None, a tolerance of one thousandth of the step is used.
+        repair (bool): if False, any frame that cannot be assembled raises
+            :class:`lasio.exceptions.WrappedDataError`. If True, the damaged
+            depth step is retained as null values and parsing re-aligns at the
+            next valid depth anchor.
+        repair_report (WrappedDataRepair or None): object which, if supplied,
+            is filled with a record of every repair made.
+
+    Returns:
+        generator yielding a 1D ndarray per column, in the same manner as
+        :func:`read_data_section_iterative_normal_engine`.
+
+    """
+    logger.debug(
+        "Reading wrapped data section: {} columns, repair={}".format(
+            n_columns, repair
+        )
+    )
+
+    if repair_report is None:
+        repair_report = WrappedDataRepair()
+
+    tokens, anchor_positions = _tokenize_wrapped_data(
+        file_obj, line_nos, regexp_subs, ignore_data_comments, line_splitter
+    )
+
+    if len(tokens) == 0:
+        logger.warning("Data section is empty therefore setting n_columns to zero")
+        n_columns = 0
+        array = np.empty((0, 0))
+    elif n_columns <= 0:
+        raise exceptions.WrappedDataError(
+            "Cannot read a wrapped data section without a declared column count"
+        )
+    else:
+        flat_array = np.array([value for value, _ in tokens], dtype=object)
+        # Healthy wrapped sections flatten to an exact multiple of the
+        # declared number of columns: keep the historical reshape behaviour
+        # for them so parsing is unchanged. A count mismatch (a dropped cell
+        # or depth line), or depth anchors which no longer follow the STEP
+        # sequence (a whole depth step removed), triggers the frame-aware
+        # repair machinery instead.
+        if flat_array.size % n_columns == 0 and _anchors_match_sequence(
+            anchor_positions, n_columns, _to_float(step), _to_float(step_tolerance)
+        ):
+            array = np.reshape(flat_array, (-1, n_columns))
+        else:
+            array = _assemble_wrapped_frames(
+                tokens=tokens,
+                anchor_positions=anchor_positions,
+                n_columns=n_columns,
+                declared_step=_to_float(step),
+                step_tolerance=_to_float(step_tolerance),
+                repair=repair,
+                repair_report=repair_report,
+            )
+
+    for value in value_null_subs:
+        array[array == value] = np.nan
+
+    if len(array.shape) < 2:
+        arr_n_cols = 0
+    else:
+        arr_n_cols = array.shape[1]
+
+    if dtypes == "auto":
+        if len(array) > 0:
+            dtypes = identify_dtypes_from_data(array[0, :])
+        else:
+            dtypes = []
+    elif dtypes is False:
+        dtypes = [str for n in range(arr_n_cols)]
+
+    for col_idx in range(arr_n_cols):
+        curve_arr = array[:, col_idx]
+        curve_dtype = dtypes[col_idx]
+        try:
+            curve_arr = curve_arr.astype(curve_dtype, copy=False)
+        except ValueError:
+            logger.warning(
+                "Could not convert curve #{} to {}".format(col_idx, curve_dtype)
+            )
+        yield curve_arr
+
+
+def _anchors_match_sequence(
+    anchor_positions, n_columns, declared_step, step_tolerance
+):
+    """Check depth anchors on frame boundaries follow one-step increments.
+
+    A whole depth step can be deleted without changing the divisibility of
+    the token count; in that case two consecutive depth anchors jump by two
+    (or more) steps. Pairwise differences are compared rather than an
+    arithmetic sequence, so ordinary depth drift does not trigger a false
+    alarm. Returns False as soon as such a jump is detected.
+    """
+    boundary_anchors = sorted(
+        position
+        for position in anchor_positions
+        if position % n_columns == 0
+    )
+    if len(boundary_anchors) < 2:
+        return True
+    depths = [anchor_positions[position][0] for position in boundary_anchors]
+    step = declared_step
+    if step is None or step == 0:
+        first_difference = depths[1] - depths[0]
+        step = first_difference if first_difference != 0 else None
+    if step is None:
+        return True
+    if step_tolerance is None:
+        step_tolerance = abs(step) * 1e-3
+    for previous, current in zip(depths, depths[1:]):
+        if abs((current - previous) - step) > step_tolerance:
+            return False
+    return True
+
+
+def _resolve_step(declared_step, first_depth, second_depth):
+    """Return a finite, non-zero step or None."""
+    if declared_step is not None and declared_step != 0:
+        return np.float64(declared_step)
+    if first_depth is not None and second_depth is not None:
+        inferred = second_depth - first_depth
+        if inferred != 0:
+            return inferred
+    return None
+
+
+def _depth_matches(observed, expected, tolerance):
+    if expected is None or tolerance is None:
+        return True
+    try:
+        return abs(observed - expected) <= tolerance
+    except TypeError:
+        return False
+
+
+def _assemble_wrapped_frames(
+    tokens,
+    anchor_positions,
+    n_columns,
+    declared_step,
+    step_tolerance,
+    repair,
+    repair_report,
+):
+    """Rebuild depth-step frames from the tagged token stream."""
+    n_values = n_columns - 1
+    frames = []
+
+    position = 0
+    frame_index = 0
+    first_depth = None
+    step = declared_step
+    tolerance = step_tolerance
+
+    def expected_depth(index):
+        if first_depth is None or step is None:
+            return None
+        return first_depth + index * step
+
+    def record_null_frame(depth, line_span, kind, missing_cells=0):
+        if line_span is not None:
+            # Internal line numbers are zero-based; the report uses physical
+            # (1-based) file lines.
+            first_line, last_line = line_span[0] + 1, line_span[1] + 1
+        else:
+            first_line, last_line = None, None
+        frames.append(
+            [depth if depth is not None else np.nan] + [np.nan] * n_values
+        )
+        repair_report.add_frame(
+            frame_index=len(frames) - 1,
+            depth=frames[-1][0],
+            first_line=first_line,
+            last_line=last_line,
+            kind=kind,
+            missing_cells=missing_cells,
+        )
+
+    while position < len(tokens):
+        expected = expected_depth(frame_index)
+
+        anchor = anchor_positions.get(position)
+        anchor_is_valid = anchor is not None and (
+            first_depth is None or _depth_matches(anchor[0], expected, tolerance)
+        )
+        if anchor_is_valid:
+            depth = anchor[0]
+            position += 1
+            if first_depth is None:
+                first_depth = depth
+                second_anchor = next(
+                    (
+                        candidate[0]
+                        for candidate_position, candidate in anchor_positions.items()
+                        if candidate_position > position
+                    ),
+                    None,
+                )
+                step = _resolve_step(step, first_depth, second_anchor)
+                if step is not None and tolerance is None:
+                    tolerance = abs(step) * 1e-3
+        else:
+            # No valid depth anchor line at the start of this depth step.
+            depth = expected
+
+        values = []
+        value_lines = []
+        while len(values) < n_values and position < len(tokens):
+            # A single-token line is only a frame boundary when its value
+            # matches the next frame's expected depth; otherwise it is an
+            # ordinary value token (e.g. the final value of a frame).
+            if position in anchor_positions and _depth_matches(
+                anchor_positions[position][0],
+                expected_depth(frame_index + 1),
+                tolerance,
+            ):
+                break
+            value, line_no = tokens[position]
+            values.append(value)
+            value_lines.append(line_no)
+            position += 1
+
+        if len(values) == n_values:
+            if not anchor_is_valid:
+                if not repair:
+                    raise exceptions.WrappedDataError(
+                        "Wrapped data section depth step {} (raw line {}) has no "
+                        "depth anchor line. Read with repair_wrapped_data=True to "
+                        "rebuild it from the STEP-derived depth sequence.".format(
+                            frame_index, min(value_lines) + 1
+                        )
+                    )
+                # Corroborate the frame: the next depth anchor must land
+                # exactly one frame on. Otherwise the anchors themselves are
+                # unrecognisable (e.g. tolerance too tight) and accepting the
+                # frame would be a guess.
+                corroboration = _find_realignment(
+                    anchor_positions=anchor_positions,
+                    from_position=position,
+                    first_depth=first_depth,
+                    step=step,
+                    tolerance=tolerance,
+                    min_frame_index=frame_index + 1,
+                )
+                if (
+                    corroboration is None
+                    or corroboration[2] != frame_index + 1
+                ):
+                    raise exceptions.WrappedDataError(
+                        "Depth step {} (raw line {}) has no depth anchor and "
+                        "the next anchor cannot be matched to the expected "
+                        "depth sequence within the step tolerance; no "
+                        "alignment was guessed.".format(
+                            frame_index, min(value_lines) + 1
+                        )
+                    )
+            frames.append(
+                [depth if depth is not None else np.nan] + values
+            )
+            if not anchor_is_valid:
+                repair_report.add_frame(
+                    frame_index=len(frames) - 1,
+                    depth=frames[-1][0],
+                    first_line=min(value_lines) + 1,
+                    last_line=max(value_lines) + 1,
+                    kind="missing_depth_anchor",
+                )
+            frame_index += 1
+            continue
+
+        # The frame is short: at least one cell is missing.
+        if value_lines:
+            problem_line = min(value_lines) + 1
+        elif position < len(tokens):
+            problem_line = tokens[position][1] + 1
+        else:
+            # The section ended immediately after a depth anchor.
+            problem_line = anchor[1] + 1 if anchor is not None else None
+        if not repair:
+            raise exceptions.WrappedDataError(
+                "Wrapped data section is misaligned at depth step {} "
+                "(raw line {}): expected {} value(s) but found {}. Read with "
+                "repair_wrapped_data=True to retain the damaged depth step "
+                "and re-align at the next valid depth anchor.".format(
+                    frame_index, problem_line, n_values, len(values)
+                )
+            )
+
+        realignment = _find_realignment(
+            anchor_positions=anchor_positions,
+            from_position=position,
+            first_depth=first_depth,
+            step=step,
+            tolerance=tolerance,
+            min_frame_index=frame_index,
+        )
+
+        if realignment is None:
+            if position >= len(tokens):
+                if value_lines:
+                    span = (min(value_lines), max(value_lines))
+                elif anchor is not None:
+                    span = (anchor[1], anchor[1])
+                else:
+                    span = None
+                record_null_frame(
+                    expected,
+                    span,
+                    "short_final_frame",
+                    missing_cells=n_values - len(values),
+                )
+                frame_index += 1
+                break
+            raise exceptions.WrappedDataError(
+                "Wrapped data section is misaligned from raw line {} onwards "
+                "and no depth anchor re-alignment point could be found within "
+                "the step tolerance.".format(problem_line)
+            )
+
+        anchor_position, anchor_line_no, target_frame_index = realignment
+
+        # Raw lines truly involved: the surviving tokens and every line
+        # consumed before the healthy re-alignment anchor line. A fully
+        # deleted frame leaves no tokens, so point at the anchor line itself.
+        affected_lines = value_lines + [
+            line_no for _, line_no in tokens[position:anchor_position]
+        ]
+        if affected_lines:
+            line_span = (min(affected_lines), max(affected_lines))
+        else:
+            line_span = (anchor_line_no, anchor_line_no)
+
+        # No surviving tokens means the whole depth step was deleted rather
+        # than merely having some cells dropped.
+        kind = "padded_missing_cells" if values else "inserted_gap"
+        record_null_frame(
+            expected,
+            line_span,
+            kind,
+            missing_cells=n_values - len(values),
+        )
+        frame_index += 1
+
+        # Depth steps skipped entirely between the damage and the re-alignment.
+        while frame_index < target_frame_index:
+            record_null_frame(
+                expected_depth(frame_index),
+                None,
+                "inserted_gap",
+                missing_cells=n_values,
+            )
+            frame_index += 1
+
+        position = anchor_position
+
+    if not frames:
+        return np.empty((0, n_columns))
+    return np.array(frames, dtype=object)
+
+
+def _find_realignment(
+    anchor_positions, from_position, first_depth, step, tolerance, min_frame_index
+):
+    """Find the first depth anchor matching one expected depth sequence point.
+
+    Returns a (token_position, line_no, frame_index) tuple or None. If an
+    anchor matches more than one expected frame index within the tolerance
+    the alignment is ambiguous, so None is returned rather than guessing.
+    """
+    if first_depth is None or step is None or tolerance is None:
+        return None
+    for token_position in sorted(anchor_positions):
+        if token_position < from_position:
+            continue
+        depth, line_no = anchor_positions[token_position]
+        exact_index = (depth - first_depth) / step
+        candidate_index = int(round(float(exact_index)))
+        if candidate_index < min_frame_index:
+            continue
+        matches = [
+            index
+            for index in (candidate_index - 1, candidate_index, candidate_index + 1)
+            if abs(depth - (first_depth + index * step)) <= tolerance
+        ]
+        if len(matches) == 1 and matches[0] == candidate_index:
+            return token_position, line_no, candidate_index
+    return None
+
+
 def identify_dtypes_from_data(row):
     """Identify which columns should be 'str' and which 'float'.
 

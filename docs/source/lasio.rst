@@ -12,6 +12,8 @@ Reading LAS files
 .. automethod:: lasio.LASFile.match_raw_section
 .. autofunction:: lasio.reader.read_data_section_iterative_normal_engine
 .. autofunction:: lasio.reader.read_data_section_iterative_numpy_engine
+.. autofunction:: lasio.reader.read_wrapped_data_section
+.. autoclass:: lasio.reader.WrappedDataRepair
 .. autofunction:: lasio.reader.get_substitutions
 .. autoclass:: lasio.reader.SectionParser
 .. autofunction:: lasio.reader.read_header_line
@@ -83,6 +85,7 @@ Defaults
 Custom exceptions
 -----------------
 .. autoclass:: lasio.exceptions.LASDataError
+.. autoclass:: lasio.exceptions.WrappedDataError
 .. autoclass:: lasio.exceptions.LASHeaderError
 .. autoclass:: lasio.exceptions.LASUnknownUnitError
 

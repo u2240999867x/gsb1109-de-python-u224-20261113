@@ -79,6 +79,16 @@ class LASFile(object):
             (this is handled by :func:`lasio.reader.open_with_codecs`)
         autodetect_encoding_chars (int/None): number of chars to read from LAS
             file for auto-detection of encoding.
+        repair_wrapped_data (bool): only applies to wrapped files
+            (``WRAP=YES``). If a depth step is missing one or more cells, by
+            default the whole read fails. When True, the damaged depth step is
+            retained as null values and parsing re-aligns at the next depth
+            anchor whose value matches the depth sequence derived from STEP.
+            Details are stored on ``self.wrapped_data_repairs``.
+        wrapped_step_tolerance (float or None): maximum absolute difference
+            accepted when matching a depth anchor against the expected depth
+            sequence during wrapped-data repair. If None, one thousandth of
+            the declared (or inferred) step is used.
             (this is handled by :func:`lasio.reader.open_with_codecs`)
 
     The documented arguments above are combined from these methods:
@@ -99,6 +109,7 @@ class LASFile(object):
         self._text = ""
         self.index_unit = None
         self.index_initial = None
+        self.wrapped_data_repairs = None
         default_items = defaults.get_default_items()
         self.sections = {
             "Version": default_items["Version"],
@@ -126,6 +137,8 @@ class LASFile(object):
         accept_regexp_sub_recommendations=True,
         index_unit=None,
         dtypes="auto",
+        repair_wrapped_data=False,
+        wrapped_step_tolerance=None,
         **kwargs,
     ):
         """Read a LAS file.
@@ -193,6 +206,15 @@ class LASFile(object):
                 (this is handled by :func:`lasio.reader.open_with_codecs`)
             autodetect_encoding_chars (int/None): number of chars to read from LAS
                 file for auto-detection of encoding.
+            repair_wrapped_data (bool): only applies to wrapped files
+                (``WRAP=YES``). When True, a depth step missing one or more
+                cells is retained as null values and parsing re-aligns at the
+                next depth anchor matching the STEP-derived depth sequence.
+                Details are stored on ``self.wrapped_data_repairs``.
+            wrapped_step_tolerance (float or None): maximum absolute difference
+                accepted when matching a depth anchor to the expected depth
+                sequence during wrapped-data repair. Defaults to one
+                thousandth of the step.
                 (this is handled by :func:`lasio.reader.open_with_codecs`)
 
         """
@@ -419,6 +441,38 @@ class LASFile(object):
                     # ----------------------------------------------------------------------
 
                     # Attempt to read the data section
+                    def normal_engine_generator(target_file_obj):
+                        if provisional_wrapped == "YES":
+                            if self.wrapped_data_repairs is None:
+                                self.wrapped_data_repairs = reader.WrappedDataRepair()
+                            step = None
+                            if "STEP" in self.well:
+                                step = self.well["STEP"].value
+                            return reader.read_wrapped_data_section(
+                                target_file_obj,
+                                (first_line, last_line),
+                                regexp_subs,
+                                value_null_subs,
+                                ignore_data_comments=ignore_data_comments,
+                                n_columns=reader_n_columns,
+                                dtypes=dtypes,
+                                line_splitter=line_splitter,
+                                step=step,
+                                step_tolerance=wrapped_step_tolerance,
+                                repair=repair_wrapped_data,
+                                repair_report=self.wrapped_data_repairs,
+                            )
+                        return reader.read_data_section_iterative_normal_engine(
+                            target_file_obj,
+                            (first_line, last_line),
+                            regexp_subs,
+                            value_null_subs,
+                            ignore_data_comments=ignore_data_comments,
+                            n_columns=reader_n_columns,
+                            dtypes=dtypes,
+                            line_splitter=line_splitter,
+                        )
+
                     if engine == "numpy":
                         try:
                             curves_data_gen = reader.read_data_section_iterative_numpy_engine(
@@ -427,18 +481,9 @@ class LASFile(object):
                         except Exception:
                             try:
                                 file_obj.seek(k)
-                                curves_data_gen = (
-                                    reader.read_data_section_iterative_normal_engine(
-                                        file_obj,
-                                        (first_line, last_line),
-                                        regexp_subs,
-                                        value_null_subs,
-                                        ignore_data_comments=ignore_data_comments,
-                                        n_columns=reader_n_columns,
-                                        dtypes=dtypes,
-                                        line_splitter=line_splitter,
-                                    )
-                                )
+                                curves_data_gen = normal_engine_generator(file_obj)
+                            except exceptions.WrappedDataError:
+                                raise
                             except Exception:
                                 raise exceptions.LASDataError(
                                     traceback.format_exc()[:-1]
@@ -447,18 +492,9 @@ class LASFile(object):
 
                     if engine == "normal":
                         try:
-                            curves_data_gen = (
-                                reader.read_data_section_iterative_normal_engine(
-                                    file_obj,
-                                    (first_line, last_line),
-                                    regexp_subs,
-                                    value_null_subs,
-                                    ignore_data_comments=ignore_data_comments,
-                                    n_columns=reader_n_columns,
-                                    dtypes=dtypes,
-                                    line_splitter=line_splitter,
-                                )
-                            )
+                            curves_data_gen = normal_engine_generator(file_obj)
+                        except exceptions.WrappedDataError:
+                            raise
                         except Exception:
                             raise exceptions.LASDataError(
                                 traceback.format_exc()[:-1]

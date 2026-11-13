@@ -59,7 +59,8 @@ add_logging_level("TRACE_LASIO", logging.DEBUG - 5, "trace_lasio")
 from .las import JSONEncoder, LASFile
 from .las_items import CurveItem, HeaderItem, SectionItems
 from .las_version import version
-from .reader import open_file
+from .reader import WrappedDataRepair, open_file
+from .exceptions import WrappedDataError
 
 __version__ = version()
 
@@ -132,6 +133,15 @@ def read(file_ref, **kwargs):
             (this is handled by :func:`lasio.reader.open_with_codecs`)
         autodetect_encoding_chars (int/None): number of chars to read from LAS
             file for auto-detection of encoding.
+        repair_wrapped_data (bool): only applies to wrapped files
+            (``WRAP=YES``). When True, a depth step missing one or more cells
+            is retained as null values and parsing re-aligns at the next depth
+            anchor matching the STEP-derived depth sequence instead of failing.
+            Details are stored on ``las.wrapped_data_repairs``.
+        wrapped_step_tolerance (float or None): maximum absolute difference
+            accepted when matching a depth anchor to the expected depth
+            sequence during wrapped-data repair. Defaults to one thousandth
+            of the step.
             (this is handled by :func:`lasio.reader.open_with_codecs`)
 
 
