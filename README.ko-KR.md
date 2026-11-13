@@ -7,6 +7,7 @@
 - `ulog_info`: ULog 파일의 정보를 나타냅니다.
 - `ulog_messages`: ULog 파일에 기록된 로그 메시지(logged messages)를 출력합니다.
 - `ulog_params`: ULog 파일에 저장된 파라미터들을 추출합니다.
+- `ulog_param_group`: 측정 구간 동안 실제 적용된 파라미터를 기준으로 ULog 배치를 그룹화할 수 있는지 검증합니다.
 - `ulog2csv`: ULog 파일을 CSV 파일로 변환합니다.
 - `ulog2kml`: ULog 파일을 KML 파일로 변환합니다.
 - `ulog2ros2bag`: ULog 파일을 ros2bag 파일로 변환.

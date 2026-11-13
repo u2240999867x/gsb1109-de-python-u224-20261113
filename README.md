@@ -8,6 +8,7 @@ The provided [command line scripts](#scripts) are:
 - `ulog_info`: display information from an ULog file.
 - `ulog_messages`: display logged messages from an ULog file.
 - `ulog_params`: extract parameters from an ULog file.
+- `ulog_param_group`: verify how ULog batches can be grouped by the parameters in effect during their measured intervals.
 - `ulog2csv`: convert ULog to CSV files.
 - `ulog2kml`: convert ULog to KML files.
 - `ulog2ros2bag`: convert ULog to ROS2 bag files.
@@ -160,6 +161,29 @@ VT_TYPE,0
 VT_WV_LND_EN,0
 VT_WV_LTR_EN,0
 VT_WV_YAWR_SCL,0.15000000596
+```
+
+### Verify parameter-based batch grouping (ulog_param_group)
+
+Compares the parameter configuration that was effectively in use while each
+log was recording. The measured interval is taken from the actual data
+samples; a parameter changed at or after the last sample is kept as evidence
+but never changes the grouping. For every parameter known to either log one
+of three verdicts is reported:
+
+- `explicit_equal`: both logs explicitly carry the same value;
+- `default_equal`: a missing explicit value matches the stored default
+  parameter of that log version;
+- `undecidable`: evidence is missing or the values disagree.
+
+Every verdict is backed by the interval and the raw parameter evidence, so it
+can be recomputed from the files. Use `--json` for the full machine-readable
+evidence, and `-d current_setup` to select the other stored default set.
+
+Usage:
+```
+usage: ulog_param_group [-h] [-d {system,current_setup}] [--json]
+                        file.ulg [file.ulg ...]
 ```
 
 ### Convert ULog to CSV files (ulog2csv)
