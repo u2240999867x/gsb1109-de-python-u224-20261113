@@ -728,3 +728,97 @@ Each of those ``Spec`` classes provides a shared set of methods to work with ver
 
 .. _SemVer: http://semver.org/
 .. _`compatible release clauses`: https://www.python.org/dev/peps/pep-0440/#compatible-release
+
+
+Upgrade paths
+-------------
+
+.. module:: semantic_version.upgrade
+
+.. class:: Transformation(name, input_versions=None, output_version=None, cost=1, drops_fields=(), accepts=None)
+
+    A single record transformation.
+
+    ``input_versions`` lists the versions the transformation accepts; a
+    version string or :class:`~semantic_version.Version` is accepted as a
+    single value.  ``accepts`` optionally adds a SemVer range
+    (:class:`~semantic_version.SimpleSpec` or a string) accepted on top of
+    those exact versions.  ``output_version`` is the version the
+    transformation produces, ``cost`` is a non-negative number, and
+    ``drops_fields`` lists fields the transformation permanently loses.
+
+    .. method:: applies_to(version)
+
+        Return whether the transformation accepts ``version``.
+
+    .. method:: from_dict(data)
+
+        Build a transformation from a mapping.  Both the canonical keys and
+        the aliases ``id``/``inputs``/``produces``/``weight``/``lost_fields``
+        are accepted.
+
+    .. method:: as_dict()
+
+        Return a JSON-serialisable representation.
+
+.. class:: UpgradePath
+
+    The cheapest path returned by :func:`plan_upgrade`.
+
+    .. attribute:: start_version
+
+        Version the archived record is read at.
+
+    .. attribute:: target_version
+
+        Version the record must reach.
+
+    .. attribute:: required_fields
+
+        Fields that survive at the end of the path.
+
+    .. attribute:: steps
+
+        The accepted :class:`Transformation` objects, in order.
+
+    .. attribute:: cost
+
+        Sum of the costs of ``steps``.
+
+    .. attribute:: versions
+
+        Versions visited, starting with ``start_version``.
+
+    .. method:: as_dict()
+
+        Return a JSON-serialisable representation.
+
+.. function:: plan_upgrade(start_version, target_version, transformations, required_fields=(), source_fields=None)
+
+    Return the cheapest :class:`UpgradePath` from ``start_version`` to
+    ``target_version``.
+
+    The search state is ``(version, retained_fields)``; two states with the
+    same version but different fields are distinct, so a cheaper path that
+    lost a required field cannot be reused.  Transformation inputs are always
+    concrete versions, which keeps the state space finite.
+
+    When ``source_fields`` is omitted, the archived record is assumed to hold
+    every required field; the source file is never read.
+
+    :raises VersionGapError: when no chain of transformations connects the
+        start version to the target version.
+    :raises RequiredFieldLostError: when the target version is reachable but
+        every path permanently drops a required field, or ``source_fields``
+        already lacks one.
+
+.. function:: find_upgrade_path(...)
+
+    Alias for :func:`plan_upgrade`.
+
+.. function:: main(argv=None)
+
+    Command line entry point, also available as
+    ``python -m semantic_version.upgrade``.  It reads a JSON document and
+    writes ``status: ok`` with the path, or ``status: no_path`` with a
+    ``reason`` of ``version_gap`` or ``required_field_lost``.

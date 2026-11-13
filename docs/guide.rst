@@ -344,3 +344,33 @@ The :mod:`semantic_version.django_fields` module provides django fields to
 store :class:`Version` or :class:`BaseSpec` objects.
 
 More documentation is available in the :doc:`django` section.
+
+Planning record upgrades
+------------------------
+
+Cold archives often need several transformations to reach a current contract.
+Each :class:`~semantic_version.upgrade.Transformation` accepts some input
+versions, produces one output version, drops some fields forever, and costs
+something.  :func:`~semantic_version.upgrade.plan_upgrade` returns the cheapest
+sequence:
+
+.. code-block:: pycon
+
+    >>> from semantic_version.upgrade import Transformation, plan_upgrade
+    >>> steps = [
+    ...     Transformation('direct', '1.0.0', '2.0.0', 10),
+    ...     Transformation('minor', '1.0.0', '1.1.0', 1, drops_fields=['legacy']),
+    ...     Transformation('major', '1.1.0', '2.0.0', 1),
+    ... ]
+    >>> path = plan_upgrade('1.0.0', '2.0.0', steps, required_fields=['owner'])
+    >>> [step.name for step in path.steps]
+    ['minor', 'major']
+    >>> path.cost
+    2
+
+The retained field set is part of the search state: if the cheap ``minor``
+step dropped ``owner``, the planner would instead take the costlier route that
+keeps it.  When no route exists, the exception says whether the version graph
+is disconnected (:class:`~semantic_version.upgrade.VersionGapError`) or the
+version is reachable but a required field is lost on every route
+(:class:`~semantic_version.upgrade.RequiredFieldLostError`).

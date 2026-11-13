@@ -4,6 +4,15 @@
 
 
 from .base import compare, match, validate, SimpleSpec, NpmSpec, Spec, SpecItem, Version
+from .upgrade import (
+    RequiredFieldLostError,
+    Transformation,
+    UpgradeError,
+    UpgradePath,
+    VersionGapError,
+    find_upgrade_path,
+    plan_upgrade,
+)
 
 
 __author__ = "Raphaël Barrois <raphael.barrois+semver@polytechnique.org>"
