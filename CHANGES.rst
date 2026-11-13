@@ -1,6 +1,17 @@
 Changes
 =======
 
+(unreleased)
+------------
+
+* Added the ``price_parser.promotions`` module: stacking-aware settlement
+  of a shopping basket with threshold coupons, member discounts and
+  category-limited coupons. Promotions only stack when a ``StackingGroup``
+  declares them together (in trigger order), thresholds can be checked
+  against the original price or the amount left by earlier promotions, and
+  ``best_settlement`` returns the cheapest settlement with per-line
+  discount allocations, independent of the display order of the promotions.
+
 0.5.1 (2026-03-19)
 ------------------
 

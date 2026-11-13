@@ -166,6 +166,41 @@ Price(amount=Decimal('140.600'), currency='$')
 Price(amount=Decimal('140600'), currency='$')
 
 
+Promotion settlement
+====================
+
+The ``price_parser.promotions`` module settles a shopping basket when
+several promotions (threshold coupons, member discounts, category-limited
+coupons) hang off the same original price. Promotions are only combined
+when a ``StackingGroup`` explicitly declares them together, in the declared
+trigger order; thresholds may look at the original price or at the amount
+left by previously triggered promotions. ``best_settlement`` returns the
+cheapest settlement, with every discount allocated back to the item lines,
+and the result does not depend on the order the promotions were listed in:
+
+>>> from price_parser.promotions import (
+...     Item, Promotion, StackingGroup, best_settlement,
+... )
+>>> items = [Item("A", "books", "100.00"),
+...          Item("B", "electronics", "200.00"),
+...          Item("C", "books", "50.00")]
+>>> promos = [Promotion.member_discount("member", "0.9"),
+...           Promotion.threshold_coupon("coupon", threshold="300", amount_off="40"),
+...           Promotion.category_coupon("cat", ["books"], amount_off="30")]
+>>> settlement = best_settlement(
+...     items, promos, [StackingGroup(("member", "coupon", "cat"))],
+... )
+>>> settlement.total_payable
+Decimal('245.00')
+>>> print(settlement.explain())
+basket original total: 350.00
+applied promotions (trigger order): member -> coupon -> cat
+  A (books): 100.00 -> 58.57  [member -10.00, coupon -11.43, cat -20.00]
+  B (electronics): 200.00 -> 157.14  [member -20.00, coupon -22.86]
+  C (books): 50.00 -> 29.29  [member -5.00, coupon -5.71, cat -10.00]
+total payable: 245.00 (discount 105.00)
+
+
 Contributing
 ============
 
