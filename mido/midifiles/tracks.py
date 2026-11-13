@@ -54,6 +54,18 @@ class MidiTrack(list):
     def __mul__(self, other):
         return self.__class__(list.__mul__(self, other))
 
+    def find_segment_matches(self, events, **kwargs):
+        """Find occurrences of this track in ``events``.
+
+        See :func:`mido.midifiles.notes.find_segment_matches`.
+        """
+        from .notes import find_segment_matches
+        return find_segment_matches(self, events, **kwargs)
+
+    def find_note_matches(self, events, **kwargs):
+        """Alias for :meth:`find_segment_matches`."""
+        return self.find_segment_matches(events, **kwargs)
+
     def __repr__(self):
         if len(self) == 0:
             messages = ''

@@ -334,6 +334,18 @@ class MidiFile:
     def merged_track(self):
         self._merged_track = None
 
+    def find_segment_matches(self, events, **kwargs):
+        """Find occurrences of this file's merged track in ``events``.
+
+        See :func:`mido.midifiles.notes.find_segment_matches`.
+        """
+        from .notes import find_segment_matches
+        return find_segment_matches(self, events, **kwargs)
+
+    def find_note_matches(self, events, **kwargs):
+        """Alias for :meth:`find_segment_matches`."""
+        return self.find_segment_matches(events, **kwargs)
+
     def add_track(self, name=None):
         """Add a new track to the file.
 

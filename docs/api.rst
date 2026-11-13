@@ -189,7 +189,23 @@ Standard MIDI Files
 
 .. autofunction:: merge_tracks
 
+Migrating rehearsal notes
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+A rehearsal note is attached to a contiguous run of MIDI events in an
+old recording.  When the piece is re-recorded, the run may be transposed
+and ornaments may be inserted, so the original track number and event
+indices cannot be trusted.  These functions locate every candidate
+occurrence in the new performance, including repeated choruses.
+
 .. module:: mido.midifiles
+
+.. autofunction:: find_segment_matches
+.. autofunction:: find_note_matches
+.. autofunction:: find_all_matches
+
+.. autoclass:: SegmentMatch
+   :members:
 
 .. todo: Expose more of the internal API? (meta, tracks, units…)
 
