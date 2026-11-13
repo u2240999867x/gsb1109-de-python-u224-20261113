@@ -320,6 +320,93 @@ To do that, you need ``Schema(Or({int:int}, {}))``. This is unlike what happens 
 lists, where ``Schema([int]).is_valid([])`` will return True.
 
 
+Tracking where each field came from
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+An omitted field is indistinguishable from an explicitly supplied one once the
+cleaned data is all you have. Pass ``track_sources=True`` to ``validate`` to get
+a ``ValidationReport`` instead of the bare data; its ``sources`` attribute
+records the provenance of every field:
+
+.. code:: python
+
+    from schema import SOURCE_PROVIDED, SOURCE_DEFAULT
+    from schema import MISSING_OBJECT, MISSING_FIELD
+
+    contract_schema = Schema({
+        "contract_no": str,
+        Optional("warehouse", default="WH-OLD"): str,
+        Optional("location", default={"zone": "Z1", "bin": "B1"}): {
+            Optional("zone", default="Z1"): str,
+            Optional("bin", default="B1"): str,
+        },
+    })
+
+    report = contract_schema.validate(
+        {"contract_no": "C1", "location": {"zone": "Z9"}},
+        track_sources=True,
+    )
+    report.data                       # the cleaned document, as usual
+    report.origins                    # dotted path -> "provided"/"default"/...
+    report.sources.get("warehouse")   # SOURCE_DEFAULT
+    report.sources.missing_kind("location.bin")   # MISSING_FIELD
+
+A field is ``SOURCE_PROVIDED`` when it was explicitly present and
+``SOURCE_DEFAULT`` when an ``Optional`` default produced it. Two kinds of
+omission are kept apart:
+
+* ``MISSING_FIELD`` — the enclosing object existed but this single field was
+  left out (``location.bin`` above).
+* ``MISSING_OBJECT`` — the whole nested object/array was absent and the
+  default filled it in one step; every field inside it inherits this kind.
+
+Reconciling historical data after a default change
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When a default changes, rows that wrote the old value by hand must be kept;
+only rows that genuinely relied on the default may be migrated. ``reconcile``
+drives that decision and never guesses. With the old raw document available,
+each field is proven against it and only confirmed default-filled fields
+receive the new default:
+
+.. code:: python
+
+    from schema import reconcile
+
+    raw = {"contract_no": "C1", "warehouse": "WH-OLD"}      # hand-written
+    stored = contract_schema.validate(raw)
+    result = reconcile(
+        stored,
+        contract_schema,
+        raw=raw,
+        new_defaults={("warehouse",): "WH-NEW"},
+    )
+    result.data["warehouse"]     # "WH-OLD" — preserved, it was provided
+    result.preserved             # ["contract_no", "warehouse", ...]
+    result.migrated              # []
+
+When only the cleaned data survives, omit ``raw`` and pass the defaults that
+were configured at the time. A stored value equal to its old default could be
+either explicit or default-filled, so it is left untouched, labelled
+``SOURCE_AMBIGUOUS`` and listed under ``review`` together with the source
+fields to inspect:
+
+.. code:: python
+
+    result = reconcile(
+        stored,
+        contract_schema,
+        old_defaults={("warehouse",): "WH-OLD"},
+        new_defaults={("warehouse",): "WH-NEW"},
+    )
+    result.data == stored        # nothing is changed automatically
+    result.ambiguous_fields      # ["warehouse"]
+    result.review                # {"warehouse": ["warehouse"], ...}
+
+Field paths may be given as tuples or dotted strings
+(``("location", "zone")`` or ``"location.zone"``).
+
+
 **schema** has classes ``And`` and ``Or`` that help validating several schemas
 for the same data:
 

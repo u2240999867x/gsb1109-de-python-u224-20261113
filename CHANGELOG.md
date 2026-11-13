@@ -3,6 +3,23 @@
 
 ## Unreleased
 
+### Features
+
+* `Schema.validate(..., track_sources=True)` returns a `ValidationReport`
+  recording each field's provenance: explicitly provided (`SOURCE_PROVIDED`),
+  filled from an `Optional` default (`SOURCE_DEFAULT`), or not provable from
+  the cleaned data alone (`SOURCE_AMBIGUOUS`). Default-filled fields also
+  distinguish a whole missing nested object/array (`MISSING_OBJECT`) from an
+  existing object whose inner field was omitted (`MISSING_FIELD`).
+
+* Add `reconcile()` to migrate stored cleaned data after a default change. It
+  preserves hand-written historical values by proving every field against the
+  old raw document, migrates only confirmed default-filled fields, and — when
+  only the cleaned data survives — leaves ambiguous values untouched while
+  listing the source fields that need manual review.
+
+* Add `Schema.collect_defaults()` enumerating every default field path.
+
 
 ## v0.7.8 (2025-10-11)
 

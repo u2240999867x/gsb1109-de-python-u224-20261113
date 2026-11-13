@@ -2,6 +2,7 @@
 obtained from config-files, forms, external services or command-line
 parsing, converted from JSON/YAML (or something else) to Python data-types."""
 
+import copy
 import inspect
 import re
 from typing import (
@@ -35,6 +36,26 @@ else:
 
 
 __version__ = "0.7.8"
+
+# Provenance labels recorded for every value emitted by validation.
+# The value was copied from an explicit field of the source data.
+SOURCE_PROVIDED = "provided"
+# The field (or a whole enclosing object) was omitted and the value comes
+# from an Optional default.
+SOURCE_DEFAULT = "default"
+# The cleaned value alone cannot prove its origin; both "explicitly provided"
+# and "filled from a default" remain possible. The original document must be
+# inspected before migrating anything.
+SOURCE_AMBIGUOUS = "ambiguous"
+
+# Sentinel meaning "no original value is known for this path".
+_MISSING = object()
+
+# Private kwarg used to thread the source-tracking context through recursive
+# validate() calls. It must never collide with user-supplied kwargs.
+_SOURCE_CTX_KW = "_schema_source_ctx"
+
+
 __all__ = [
     "Schema",
     "And",
@@ -51,6 +72,15 @@ __all__ = [
     "SchemaForbiddenKeyError",
     "SchemaUnexpectedTypeError",
     "SchemaOnlyOneAllowedError",
+    "FieldSources",
+    "ValidationReport",
+    "ReconciliationResult",
+    "reconcile",
+    "SOURCE_PROVIDED",
+    "SOURCE_DEFAULT",
+    "SOURCE_AMBIGUOUS",
+    "MISSING_OBJECT",
+    "MISSING_FIELD",
 ]
 
 
@@ -356,6 +386,386 @@ def _invoke_with_optional_kwargs(f: Callable[..., Any], **kwargs: Any) -> Any:
     return f(**kwargs)
 
 
+_CONTAINER_TYPES = (dict, list, tuple, set, frozenset)
+# What exactly was omitted when a default filled a value: the whole nested
+# object/array was absent, or the enclosing object was present but this single
+# field was left out.
+MISSING_OBJECT = "object"
+MISSING_FIELD = "field"
+
+
+def _path_to_str(path: Tuple[Any, ...]) -> str:
+    """Render a field path tuple as a dotted, human-readable location."""
+    return ".".join(str(part) for part in path)
+
+
+def _normalize_path(path: Union[str, Sequence[Any]]) -> Tuple[Any, ...]:
+    if isinstance(path, str):
+        return tuple(part for part in path.split(".") if part != "")
+    return tuple(path)
+
+
+def get_at_path(data: Any, path: Union[str, Sequence[Any]]) -> Any:
+    """Return the value at a dotted/tuple field path inside nested data."""
+    current = data
+    for part in _normalize_path(path):
+        if isinstance(current, dict) and part in current:
+            current = current[part]
+        elif isinstance(current, dict):
+            current = current[str(part)]
+        else:
+            current = current[part]
+    return current
+
+
+def _set_at_path(data: Any, path: Tuple[Any, ...], value: Any) -> None:
+    current = data
+    for part in path[:-1]:
+        current = current[part]
+    last = path[-1]
+    if isinstance(current, dict) and last not in current:
+        current[str(last)] = value
+    else:
+        current[last] = value
+
+
+def _safe_equal(left: Any, right: Any) -> bool:
+    """Equality check that never raises (custom objects may overload ==)."""
+    try:
+        return bool(left == right)
+    except Exception:  # pragma: no cover - defensive against exotic objects
+        return False
+
+
+class FieldSources:
+    """Field-by-field provenance of a validated document.
+
+    Each field path is labelled with SOURCE_PROVIDED when it was explicitly
+    present in the source document, SOURCE_DEFAULT when an Optional default
+    produced it, or SOURCE_AMBIGUOUS when the cleaned output alone cannot
+    distinguish the two. Default-sourced paths additionally remember whether
+    the omission was a whole missing object/array (MISSING_OBJECT) or a single
+    omitted field inside an existing object (MISSING_FIELD).
+    """
+
+    def __init__(self) -> None:
+        self._sources: Dict[Tuple[Any, ...], str] = {}
+        self._missing: Dict[Tuple[Any, ...], str] = {}
+        self._defaults: Dict[Tuple[Any, ...], Any] = {}
+        self._review: Dict[Tuple[Any, ...], List[str]] = {}
+
+    def record(
+        self, path: Tuple[Any, ...], source: str, missing: Union[str, None] = None
+    ) -> str:
+        previous = self._sources.get(path)
+        if previous is not None and previous != source:
+            source = SOURCE_AMBIGUOUS
+        self._sources[path] = source
+        if missing is not None:
+            self._missing[path] = missing
+        return source
+
+    def set(
+        self, path: Tuple[Any, ...], source: str, missing: Union[str, None] = None
+    ) -> None:
+        """Assign a provenance label authoritatively.
+
+        Unlike :meth:`record`, this overwrites a previous label instead of
+        merging a conflict into ``ambiguous``. Reconciliation uses it after it
+        has proven the true origin against the raw document.
+        """
+        self._sources[path] = source
+        if missing is not None:
+            self._missing[path] = missing
+        else:
+            self._missing.pop(path, None)
+
+    def record_default_value(self, path: Tuple[Any, ...], value: Any) -> None:
+        self._defaults.setdefault(path, value)
+
+    def record_review(
+        self, path: Tuple[Any, ...], candidates: Iterable[str]
+    ) -> None:
+        existing = self._review.setdefault(path, [])
+        for candidate in candidates:
+            if candidate not in existing:
+                existing.append(candidate)
+
+    def get(self, path: Union[str, Sequence[Any]]) -> Union[str, None]:
+        return self._sources.get(_normalize_path(path))
+
+    def missing_kind(self, path: Union[str, Sequence[Any]]) -> Union[str, None]:
+        return self._missing.get(_normalize_path(path))
+
+    def default_value(self, path: Union[str, Sequence[Any]]) -> Any:
+        return self._defaults.get(_normalize_path(path), _MISSING)
+
+    def review_candidates(self, path: Union[str, Sequence[Any]]) -> List[str]:
+        return list(self._review.get(_normalize_path(path), []))
+
+    def to_dict(self) -> Dict[str, str]:
+        return {_path_to_str(path): label for path, label in self._sources.items()}
+
+    def _paths_with(self, source: str) -> List[str]:
+        return sorted(
+            _path_to_str(path)
+            for path, label in self._sources.items()
+            if label == source
+        )
+
+    @property
+    def sources(self) -> Dict[Tuple[Any, ...], str]:
+        return dict(self._sources)
+
+    @property
+    def provided_fields(self) -> List[str]:
+        return self._paths_with(SOURCE_PROVIDED)
+
+    @property
+    def default_fields(self) -> List[str]:
+        return self._paths_with(SOURCE_DEFAULT)
+
+    @property
+    def ambiguous_fields(self) -> List[str]:
+        return self._paths_with(SOURCE_AMBIGUOUS)
+
+    @property
+    def missing_object_fields(self) -> List[str]:
+        return sorted(
+            _path_to_str(path)
+            for path, kind in self._missing.items()
+            if kind == MISSING_OBJECT
+        )
+
+    @property
+    def missing_field_fields(self) -> List[str]:
+        return sorted(
+            _path_to_str(path)
+            for path, kind in self._missing.items()
+            if kind == MISSING_FIELD
+        )
+
+    @property
+    def review_fields(self) -> Dict[str, List[str]]:
+        return {
+            _path_to_str(path): list(candidates)
+            for path, candidates in self._review.items()
+        }
+
+
+class _SourceContext:
+    """Internal, thread-unsafe carrier threaded through recursive validation."""
+
+    def __init__(self) -> None:
+        self.sources = FieldSources()
+        self.path: Tuple[Any, ...] = ()
+
+    def child(self, key: Any) -> "_SourceContext":
+        context = _SourceContext.__new__(_SourceContext)
+        context.sources = self.sources
+        context.path = self.path + (key,)
+        return context
+
+
+class ValidationReport:
+    """Result of ``Schema.validate(..., track_sources=True)``.
+
+    Wraps the cleaned data together with the recorded :class:`FieldSources`,
+    so downstream migration tooling can tell explicit values apart from
+    default-filled ones without re-reading the schema.
+    """
+
+    def __init__(self, data: Any, sources: FieldSources) -> None:
+        self.data = data
+        self.sources = sources
+
+    @property
+    def origins(self) -> Dict[str, str]:
+        return self.sources.to_dict()
+
+    def __repr__(self) -> str:
+        return "ValidationReport(data=%r, origins=%r)" % (
+            self.data,
+            self.origins,
+        )
+
+
+class ReconciliationResult:
+    """Outcome of reconciling stored cleaned data against an old raw document.
+
+    ``data`` only contains confirmed migrations; ambiguous values are left
+    untouched and listed in ``review`` together with the source fields that a
+    human has to inspect.
+    """
+
+    def __init__(
+        self,
+        data: Any,
+        sources: FieldSources,
+        migrated: List[Tuple[str, Any, Any]],
+        preserved: List[str],
+        review: Dict[str, List[str]],
+    ) -> None:
+        self.data = data
+        self.sources = sources
+        self.migrated = migrated
+        self.preserved = preserved
+        self.review = review
+
+    @property
+    def ambiguous_fields(self) -> List[str]:
+        return self.sources.ambiguous_fields
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "data": self.data,
+            "origins": self.sources.to_dict(),
+            "migrated": [
+                {"field": field, "old": old, "new": new}
+                for field, old, new in self.migrated
+            ],
+            "preserved": self.preserved,
+            "review": self.review,
+        }
+
+
+def _review_candidates_for(
+    path: Tuple[Any, ...], default_paths: Set[Tuple[Any, ...]]
+) -> List[str]:
+    """Source fields to inspect: the field itself plus any enclosing object
+    that itself carries a default (it may have been missing wholesale)."""
+    candidates = [_path_to_str(path)]
+    for depth in range(len(path) - 1, 0, -1):
+        ancestor = path[:depth]
+        if ancestor in default_paths:
+            candidates.append(_path_to_str(ancestor))
+    return candidates
+
+
+def reconcile(
+    cleaned: Any,
+    schema: "Schema",
+    raw: Any = _MISSING,
+    old_defaults: Union[Dict[Any, Any], None] = None,
+    new_defaults: Union[Dict[Any, Any], None] = None,
+) -> ReconciliationResult:
+    """Reconcile stored cleaned data against its old raw document.
+
+    :param cleaned: the stored, already-cleaned document.
+    :param schema: the Schema (with Optional defaults) that produced it.
+    :param raw: the old raw document. When supplied, every field is proven
+        against it; explicit values are preserved, proven default-filled
+        values are migrated via ``new_defaults``. Pass ``None`` or omit it
+        when only cleaned data survives.
+    :param old_defaults: mapping of field path (tuple or dotted string) to the
+        default value that was configured when ``cleaned`` was produced. Used
+        only in the no-raw case: a value equal to its old default could be
+        either explicit or default-filled, so it is left untouched and queued
+        for review instead of being guessed.
+    :param new_defaults: mapping of field path (tuple or dotted string) to the
+        new default value. It is applied only where the old raw document proves
+        the value actually came from the old default.
+    """
+    previous_defaults = {
+        _normalize_path(path): value for path, value in (old_defaults or {}).items()
+    }
+    overrides = {
+        _normalize_path(path): value for path, value in (new_defaults or {}).items()
+    }
+    default_paths = set(schema.collect_defaults().keys()) | set(
+        previous_defaults.keys()
+    )
+
+    cleaned_report = schema.validate(cleaned, track_sources=True)
+    sources = cleaned_report.sources
+    migrated_data = copy.deepcopy(cleaned)
+
+    raw_report = (
+        schema.validate(raw, track_sources=True)
+        if raw is not _MISSING and raw is not None
+        else None
+    )
+
+    migrated: List[Tuple[str, Any, Any]] = []
+    preserved: List[str] = []
+
+    def raw_origin(
+        path: Tuple[Any, ...]
+    ) -> Tuple[Union[str, None], Union[str, None]]:
+        """Provenance of a path in the raw doc, inheriting through a defaulted
+        ancestor: when a whole enclosing object was missing, every field inside
+        it was default-filled as well."""
+        exact = raw_report.sources.get(path)
+        if exact is not None:
+            return exact, raw_report.sources.missing_kind(path)
+        for depth in range(len(path) - 1, 0, -1):
+            ancestor_label = raw_report.sources.get(path[:depth])
+            if ancestor_label == SOURCE_DEFAULT:
+                kind = raw_report.sources.missing_kind(path[:depth])
+                return SOURCE_DEFAULT, kind
+            if ancestor_label == SOURCE_PROVIDED:
+                return SOURCE_PROVIDED, None
+        return None, None
+
+    ambiguous_ancestors: Set[Tuple[Any, ...]] = set()
+
+    for path in sorted(sources.sources.keys(), key=len):
+        field = _path_to_str(path)
+        if any(path[:depth] in ambiguous_ancestors for depth in range(1, len(path))):
+            sources.set(path, SOURCE_AMBIGUOUS)
+            sources.record_review(
+                path, _review_candidates_for(path, default_paths)
+            )
+            ambiguous_ancestors.add(path)
+            continue
+        if raw_report is not None:
+            raw_label, kind = raw_origin(path)
+            if raw_label == SOURCE_PROVIDED:
+                sources.set(path, SOURCE_PROVIDED)
+                preserved.append(field)
+                continue
+            if raw_label == SOURCE_DEFAULT:
+                sources.set(path, SOURCE_DEFAULT, missing=kind)
+            else:
+                # The raw document cannot account for this field; do not guess.
+                sources.set(path, SOURCE_AMBIGUOUS)
+                sources.record_review(
+                    path, _review_candidates_for(path, default_paths)
+                )
+                ambiguous_ancestors.add(path)
+                continue
+        else:
+            old_value = previous_defaults.get(path, _MISSING)
+            current_value = get_at_path(cleaned, path)
+            if old_value is not _MISSING and _safe_equal(current_value, old_value):
+                # Only the cleaned value survives, and both origins explain it.
+                sources.set(path, SOURCE_AMBIGUOUS)
+                sources.record_review(
+                    path, _review_candidates_for(path, default_paths)
+                )
+                ambiguous_ancestors.add(path)
+                continue
+            # Not equal to any old default (or the field had none): it had to
+            # be written explicitly, so keep the historical value as-is.
+            sources.set(path, SOURCE_PROVIDED)
+            preserved.append(field)
+            continue
+
+        if path in overrides:
+            old_value = get_at_path(migrated_data, path)
+            new_value = overrides[path]
+            _set_at_path(migrated_data, path, new_value)
+            migrated.append((field, old_value, new_value))
+
+    return ReconciliationResult(
+        data=migrated_data,
+        sources=sources,
+        migrated=migrated,
+        preserved=sorted(set(preserved)),
+        review=sources.review_fields,
+    )
+
+
 class Schema(object):
     """
     Entry point of the library, use this class to instantiate validation
@@ -434,7 +844,134 @@ class Schema(object):
             message = "{0!r} {1!s}".format(self._name, message)
         return message
 
-    def validate(self, data: Any, **kwargs: Dict[str, Any]) -> Any:
+    def validate(
+        self, data: Any, track_sources: bool = False, **kwargs: Dict[str, Any]
+    ) -> Any:
+        """Validate ``data``.
+
+        With ``track_sources=False`` (the default) behavior is unchanged and
+        the cleaned data is returned. With ``track_sources=True`` a
+        :class:`ValidationReport` is returned instead, carrying the cleaned
+        data together with the recorded :class:`FieldSources` (provided,
+        default-filled, or ambiguous, including which defaults filled a whole
+        missing object versus a single omitted field).
+        """
+        ctx = kwargs.pop(_SOURCE_CTX_KW, None)
+        top_level = False
+        if track_sources:
+            if ctx is not None:
+                raise ValueError(
+                    "track_sources can only be passed to the outermost validate() call"
+                )
+            ctx = _SourceContext()
+            top_level = True
+        if ctx is not None:
+            kwargs[_SOURCE_CTX_KW] = ctx
+        result = self._validate(data, ctx, **kwargs)
+        if top_level:
+            return ValidationReport(result, ctx.sources)
+        return result
+
+    @staticmethod
+    def _child_kwargs(
+        kwargs: Dict[str, Any], ctx: Union[_SourceContext, None], key: Any
+    ) -> Dict[str, Any]:
+        if ctx is None:
+            return kwargs
+        child = dict(kwargs)
+        child[_SOURCE_CTX_KW] = ctx.child(key)
+        return child
+
+    @staticmethod
+    def _user_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Kwargs safe to forward to user callables (defaults, hooks)."""
+        return {
+            key: value
+            for key, value in kwargs.items()
+            if key != _SOURCE_CTX_KW
+        }
+
+    @staticmethod
+    def _unwrap_container_schema(node: Any) -> Any:
+        """Drill through Schema/And/Or wrappers to reach a dict/iterable schema."""
+        if isinstance(node, Schema):
+            return Schema._unwrap_container_schema(node._schema)
+        if isinstance(node, (And, Or)):
+            for arg in node.args:
+                found = Schema._unwrap_container_schema(arg)
+                if isinstance(found, (dict, list, tuple, set, frozenset)):
+                    return found
+        return node
+
+    @staticmethod
+    def _lookup_svalue(schema_dict: Dict[Any, Any], key: Any) -> Any:
+        """Find the value schema declared for a concrete dict key."""
+        for skey, svalue in schema_dict.items():
+            candidate = skey
+            if isinstance(candidate, Optional):
+                candidate = candidate._schema
+            if isinstance(candidate, Literal):
+                candidate = candidate.schema
+            if candidate == key:
+                return svalue
+        return None
+
+    def _annotate_container_default(
+        self,
+        value_schema: Any,
+        value: Any,
+        ctx: _SourceContext,
+        missing_kind: str,
+    ) -> None:
+        """Record default provenance for a container and every field inside it.
+
+        A whole missing object/array is filled in one step, so ordinary
+        validation never visits its inner fields; this walks the default value
+        alongside the schema so nested fields inherit the same provenance and
+        missing kind rather than going unrecorded.
+        """
+        ctx.sources.record(ctx.path, SOURCE_DEFAULT, missing=missing_kind)
+        ctx.sources.record_default_value(ctx.path, value)
+        inner_schema = self._unwrap_container_schema(value_schema)
+
+        if isinstance(value, dict) and isinstance(inner_schema, dict):
+            for key, item in value.items():
+                child_ctx = ctx.child(key)
+                sub_schema = self._lookup_svalue(inner_schema, key)
+                if isinstance(item, _CONTAINER_TYPES):
+                    self._annotate_container_default(
+                        sub_schema if sub_schema is not None else item,
+                        item,
+                        child_ctx,
+                        missing_kind,
+                    )
+                else:
+                    child_ctx.sources.record(
+                        child_ctx.path, SOURCE_DEFAULT, missing=missing_kind
+                    )
+                    child_ctx.sources.record_default_value(child_ctx.path, item)
+        elif isinstance(value, (list, tuple, set, frozenset)) and isinstance(
+            inner_schema, (list, tuple, set, frozenset)
+        ):
+            item_schema = next(iter(inner_schema), object)
+            for index, item in enumerate(value):
+                child_ctx = ctx.child(index)
+                if isinstance(item, _CONTAINER_TYPES):
+                    self._annotate_container_default(
+                        item_schema, item, child_ctx, missing_kind
+                    )
+                else:
+                    child_ctx.sources.record(
+                        child_ctx.path, SOURCE_DEFAULT, missing=missing_kind
+                    )
+                    child_ctx.sources.record_default_value(child_ctx.path, item)
+
+    def _validate(
+        self,
+        data: Any,
+        ctx: Union[_SourceContext, None],
+        **kwargs: Dict[str, Any],
+    ) -> Any:
         Schema = self.__class__
         s: Any = self._schema
         e: Union[str, None] = self._error
@@ -447,7 +984,14 @@ class Schema(object):
         if flavor == ITERABLE:
             data = Schema(type(s), error=e).validate(data, **kwargs)
             o: Or = Or(*s, error=e, schema=Schema, ignore_extra_keys=i)
-            return type(data)(o.validate(d, **kwargs) for d in data)
+
+            def _items() -> Iterable[Any]:
+                for index, item in enumerate(data):
+                    yield o.validate(
+                        item, **self._child_kwargs(kwargs, ctx, index)
+                    )
+
+            return type(data)(_items())
         if flavor == DICT:
             exitstack = ExitStack()
             data = Schema(dict, error=e).validate(data, **kwargs)
@@ -495,10 +1039,13 @@ class Schema(object):
                                     continue
                                 skey.handler(nkey, data, e)
                             else:
+                                value_kwargs = self._child_kwargs(
+                                    kwargs, ctx, nkey
+                                )
                                 try:
                                     nvalue = Schema(
                                         svalue, error=e, ignore_extra_keys=i
-                                    ).validate(value, **kwargs)
+                                    ).validate(value, **value_kwargs)
                                 except SchemaError as x:
                                     k = "Key '%s' error:" % (nkey,)
                                     message = self._prepend_schema_name(k)
@@ -509,6 +1056,10 @@ class Schema(object):
                                 else:
                                     new[nkey] = nvalue
                                     coverage.add(skey)
+                                    if ctx is not None:
+                                        ctx.sources.record(
+                                            ctx.child(nkey).path, SOURCE_PROVIDED
+                                        )
                                     break
             required = set(k for k in s if not self._is_optional_type(k))
             if not required.issubset(coverage):
@@ -550,12 +1101,30 @@ class Schema(object):
                 set(k for k in s if isinstance(k, Optional) and hasattr(k, "default"))
                 - coverage
             )
+            user_kwargs = self._user_kwargs(kwargs)
             for default in defaults:
-                new[default.key] = (
-                    _invoke_with_optional_kwargs(default.default, **kwargs)
+                default_value = (
+                    _invoke_with_optional_kwargs(default.default, **user_kwargs)
                     if callable(default.default)
                     else default.default
                 )
+                new[default.key] = default_value
+                if ctx is not None:
+                    default_ctx = ctx.child(default.key)
+                    if isinstance(default_value, _CONTAINER_TYPES):
+                        self._annotate_container_default(
+                            s[default],
+                            default_value,
+                            default_ctx,
+                            MISSING_OBJECT,
+                        )
+                    else:
+                        default_ctx.sources.record(
+                            default_ctx.path, SOURCE_DEFAULT, missing=MISSING_FIELD
+                        )
+                        default_ctx.sources.record_default_value(
+                            default_ctx.path, default_value
+                        )
 
             return new
         if flavor == TYPE:
@@ -598,6 +1167,44 @@ class Schema(object):
             message = "%r does not match %r" % (s, data)
             message = self._prepend_schema_name(message)
             raise SchemaError(message, e.format(data) if e else None)
+
+    def collect_defaults(self) -> Dict[Tuple[Any, ...], Any]:
+        """Static map of every Optional default field path to its default value.
+
+        Unlike a validation run, this includes defaults that would have been
+        applied on omitted fields, so reconciliation can reason about origins
+        even when only cleaned data is available. Callable defaults that need
+        validation kwargs are best-effort evaluated and skipped on failure.
+        """
+        out: Dict[Tuple[Any, ...], Any] = {}
+
+        def walk(node: Any, path: Tuple[Any, ...]) -> None:
+            if isinstance(node, Schema):
+                walk(node._schema, path)
+                return
+            if isinstance(node, (And, Or)):
+                for arg in node.args:
+                    walk(arg, path)
+                return
+            if isinstance(node, dict):
+                for skey, svalue in node.items():
+                    key = skey
+                    if isinstance(skey, Optional):
+                        key = skey.key
+                        if hasattr(skey, "default"):
+                            default_value = skey.default
+                            if callable(default_value):
+                                try:
+                                    default_value = _invoke_with_optional_kwargs(
+                                        default_value
+                                    )
+                                except Exception:
+                                    default_value = None
+                            out[path + (key,)] = default_value
+                    walk(svalue, path + (key,))
+
+        walk(self, ())
+        return out
 
     def json_schema(
         self, schema_id: str, use_refs: bool = False, **kwargs: Any
