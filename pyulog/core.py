@@ -2,12 +2,395 @@
 
 import struct
 import copy
+import fnmatch
+import re
 import sys
 import contextlib
+
+from collections.abc import Mapping
+
 import numpy as np
 from .exceptions import ULogException, ULogIncompatibleFlagException
 #pylint: disable=too-many-instance-attributes, unused-argument, missing-docstring
 #pylint: disable=protected-access, too-many-branches, too-many-lines
+
+# Parameter/info names that can carry device serial numbers, device identities
+# or operator information. They are kept out of filtered exports; the only way
+# to influence this is to select the remaining parameters explicitly.
+_SENSITIVE_NAME_RE = re.compile(
+    r'(SERIAL|UUID|OPERATOR|PILOT|CALLSIGN|ARM_AUTH_ID|'
+    r'^CAL_(?:GYRO|ACC|MAG|BARO)\d+_ID$|'
+    r'^MAV_(?:SYS|COMP|RADIO|SIK_RADIO)_ID$)',
+    re.IGNORECASE)
+
+# Field names that must never leave the machine in a filtered export. Matching
+# is done on the last component of a (possibly nested) flattened field name, so
+# e.g. 'esc[0].serial_number' and 'battery_status.serial_number' are caught.
+_SENSITIVE_FIELD_RE = re.compile(
+    r'^(?:serial|serial_number|device_serial|hw_serial|callsign|pilot|'
+    r'operator|operator_name|uas_id|flight_uuid)$',
+    re.IGNORECASE)
+
+
+class _UnrepresentableLayout(Exception):
+    """ Raised when a whitelist cannot be expressed in a ULog format. """
+
+
+def _layout_error_message(error):
+    """ Return a report-friendly reason for a failed layout build. """
+    if isinstance(error, _UnrepresentableLayout):
+        return str(error)
+    if isinstance(error, KeyError):
+        return 'message format not found'
+    return 'recursive message format definition'
+
+
+class ULogExportReport(object):
+    """ Result of a filtered :meth:`ULog.write_ulog` export.
+
+    ``topics`` maps a topic name to the list of multi ids that were written.
+    ``skipped_topics`` maps a topic (or a ``(topic, multi_id)`` tuple) to the
+    reason it could not be retained. ``empty_topics`` lists ``topic[id]`` keys
+    whose subscription and reduced definition were written although the window
+    had no samples. ``unmatched_fields`` lists whitelist entries that did not
+    occur in the corresponding topic definition,
+    ``omitted_sensitive_fields`` lists requested fields that were suppressed by
+    the privacy rules, and ``zero_filled_fields`` lists array slots kept for
+    layout compatibility but written as zero.
+    """
+
+    def __init__(self):
+        self.topics = {}
+        self.skipped_topics = {}
+        self.empty_topics = {}
+        self.unmatched_fields = {}
+        self.omitted_sensitive_fields = {}
+        self.written_fields = {}
+        self.zero_filled_fields = {}
+        self.parameters = {}
+        self.parameter_changes = []
+        self.parameter_count = 0
+        self.format_count = 0
+        self.start_timestamp = None
+        self.end_timestamp = None
+
+    @property
+    def kept_topics(self):
+        """ Alias for ``topics``. """
+        return self.topics
+
+    @property
+    def unretained_topics(self):
+        """ Alias for ``skipped_topics``. """
+        return self.skipped_topics
+
+    def summary(self):
+        """ Return a short human readable summary. """
+        kept = ', '.join(
+            '{}[{}]'.format(name, ','.join(str(i) for i in multi_ids))
+            for name, multi_ids in sorted(self.topics.items())) or 'none'
+        skipped = ', '.join(
+            '{} ({})'.format(name, reason)
+            for name, reason in sorted(self.skipped_topics.items(),
+                                       key=lambda item: str(item[0]))) or 'none'
+        empty = ', '.join(
+            '{} ({})'.format(name, reason)
+            for name, reason in sorted(self.empty_topics.items())) or 'none'
+        return 'kept: {}; empty: {}; skipped: {}'.format(kept, empty, skipped)
+
+
+class _ExportMessageFormat(object):
+    """ Minimal MessageFormat look-alike used for reduced export definitions. """
+
+    def __init__(self, name, fields):
+        self.name = name
+        self.fields = fields
+
+
+class _ExportLayout(object):
+    """ A reduced top-level format plus the flat leaves it writes. """
+
+    def __init__(self, fields, leaves):
+        self.fields = fields
+        # list of (flat field name or None for zero fill, type string)
+        self.leaves = leaves
+
+
+def _layout_field_names(layout):
+    """ Return the field names a reduced layout actually carries values for. """
+    return [leaf for leaf, _ in layout.leaves if leaf is not None]
+
+
+def _layout_zero_filled(layout):
+    """ Return array slots that are kept only to preserve the layout shape. """
+    return [index for index, (leaf, _) in enumerate(layout.leaves) if leaf is None]
+
+
+class _ExportLayoutBuilder(object):
+    """ Build reduced (nested) message formats for a field whitelist.
+
+    All selections are applied to relative leaf names of a message format, so
+    the same nested type can be reduced consistently for every occurrence.
+    """
+
+    def __init__(self, ulog_object, top_level_names=None):
+        self._ulog = ulog_object
+        self._cache = {}
+        self._top_level_names = set(top_level_names or ())
+        self._used_names = set(ulog_object.message_formats)
+        self._formats = []
+        self._expanding = set()
+        self._counter = 0
+        self.unmatched = []
+        self.blocked = []
+        self._all_leaves = []
+
+    def build(self, topic_name, selection):
+        """ Return an :class:`_ExportLayout` for a topic, or None if empty. """
+        self.unmatched = []
+        self.blocked = []
+        self._all_leaves = self._flattened_leaves(topic_name)
+        patterns = selection
+        if patterns is not None:
+            patterns = list(patterns)
+            requested = list(patterns)
+            if 'timestamp' not in patterns:
+                # A regular reader needs a timestamp field to order samples.
+                patterns.append('timestamp')
+            for pattern in patterns:
+                matched = [leaf for leaf in self._all_leaves
+                           if self._pattern_matches(pattern, leaf)]
+                if not matched:
+                    self.unmatched.append(pattern)
+                elif all(ULog._is_sensitive_field(leaf) for leaf in matched):
+                    self.blocked.append(pattern)
+
+            if requested and all(pattern in self.blocked for pattern in requested):
+                raise _UnrepresentableLayout('only privacy-sensitive fields requested')
+
+        top_format = self._ulog.message_formats[topic_name]
+        formats_before = len(self._formats)
+        cache_before = dict(self._cache)
+        fields, leaves = self._reduce_fields(top_format.fields, patterns)
+        written = [leaf for leaf, _ in leaves if leaf is not None]
+        if 'timestamp' not in written:
+            # Every readable data topic needs a top-level timestamp; without it
+            # the data section cannot be placed in time.
+            del self._formats[formats_before:]
+            self._cache = cache_before
+            raise _UnrepresentableLayout('no top-level timestamp field')
+        if not fields or not any(leaf != 'timestamp' and
+                                 not leaf.endswith('.timestamp') for leaf in written):
+            # Roll back nested formats and cache entries of a topic that
+            # cannot be retained, so no dangling synthetic names are emitted.
+            del self._formats[formats_before:]
+            self._cache = cache_before
+            return None
+        self._formats.append(_ExportMessageFormat(topic_name, fields))
+        return _ExportLayout(fields, leaves)
+
+    def formats(self):
+        """ Return all synthetic nested formats that were created. """
+        result = []
+        names = set()
+        for message_format in self._formats:
+            if message_format.name in names:
+                continue
+            names.add(message_format.name)
+            result.append(message_format)
+        return result
+
+    def _flattened_leaves(self, type_name, prefix='', _stack=None):
+        """ Flatten a format definition to its leaf field names. """
+        stack = set() if _stack is None else _stack
+        if type_name in stack:
+            raise RecursionError('recursive message format definition')
+        stack.add(type_name)
+        leaves = []
+        for field_type, array_size, field_name in self._ulog.message_formats[type_name].fields:
+            if field_name.startswith('_padding'):
+                continue
+            if field_type in ULog._UNPACK_TYPES:
+                if array_size > 0:
+                    leaves.extend(prefix + field_name + '[{}]'.format(i)
+                                  for i in range(array_size))
+                else:
+                    leaves.append(prefix + field_name)
+            elif array_size > 0:
+                for i in range(array_size):
+                    leaves.extend(self._flattened_leaves(
+                        field_type, prefix + field_name + '[{}].'.format(i), stack))
+            else:
+                leaves.extend(self._flattened_leaves(
+                    field_type, prefix + field_name + '.', stack))
+        stack.discard(type_name)
+        return leaves
+
+    @staticmethod
+    def _pattern_matches(pattern, leaf):
+        """ Return True if a whitelist pattern selects a flattened leaf. """
+        if pattern in ('*', '**'):
+            return True
+        if leaf == pattern or leaf.startswith(pattern + '.') or leaf.startswith(pattern + '['):
+            return True
+        return fnmatch.fnmatchcase(leaf, pattern)
+
+    def _child_patterns(self, patterns, field_name):
+        """ Map parent patterns to relative patterns of a nested type.
+
+        Returns ``(matched, relative_patterns, elements)``. ``relative_patterns``
+        is None when the whole nested type is selected. ``elements`` is None
+        when every array element is selected, otherwise it is the set of
+        requested element indices. A ULog format has a single definition per
+        nested type, so members below each element are reduced consistently.
+        """
+        if patterns is None:
+            return True, None, None
+        result = []
+        elements = set()
+        matched = False
+        for pattern in patterns:
+            relative, element = self._relative_pattern(pattern, field_name)
+            if relative is not None:
+                matched = True
+                if element is not None:
+                    elements.add(element)
+                if relative not in result:
+                    result.append(relative)
+        if elements:
+            return True, result, elements
+        return matched, result, None
+
+    @staticmethod
+    def _relative_pattern(pattern, field_name):
+        """ Return ``(relative pattern, element index)`` below ``field_name``. """
+        if pattern in ('*', '**'):
+            return '*', None
+        if pattern == field_name:
+            return '*', None
+        escaped = re.escape(field_name)
+        element_match = re.fullmatch(escaped + r'\[(\d+)\]', pattern)
+        if element_match:
+            return '*', int(element_match.group(1))
+        nested = re.match(r'^' + escaped + r'\[(\d+)\]\.(.+)$', pattern)
+        if nested:
+            return nested.group(2), int(nested.group(1))
+        nested = re.match(r'^' + escaped + r'(?:\[\*\])?\.(.+)$', pattern)
+        if nested:
+            return nested.group(1), None
+        if fnmatch.fnmatchcase(field_name, pattern):
+            return '*', None
+        if any(fnmatch.fnmatchcase(field_name + suffix, pattern)
+               for suffix in ('[0]', '.x')):
+            return '*', None
+        return None, None
+
+    def _reduce_fields(self, format_fields, patterns):
+        """ Reduce a list of format fields; returns (fields, leaves). """
+        fields = []
+        leaves = []
+        for field_type, array_size, field_name in format_fields:
+            if field_name.startswith('_padding'):
+                continue
+            if field_type in ULog._UNPACK_TYPES:
+                if array_size > 0:
+                    allowed = [i for i in range(array_size)
+                               if self._leaf_allowed(patterns,
+                                                     '{}[{}]'.format(field_name, i))]
+                    if not allowed:
+                        continue
+                    fields.append((field_type, array_size, field_name))
+                    # A ULog format cannot express a hole in an array: keep
+                    # the array rectangular and zero-fill unselected slots.
+                    for i in range(array_size):
+                        leaf = '{}[{}]'.format(field_name, i)
+                        leaves.append((leaf if i in allowed else None, field_type))
+                else:
+                    if not self._leaf_allowed(patterns, field_name):
+                        continue
+                    fields.append((field_type, 0, field_name))
+                    leaves.append((field_name, field_type))
+                continue
+
+            matched, child_patterns, elements = self._child_patterns(patterns, field_name)
+            if not matched:
+                continue
+            child_name, child_leaves = self._reduce_type_name(field_type, child_patterns)
+            if not child_leaves:
+                continue
+            if array_size > 0:
+                # Each element of a nested array has the same definition. If
+                # only some elements or members were selected by name, keep
+                # the array rectangular and zero-fill unselected slots.
+                fields.append((child_name, array_size, field_name))
+                for i in range(array_size):
+                    keep_element = elements is None or i in elements
+                    for relative, child_type in child_leaves:
+                        if relative is None or not keep_element:
+                            leaf = None
+                        else:
+                            full_leaf = '{0}[{1}].{2}'.format(field_name, i, relative)
+                            leaf = full_leaf if self._leaf_allowed(patterns, full_leaf) \
+                                else None
+                        leaves.append((leaf, child_type))
+            else:
+                fields.append((child_name, 0, field_name))
+                for relative, child_type in child_leaves:
+                    leaf = None if relative is None else \
+                        '{}.{}'.format(field_name, relative)
+                    leaves.append((leaf, child_type))
+        return fields, leaves
+
+    def _leaf_allowed(self, patterns, leaf):
+        """ Return True if a leaf may be written. """
+        if ULog._is_sensitive_field(leaf):
+            return False
+        if patterns is None:
+            return True
+        return any(self._pattern_matches(pattern, leaf) for pattern in patterns)
+
+    def _reduce_type_name(self, type_name, patterns):
+        """ Reduce a nested type and return (synthetic type name, leaves). """
+        signature = (type_name, None if patterns is None else tuple(sorted(set(patterns))))
+        if signature in self._cache:
+            return self._cache[signature]
+        if signature in self._expanding:
+            raise RecursionError('recursive message format definition')
+
+        original_fields = self._ulog.message_formats[type_name].fields
+        # Guard against mutually recursive FORMAT definitions in a corrupt log.
+        # The cache entry is only set after the expansion is complete.
+        self._expanding.add(signature)
+        try:
+            fields, leaves = self._reduce_fields(original_fields, patterns)
+        finally:
+            self._expanding.discard(signature)
+        if not fields:
+            result = (None, [])
+            self._cache[signature] = result
+            return result
+
+        clean_original = [field for field in original_fields
+                          if not field[2].startswith('_padding')]
+        if fields == clean_original and type_name not in self._top_level_names:
+            reduced_name = type_name
+        else:
+            # Either the layout changed or the name is reserved for a reduced
+            # top-level topic; both need a distinct synthetic name.
+            reduced_name = self._new_name(type_name)
+        self._formats.append(_ExportMessageFormat(reduced_name, fields))
+        result = (reduced_name, leaves)
+        self._cache[signature] = result
+        return result
+
+    def _new_name(self, type_name):
+        """ Allocate a collision-free synthetic format name. """
+        while True:
+            self._counter += 1
+            candidate = '{}__red{}'.format(type_name, self._counter)
+            if candidate not in self._used_names:
+                self._used_names.add(candidate)
+                return candidate
 
 __author__ = "Beat Kueng"
 
@@ -239,8 +622,195 @@ class ULog(object):
         return [elem for elem in self._data_list
                 if elem.name == name and elem.multi_id == multi_instance][0]
 
-    def write_ulog(self, log_file):
-        """ write current data back into a ulog file """
+    def write_ulog(self, log_file, field_whitelist=None, time_start=None, time_end=None,
+                   time_window=None, time_s=None, time_e=None, start_timestamp=None,
+                   end_timestamp=None, topics=None, topic_fields=None, fields=None,
+                   parameter_whitelist=None, include_parameters=True,
+                   include_info=False, include_logged_messages=False,
+                   include_dropouts=False):
+        """ Write current data back into a ulog file.
+
+        Without filtering arguments this reproduces the loaded log as before.
+        With a field whitelist and/or a time window it writes a reduced log that
+        can be read by any regular ULog reader (including this class):
+
+        :param field_whitelist: either a list of topic names to keep in full,
+               or a dict mapping a topic name to a list of field names. Field
+               names may be leaf names (``q[1]``), array/base names (``q``),
+               nested prefixes (``current``) or shell-style patterns
+               (``current.*``). ``None`` keeps every topic and every field that
+               is not privacy-sensitive. A leaf is only ever a permission, so
+               sensitive leaves such as ``serial_number`` or ``callsign`` are
+               never written, even if they are listed.
+        :param time_start: first sample timestamp to write, in microseconds
+               (inclusive). ``None`` starts at the first sample.
+        :param time_end: last sample timestamp (exclusive), in microseconds.
+               ``None`` writes up to the end of the log.
+        :param time_window: optional ``(start, end)`` tuple alternative to
+               time_start/time_end.
+        :param time_s: alias for time_start, in seconds.
+        :param time_e: alias for time_end, in seconds.
+        :param start_timestamp: alias for time_start (microseconds).
+        :param end_timestamp: alias for time_end (microseconds).
+        :param topics: alias to restrict the export to the given topic names.
+        :param topic_fields: alias for field_whitelist.
+        :param fields: alias for field_whitelist.
+        :param parameter_whitelist: optional list of parameter names. By default
+               all non-sensitive parameters are written.
+        :param include_parameters: write the effective parameter state at the
+               cut point (True by default).
+        :param include_info: also write non-sensitive information messages.
+        :param include_logged_messages: also write log strings (off by default,
+               as they can contain operator information).
+        :param include_dropouts: write dropout messages inside the window.
+        :return: a :class:`ULogExportReport` describing what was retained.
+        """
+        options = self._normalize_export_options(
+            field_whitelist, time_start, time_end, time_window, time_s, time_e,
+            start_timestamp, end_timestamp, topics, topic_fields, fields,
+            parameter_whitelist, include_parameters, include_info,
+            include_logged_messages, include_dropouts)
+
+        if not options['filtered']:
+            self._write_full_ulog(log_file)
+            return None
+
+        report = ULogExportReport()
+        export = self._build_export(options, report)
+
+        if isinstance(log_file, str):
+            handle = open(log_file, "wb")
+        else:
+            handle = contextlib.nullcontext(log_file)
+
+        with handle as ulog_file:
+            self._write_file_header(ulog_file, export['header_timestamp'])
+            self._write_export_flags(ulog_file)
+            for message_format in export['formats']:
+                self._write_one_format_message(ulog_file, message_format)
+            if options['include_parameters']:
+                for name, value in export['parameter_state'].items():
+                    data = self._make_parameter_data(name, value)
+                    ulog_file.write(struct.pack('<HB', len(data), self.MSG_TYPE_PARAMETER))
+                    ulog_file.write(data)
+            if options['include_info']:
+                self._write_export_info_messages(ulog_file)
+            for subscription in export['subscriptions']:
+                data = bytearray()
+                data.extend(struct.pack('<BH', subscription['multi_id'],
+                                        subscription['msg_id']))
+                data.extend(bytes(subscription['name'], 'utf-8'))
+                ulog_file.write(struct.pack('<HB', len(data), self.MSG_TYPE_ADD_LOGGED_MSG))
+                ulog_file.write(data)
+            for _, _, buffer in export['data_items']:
+                ulog_file.write(buffer)
+
+        report.format_count = len(export['formats'])
+        report.parameter_count = (len(export['parameter_state']) +
+                                  len(export['parameter_changes']))
+        report.parameters = dict(export['parameter_state'])
+        report.parameter_changes = list(export['parameter_changes'])
+        report.start_timestamp = export['start_timestamp']
+        report.end_timestamp = export['end_timestamp']
+        return report
+
+    def write_ulog_filtered(self, log_file, **kwargs):
+        """ Alias for :meth:`write_ulog` with filtering arguments. """
+        return self.write_ulog(log_file, **kwargs)
+
+    @staticmethod
+    def _normalize_export_options(field_whitelist, time_start, time_end, time_window,
+                                  time_s, time_e, start_timestamp, end_timestamp,
+                                  topics, topic_fields, fields, parameter_whitelist,
+                                  include_parameters, include_info,
+                                  include_logged_messages, include_dropouts):
+        """ Validate and normalize the filtering arguments of write_ulog. """
+        aliases = [value for value in (field_whitelist, topic_fields, fields,
+                                       topics) if value is not None]
+        if len(aliases) > 1:
+            raise ValueError('pass only one of field_whitelist/topic_fields/fields/topics')
+
+        if time_window is not None:
+            try:
+                window_start, window_end = time_window
+            except (TypeError, ValueError) as error:
+                raise ValueError('time_window must be a (start, end) pair') from error
+        else:
+            window_start = window_end = None
+
+        whitelist = aliases[0] if aliases else None
+        normalized = None
+        if whitelist is not None:
+            if isinstance(whitelist, Mapping):
+                normalized = {}
+                for name, selection in whitelist.items():
+                    if not isinstance(name, str):
+                        raise ValueError('topic names in field_whitelist must be strings')
+                    if selection is None:
+                        normalized[name] = None
+                    elif isinstance(selection, str):
+                        normalized[name] = [item.strip() for item in selection.split(',')
+                                            if item.strip()]
+                    else:
+                        normalized[name] = [str(field) for field in selection]
+            elif isinstance(whitelist, str):
+                normalized = {item.strip(): None for item in whitelist.split(',')
+                              if item.strip()}
+            else:
+                normalized = {}
+                for name in whitelist:
+                    if not isinstance(name, str):
+                        raise ValueError('topic names in field_whitelist must be strings')
+                    normalized[name] = None
+
+        starts = []
+        if time_start is not None:
+            starts.append(int(time_start))
+        if start_timestamp is not None:
+            starts.append(int(start_timestamp))
+        if time_s is not None:
+            starts.append(int(round(time_s * 1e6)))
+        if time_window is not None:
+            starts.append(int(window_start))
+        ends = []
+        if time_end is not None:
+            ends.append(int(time_end))
+        if end_timestamp is not None:
+            ends.append(int(end_timestamp))
+        if time_e is not None:
+            ends.append(int(round(time_e * 1e6)))
+        if time_window is not None:
+            ends.append(int(window_end))
+        if len(set(starts)) > 1 or len(set(ends)) > 1:
+            raise ValueError('conflicting start/end time arguments')
+        start = starts[0] if starts else None
+        end = ends[0] if ends else None
+        if start is not None and end is not None and end < start:
+            raise ValueError('time_end must not be smaller than time_start')
+
+        if parameter_whitelist is not None:
+            if isinstance(parameter_whitelist, str):
+                parameter_whitelist = [parameter_whitelist]
+            parameter_whitelist = set(parameter_whitelist)
+
+        filtered = (normalized is not None or start is not None or end is not None or
+                    parameter_whitelist is not None or include_info or
+                    include_logged_messages or include_dropouts or
+                    not include_parameters)
+        return {
+            'whitelist': normalized,
+            'start': start,
+            'end': end,
+            'parameter_whitelist': parameter_whitelist,
+            'include_parameters': include_parameters,
+            'include_info': include_info,
+            'include_logged_messages': include_logged_messages,
+            'include_dropouts': include_dropouts,
+            'filtered': filtered,
+        }
+
+    def _write_full_ulog(self, log_file):
+        """ Write all loaded data, preserving the historical write_ulog behaviour. """
         if isinstance(log_file, str):
             handle = open(log_file, "wb")
         else:
@@ -260,11 +830,300 @@ class ULog(object):
             self._write_logged_message_subscriptions(ulog_file)
             self._write_data_section(ulog_file)
 
-    def _write_file_header(self, file):
+    @staticmethod
+    def _is_sensitive_name(name):
+        """ Return True if a parameter/info name carries private information. """
+        return bool(_SENSITIVE_NAME_RE.search(name))
+
+    @staticmethod
+    def _is_sensitive_field(flat_name):
+        """ Return True if a flattened data field is privacy-sensitive. """
+        leaf = flat_name.rsplit('.', 1)[-1]
+        leaf = re.sub(r'\[\d+\]$', '', leaf)
+        return bool(_SENSITIVE_FIELD_RE.match(leaf))
+
+    def _write_export_flags(self, file):
+        """ Write flags for a standalone (non-appended) filtered log. """
+        compat_flags = list(self._compat_flags)
+        compat_flags[0] &= ~0x01 # no default parameter messages are written
+        data = bytearray()
+        data.extend(struct.pack('<' + 'B' * 8, *compat_flags))
+        data.extend(struct.pack('<' + 'B' * 8, *([0] * 8)))
+        data.extend(struct.pack('<' + 'Q' * 3, *([0] * 3)))
+        file.write(struct.pack('<HB', len(data), self.MSG_TYPE_FLAG_BITS))
+        file.write(data)
+
+    def _write_one_format_message(self, file, message_format):
+        """ Write a single MessageFormat-like object to the definition section. """
+        data = bytearray()
+        data.extend(bytes(message_format.name + ':', 'utf-8'))
+        for field_type, array_size, field_name in message_format.fields:
+            if array_size > 0:
+                encoded_field = '%s[%d] %s;' % (field_type, array_size, field_name)
+            else:
+                encoded_field = '%s %s;' % (field_type, field_name)
+            data.extend(bytes(encoded_field, 'utf-8'))
+        file.write(struct.pack('<HB', len(data), self.MSG_TYPE_FORMAT))
+        file.write(data)
+
+    def _write_export_info_messages(self, file):
+        """ Write non-sensitive info and info-multiple messages. """
+        for key, value in self._msg_info_dict.items():
+            if self._is_sensitive_name(key):
+                continue
+            value_type = self._msg_info_dict_types[key]
+            data = self._make_info_message_data(value_type + ' ' + key, value, value_type)
+            file.write(struct.pack('<HB', len(data), self.MSG_TYPE_INFO))
+            file.write(data)
+        for key, value_sets in self._msg_info_multiple_dict.items():
+            if self._is_sensitive_name(key):
+                continue
+            value_type = self._msg_info_multiple_dict_types[key]
+            for value_set in value_sets:
+                continued = False
+                for value in value_set:
+                    data = self._make_info_message_data(value_type + ' ' + key, value,
+                                                        value_type, continued)
+                    file.write(struct.pack('<HB', len(data), self.MSG_TYPE_INFO_MULTIPLE))
+                    file.write(data)
+                    continued = True
+
+    def _build_export(self, options, report):
+        """ Build reduced formats, subscriptions, parameter state and data items. """
+        whitelist = options['whitelist']
+        start = options['start']
+        end = options['end']
+
+        datasets = {}
+        for data_set in self._data_list:
+            datasets.setdefault(data_set.name, {})[data_set.multi_id] = data_set
+
+        if whitelist is None:
+            # No topic filter: an untouched, non-sensitive view of all data.
+            topic_selection = {name: None for name in datasets}
+        else:
+            # Only topics named by the caller are considered. A named topic
+            # that never logged data still gets its reduced definition, so a
+            # regular reader can decode the advertised topic types.
+            topic_selection = dict(whitelist)
+
+        layout_builder = _ExportLayoutBuilder(self, topic_selection)
+        selected_datasets = []
+        for topic_name, selection in topic_selection.items():
+            if topic_name not in datasets:
+                if topic_name not in self._message_formats:
+                    report.skipped_topics[topic_name] = 'topic not found'
+                    continue
+                try:
+                    layout = layout_builder.build(topic_name, selection)
+                except (_UnrepresentableLayout, KeyError, RecursionError) as error:
+                    report.skipped_topics[topic_name] = _layout_error_message(error)
+                    continue
+                if layout is None:
+                    report.skipped_topics[topic_name] = 'no exportable fields'
+                    continue
+                if selection is not None:
+                    report.unmatched_fields[topic_name] = list(layout_builder.unmatched)
+                    report.omitted_sensitive_fields[topic_name] = \
+                        list(layout_builder.blocked)
+                # Keep the reduced definition so a plain reader can decode the
+                # topic even though this window has no samples for it. The
+                # subscription is only written if the topic logged data
+                # somewhere, which is the case for every name in datasets.
+                report.written_fields[topic_name] = _layout_field_names(layout)
+                if _layout_zero_filled(layout):
+                    report.zero_filled_fields[topic_name] = _layout_zero_filled(layout)
+                report.empty_topics[topic_name] = 'no samples in time window'
+                continue
+            if topic_name not in self._message_formats:
+                report.skipped_topics[topic_name] = 'message format not found'
+                continue
+            try:
+                layout = layout_builder.build(topic_name, selection)
+            except (_UnrepresentableLayout, KeyError, RecursionError) as error:
+                report.skipped_topics[topic_name] = _layout_error_message(error)
+                continue
+            if layout is None:
+                report.skipped_topics[topic_name] = 'no exportable fields'
+                continue
+            if selection is not None:
+                report.unmatched_fields[topic_name] = list(layout_builder.unmatched)
+                report.omitted_sensitive_fields[topic_name] = \
+                    list(layout_builder.blocked)
+            report.written_fields[topic_name] = _layout_field_names(layout)
+            if _layout_zero_filled(layout):
+                report.zero_filled_fields[topic_name] = _layout_zero_filled(layout)
+
+            for multi_id, data_set in sorted(datasets[topic_name].items()):
+                indices = self._window_indices(data_set, start, end)
+                if len(indices) == 0:
+                    # Keep the subscription so a receiver can decode an
+                    # appended stream, but there is nothing to write here.
+                    report.empty_topics['{}[{}]'.format(topic_name, multi_id)] = \
+                        'no samples in time window'
+                    selected_datasets.append((data_set, layout, indices))
+                    continue
+                selected_datasets.append((data_set, layout, indices))
+                report.topics.setdefault(topic_name, []).append(multi_id)
+
+        formats = layout_builder.formats()
+        subscriptions = []
+        data_items = []
+        sample_timestamps = []
+        sequence = 0
+        for data_set, layout, indices in selected_datasets:
+            subscriptions.append({
+                'name': data_set.name,
+                'multi_id': data_set.multi_id,
+                'msg_id': data_set.msg_id,
+            })
+            for sample_index in indices:
+                timestamp = int(data_set.data['timestamp'][sample_index])
+                sample_timestamps.append(timestamp)
+                data = bytearray(struct.pack('<H', data_set.msg_id))
+                for leaf_name, type_str in layout.leaves:
+                    encoding = self._UNPACK_TYPES[type_str][0]
+                    if leaf_name is None:
+                        # Unselected element of an array whose other elements
+                        # are kept: the reduced format has to stay rectangular,
+                        # so this slot is zero-filled.
+                        value = 0 if encoding != 'c' else b'\x00'
+                    else:
+                        value = data_set.data[leaf_name][sample_index]
+                        if encoding == 'c':
+                            value = bytes([int(value) & 0xff])
+                        else:
+                            value = value.item() if hasattr(value, 'item') else value
+                    data.extend(struct.pack('<' + encoding, value))
+                header = struct.pack('<HB', len(data), self.MSG_TYPE_DATA)
+                data_items.append((timestamp, sequence, header + bytes(data)))
+                sequence += 1
+
+        data_items.sort(key=lambda item: (item[0], item[1]))
+        parameter_state, parameter_changes = self._build_parameter_state(options, start, end)
+        for timestamp, name, value in parameter_changes:
+            data = self._make_parameter_data(name, value)
+            header = struct.pack('<HB', len(data), self.MSG_TYPE_PARAMETER)
+            data_items.append((timestamp, sequence, header + data))
+            sequence += 1
+        if options['include_dropouts']:
+            for dropout in self._dropouts:
+                if start is not None and dropout.timestamp < start:
+                    continue
+                if end is not None and dropout.timestamp >= end:
+                    continue
+                data = struct.pack('<H', dropout.duration)
+                header = struct.pack('<HB', len(data), self.MSG_TYPE_DROPOUT)
+                data_items.append((dropout.timestamp, sequence, header + data))
+                sequence += 1
+        if options['include_logged_messages']:
+            for message in self._logged_messages:
+                self._append_export_logged_message(data_items, message, False, start, end,
+                                                   sequence)
+                sequence += 1
+            for message_list in self._logged_messages_tagged.values():
+                for message in message_list:
+                    self._append_export_logged_message(data_items, message, True, start,
+                                                       end, sequence)
+                    sequence += 1
+        data_items.sort(key=lambda item: (item[0], item[1]))
+
+        if sample_timestamps:
+            start_timestamp = min(sample_timestamps)
+        elif start is not None:
+            start_timestamp = start
+        else:
+            start_timestamp = self._start_timestamp
+        end_timestamp = max(sample_timestamps) if sample_timestamps else start_timestamp
+        return {
+            'formats': formats,
+            'subscriptions': sorted(subscriptions,
+                                    key=lambda item: (item['msg_id'], item['multi_id'])),
+            'data_items': data_items,
+            'parameter_state': parameter_state,
+            'parameter_changes': parameter_changes,
+            'start': start,
+            'end': end,
+            # Keep the original logging start: it is a reference for duration
+            # and absolute time, and is not implied by the first sample.
+            'header_timestamp': self._start_timestamp,
+            'start_timestamp': start_timestamp,
+            'end_timestamp': end_timestamp,
+        }
+
+    def _append_export_logged_message(self, data_items, message, tagged, start, end,
+                                      sequence):
+        """ Append a log string message if it lies inside the export window. """
+        if start is not None and message.timestamp < start:
+            return
+        if end is not None and message.timestamp >= end:
+            return
+        data = bytearray()
+        if tagged:
+            data.extend(struct.pack('<BHQ', message.log_level, message.tag,
+                                    message.timestamp))
+            msg_type = self.MSG_TYPE_LOGGING_TAGGED
+        else:
+            data.extend(struct.pack('<BQ', message.log_level, message.timestamp))
+            msg_type = self.MSG_TYPE_LOGGING
+        data.extend(bytes(message.message, 'utf-8'))
+        header = struct.pack('<HB', len(data), msg_type)
+        data_items.append((message.timestamp, sequence, header + data))
+
+    @staticmethod
+    def _window_indices(data_set, start, end):
+        """ Return sample indices within [start, end). """
+        timestamps = data_set.data['timestamp']
+        if len(timestamps) == 0:
+            return []
+        mask = np.ones(len(timestamps), dtype=bool)
+        if start is not None:
+            mask &= timestamps >= start
+        if end is not None:
+            mask &= timestamps < end
+        return np.nonzero(mask)[0]
+
+    def _build_parameter_state(self, options, start, end):
+        """ Return effective parameters at the cut point and in-window changes. """
+        state = {}
+        if options['include_parameters']:
+            for name, value in self._initial_parameters.items():
+                if self._parameter_allowed(name, options):
+                    state[name] = value
+            if start is not None:
+                # Definition parameters describe the state at the first written
+                # sample, so changes up to and including the cut point are
+                # folded into it and are not repeated in the data section.
+                for timestamp, name, value in self._changed_parameters:
+                    if timestamp <= start and self._parameter_allowed(name, options):
+                        state[name] = value
+
+        changes = []
+        if options['include_parameters']:
+            for timestamp, name, value in self._changed_parameters:
+                if not self._parameter_allowed(name, options):
+                    continue
+                if start is not None and timestamp <= start:
+                    continue
+                if end is not None and timestamp >= end:
+                    continue
+                changes.append((timestamp, name, value))
+
+        return dict(sorted(state.items())), changes
+
+    def _parameter_allowed(self, name, options):
+        if self._is_sensitive_name(name):
+            return False
+        whitelist = options['parameter_whitelist']
+        return whitelist is None or name in whitelist
+
+    def _write_file_header(self, file, start_timestamp=None):
         header_data = bytearray()
         header_data.extend(self.HEADER_BYTES)
         header_data.extend(struct.pack('B', self._file_version))
-        header_data.extend(struct.pack('<Q', self._start_timestamp))
+        if start_timestamp is None:
+            start_timestamp = self._start_timestamp
+        header_data.extend(struct.pack('<Q', int(start_timestamp)))
         if len(header_data) != 16:
             raise TypeError("Written header is too short")
 

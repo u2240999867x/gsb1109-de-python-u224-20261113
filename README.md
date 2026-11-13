@@ -238,6 +238,52 @@ options:
   -v, --verbose         Print extra debugging information
 ```
 
+### Sharing a reduced log (write_ulog filtering)
+
+`ULog.write_ulog()` can write a reduced copy for a receiver that only needs a
+few bench topics in a time window. The copy is a normal ULog file: a regular
+reader decodes it without any knowledge of the whitelist, and the written
+values, field types and in-window sample order match the source.
+
+```python
+ulog = pyulog.ULog('bench.ulg')
+report = ulog.write_ulog(
+    'share.ulg',
+    field_whitelist={
+        'sensor_combined': ['timestamp', 'gyro_rad', 'accelerometer_m_s2'],
+        'vehicle_attitude': ['timestamp', 'q', 'rollspeed'],
+    },
+    time_window=(163000000, 164000000),   # microseconds, end exclusive
+)
+print(report.summary())                   # kept, empty, and skipped topics
+```
+
+- `field_whitelist` accepts topic names as lists (keep the whole topic), or a
+  dict of topic name to field names. Fields may be leaves (`q[1]`), base names
+  (`q`), nested prefixes (`current`) or patterns (`current.*`). `topics`,
+  `topic_fields` and `fields` are aliases; `time_s`/`time_e` take seconds and
+  `start_timestamp`/`end_timestamp` take microseconds.
+- The export always contains the reduced `FORMAT` definitions needed to decode
+  the selected topics. Nested types referenced by a reduced top-level type get
+  their own reduced layout instead of the original one, so a plain reader can
+  still parse every record.
+- Privacy rules are enforced in addition to the whitelist: serial numbers,
+  callsigns, operator names and device identity parameters (`CAL_*_ID`,
+  `COM_FLIGHT_UUID`, ...) are never written, even when requested. Information
+  and log-string messages are omitted by default; `include_info=True` writes
+  only non-sensitive information messages. If nothing else is left, the topic
+  is reported in `report.skipped_topics` / `report.omitted_sensitive_fields`.
+- The effective parameter state at the window start is written as definition
+  parameters, and later parameter changes inside the window are replayed as
+  data-section parameter messages. Use `include_parameters=False` to omit them.
+- Topics that exist in the format definitions but have no samples in the window
+  keep their reduced definition (and subscription, if they logged data
+  elsewhere) and are listed in `report.empty_topics`, so a receiver can still
+  decode a possibly appended stream.
+- The report separates `topics` (written with samples), `empty_topics`,
+  `skipped_topics` (unretainable, with a reason), `unmatched_fields`,
+  `omitted_sensitive_fields` and the parameter state that was written.
+
 ### Migrate/setup the database for use with the DatabaseULog class (ulog_migratedb)
 
 > **Warning** This command must be run whenever the schema changes, otherwise DatabaseULog won't function.
