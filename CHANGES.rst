@@ -1,6 +1,23 @@
 Changes
 =======
 
+0.6.0 (unreleased)
+------------------
+
+* Added structured price-range extraction. ``Price`` now exposes a
+  ``price_range`` attribute (with ``Bound`` / ``PriceRange`` types and a
+  ``parse_price_range`` helper) describing two-sided quotes (``"10–12 /kg"``)
+  and one-sided quotes (``"from 10"``, ``"10 以下"``), including endpoint
+  inclusivity, currency, an explicitly stated unit and the original range
+  text.
+* Range endpoints are only joined through an explicit connector and matching
+  currency, so adjacent original/sale prices or quotes in different
+  currencies are never stitched into one interval.
+* Added ``PriceRange.certainly_at_most`` and ``possibly_at_most`` to
+  distinguish goods that are definitely within a budget from ones that only
+  might be. A unit-less one-sided quote keeps ``unit=None`` instead of being
+  treated as a per-kilogram limit.
+
 0.5.1 (2026-03-19)
 ------------------
 

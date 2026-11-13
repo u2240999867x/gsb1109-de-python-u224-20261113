@@ -166,6 +166,77 @@ Price(amount=Decimal('140.600'), currency='$')
 Price(amount=Decimal('140600'), currency='$')
 
 
+Price ranges
+------------
+
+Besides the single ``amount``, ``Price`` exposes a structured
+``price_range`` describing the whole quote: its endpoints, whether each
+endpoint is inclusive, its currency, an explicitly stated unit, and the
+raw text the range came from.
+
+A two-sided quote such as ``"10–12 /kg"`` is parsed into a lower and an
+upper bound; both are inclusive for a regular interval, and the unit is only
+recorded when it is actually written (``"/kg"`` here), never guessed:
+
+>>> price = Price.fromstring("10–12 /kg")
+>>> price.price_range.values
+(Decimal('10'), Decimal('12'))
+>>> price.price_range.lower.inclusive
+True
+>>> price.price_range.unit
+'kg'
+>>> price.price_range.source_text
+'10–12'
+
+One-sided quotes keep the missing side as ``None``. ``"from 10"`` is a
+lower bound, while ``"10 以下"`` is an inclusive upper bound:
+
+>>> lower = Price.fromstring("from 10").price_range
+>>> lower.lower.inclusive, lower.upper
+(True, None)
+>>> upper = Price.fromstring("10 以下").price_range
+>>> upper.lower, upper.upper.inclusive
+(None, True)
+
+An exclusive limit such as ``"under 10"`` keeps the value but marks the
+bound as not inclusive:
+
+>>> from price_parser import parse_price_range
+>>> parse_price_range("under 10")
+PriceRange(lower=None, upper=Bound(value=Decimal('10'), inclusive=False), currency=None)
+
+Endpoints are only joined when an explicit connector (``-``, ``–``, ``~``,
+``"to"`` ...) is present and the currencies agree. A current price next to a
+struck-through original price, or a quote in another currency, is therefore
+never stitched into one range; it stays a single exact value:
+
+>>> Price.fromstring("$19.99 $9.99").price_range.is_exact
+True
+>>> Price.fromstring("$5 – €8").price_range.is_exact
+True
+
+Use ``certainly_at_most`` / ``possibly_at_most`` to separate goods that are
+definitely cheap from ones that might be. A lower-only quote (``"from 10"``)
+and an interval that extends past ten (``"10–12"``) are possible but not
+certain to be at most ten, while ``"10 以下"`` is certain:
+
+>>> from decimal import Decimal
+>>> Price.fromstring("10 以下").price_range.certainly_at_most(Decimal(10))
+True
+>>> Price.fromstring("from 10").price_range.certainly_at_most(Decimal(10))
+False
+>>> Price.fromstring("10–12 /kg").price_range.certainly_at_most(Decimal(10))
+False
+>>> Price.fromstring("10–12 /kg").price_range.possibly_at_most(Decimal(10))
+True
+
+A quote without a unit keeps ``unit=None`` instead of being treated as a
+per-kilogram cap, and a one-sided quote with no unit is preserved as-is:
+
+>>> Price.fromstring("from 10").price_range.unit is None
+True
+
+
 Contributing
 ============
 
