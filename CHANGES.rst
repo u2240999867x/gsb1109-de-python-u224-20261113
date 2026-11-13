@@ -1,6 +1,17 @@
 Changes
 =======
 
+(unreleased)
+------------
+
+* Added ``price_parser.history``: tools for building comparable price
+  histories from scraped price tags.  Tags are normalized to net-of-tax
+  unit price intervals (raw price text, net content, and effective-dated
+  regional tax rates), changes are classified as definite/possible
+  increases or insufficient evidence, same-day captures are treated as
+  coexisting versions regardless of scrape order, and every reported
+  increase keeps references to the two price tags supporting it.
+
 0.5.1 (2026-03-19)
 ------------------
 

@@ -166,6 +166,44 @@ Price(amount=Decimal('140.600'), currency='$')
 Price(amount=Decimal('140600'), currency='$')
 
 
+Price history analysis
+----------------------
+
+``price_parser.history`` builds comparable price histories from scraped
+price tags.  Each tag is normalized to a net-of-tax price-per-gram
+interval (using the raw price text, the net content, and the tax rate in
+effect in the region on the capture date), so that a merchant changing
+the net content (500 g -> 450 g) or switching between tax-inclusive and
+tax-exclusive display is not mistaken for a price change.
+
+>>> from datetime import date
+>>> from decimal import Decimal
+>>> from price_parser import (
+...     PriceTag, TaxCalendar, TaxMode, TaxRateChange, analyze_price_history,
+... )
+>>> vat = TaxCalendar({"DE": [TaxRateChange(date(2020, 1, 1), Decimal("0.19"))]})
+>>> tags = [
+...     PriceTag("t1", "p1", date(2026, 1, 10), "5,99 €", region="DE",
+...              tax_mode=TaxMode.INCLUSIVE, net_grams_min=Decimal("500")),
+...     PriceTag("t2", "p1", date(2026, 3, 1), "5,49 €", region="DE",
+...              tax_mode=TaxMode.EXCLUSIVE, net_grams_min=Decimal("450")),
+... ]
+>>> events = analyze_price_history(tags, vat)
+>>> [event.verdict.value for event in events]
+['definite_increase']
+>>> [(pair.before_tag.tag_id, pair.after_tag.tag_id)
+...  for pair in events[0].supporting_pairs]
+[('t1', 't2')]
+
+When the tax rate or the net content is only known as a range, the
+normalized price is an interval, and changes are classified as
+``definite_increase`` (intervals do not overlap), ``possible_increase``
+(intervals overlap) or ``insufficient_evidence`` (data missing).  Tags
+captured on the same day are treated as coexisting versions and never
+ordered by scrape sequence; every reported increase keeps references to
+the two price tags supporting it via ``event.supporting_pairs``.
+
+
 Contributing
 ============
 
