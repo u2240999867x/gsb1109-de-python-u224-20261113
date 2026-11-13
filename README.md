@@ -42,6 +42,44 @@ You can replace those tables (dropping them before restoring them) using the `--
 ```bash
 sqlite-diffable load restored.db dump/ --replace
 ```
+
+## Selectively restoring into an existing database
+
+`load` creates tables from scratch. When the target database already exists
+and only a subset of an archive should come back, use `restore-filtered`. It
+restores one table's filtered rows (the **anchor** documents) together with
+everything they reference, and nothing else:
+
+```bash
+sqlite-diffable restore-filtered shop.db archive/ \
+    --table receipt --filter branch_id=B1
+```
+
+Rules applied by the restore:
+
+- **Anchor filtering** — only `receipt` rows matching every `--filter`
+  (`column=value`, repeatable, combined with AND) are considered.
+- **Reference closure** — suppliers, contracts and other rows the selected
+  documents actually reference are pulled in too, including rows that
+  reference the documents back (such as receipt lines). Data belonging to
+  other branches that is never referenced is not imported.
+- **Composite foreign keys are judged as a group** — a row only satisfies a
+  multi-column foreign key when *all* referenced columns match; a partial
+  single-column match never counts.
+- **No overwrites** — a row already present in the target with the same key
+  but different content is a conflict. It is left untouched and every anchor
+  document depending on it is reported as blocked instead of being restored.
+- **Closed cycles restore** — groups of rows that reference each other in a
+  cycle are inserted as a set (foreign keys are checked afterwards with
+  `PRAGMA foreign_key_check`).
+- **Blocked documents are listed** — the report names each anchor document
+  that could not be restored and why (`content_mismatch` or
+  `missing_dependency`). The command exits `2` when any document is blocked,
+  `0` otherwise. Re-running it is safe and inserts nothing twice.
+
+Pass `--json` to get the full machine-readable report
+(`imported`, `skipped_identical`, `blocked`, `conflicts`) instead of the
+human-readable summary.
 ## Converting to JSON objects
 
 Table rows are stored in the `.ndjson` files as newline-delimited JSON arrays, like this:

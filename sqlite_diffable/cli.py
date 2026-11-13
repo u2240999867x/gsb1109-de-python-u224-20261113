@@ -5,6 +5,8 @@ import sqlite_utils
 import sqlite3
 import sys
 
+from .restore import restore, RestoreError
+
 
 @click.group()
 @click.version_option()
@@ -114,6 +116,100 @@ def load(dbpath, directory, replace):
             if line.strip()
         )
         db[info["name"]].insert_all(rows)
+
+
+@cli.command(name="restore-filtered")
+@click.argument(
+    "dbpath",
+    type=click.Path(exists=True, file_okay=True, dir_okay=False),
+)
+@click.argument(
+    "directory",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True),
+)
+@click.option(
+    "--table",
+    "anchor_table",
+    required=True,
+    help="Anchor table whose rows are filtered (e.g. receipt)",
+)
+@click.option(
+    "--filter",
+    "filters",
+    multiple=True,
+    help="Column=value filter on the anchor table, repeatable (AND)",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit the full report as JSON")
+def restore_filtered(dbpath, directory, anchor_table, filters, as_json):
+    """
+    Restore only rows reachable from filtered anchor rows into an EXISTING db.
+
+    Example, restoring one branch's receipts plus their suppliers/contracts:
+
+        sqlite-diffable restore-filtered shop.db archive/ \\
+            --table receipt --filter branch=S001
+
+    Existing same-key rows are never overwritten: conflicts block the
+    affected documents, which are listed in the report.
+    """
+    parsed_filters = {}
+    for item in filters:
+        if "=" not in item:
+            raise click.ClickException(
+                "--filter expects column=value, got: {}".format(item)
+            )
+        column, raw_value = item.split("=", 1)
+        try:
+            value = json.loads(raw_value)
+        except json.JSONDecodeError:
+            value = raw_value
+        parsed_filters[column] = value
+    try:
+        report = restore(dbpath, directory, anchor_table, parsed_filters)
+    except RestoreError as ex:
+        raise click.ClickException(str(ex))
+    if as_json:
+        click.echo(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        filters_text = json.dumps(report["filters"], ensure_ascii=False)
+        click.echo(
+            "Anchor: {} {}".format(report["anchor_table"], filters_text)
+        )
+        if report["imported"]:
+            click.echo("Imported:")
+            for table, keys in sorted(report["imported"].items()):
+                click.echo("  {} ({} row(s))".format(table, len(keys)))
+        else:
+            click.echo("Imported: nothing")
+        if report["skipped_identical"]:
+            click.echo("Already present with identical content:")
+            for table, keys in sorted(report["skipped_identical"].items()):
+                click.echo("  {} ({} row(s))".format(table, len(keys)))
+        if report["blocked"]:
+            click.echo("Blocked documents:")
+            for item in report["blocked"]:
+                click.echo(
+                    "  {} key={}".format(item["table"], json.dumps(item["key"]))
+                )
+                for reason in item["reasons"]:
+                    click.echo(
+                        "    - {kind} on {table} key={key} {extra}".format(
+                            kind=reason["kind"],
+                            table=reason["table"],
+                            key=json.dumps(reason["key"], ensure_ascii=False),
+                            extra=(
+                                "differing columns: {}".format(
+                                    ", ".join(reason["differing_columns"])
+                                )
+                                if reason["kind"] == "content_mismatch"
+                                else "referenced via: {}".format(
+                                    ", ".join(reason["referenced_by_columns"])
+                                )
+                            ),
+                        )
+                    )
+    if report["blocked"]:
+        sys.exit(2)
 
 
 @cli.command()
