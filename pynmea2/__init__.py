@@ -12,6 +12,21 @@ parse = NMEASentence.parse
 
 from .types import *
 
+from .satellites import (
+    Satellite,
+    SignalObservation,
+    GSVRound,
+    GSARound,
+    SatelliteReconciler,
+    resolve_constellation,
+    extended_constellation,
+    signal_name,
+    signal_constellation,
+    TALKER_CONSTELLATIONS,
+    EXTENDED_SATELLITE_RANGES,
+    SIGNAL_NAMES,
+)
+
 from .stream import NMEAStreamReader
 from .nmea_file import NMEAFile
 

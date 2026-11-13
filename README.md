@@ -167,3 +167,38 @@ while 1:
         print('Parse error: {}'.format(e))
         continue
 ```
+
+## GSA/GSV satellite reconciliation
+
+`pynmea2.satellites.SatelliteReconciler` compares the satellites used for a fix
+(GSA) with the satellites in view (GSV).  It keeps the constellation and signal
+ID with every observation, folds the two frequency bands of one satellite back
+to a single physical satellite, and never merges identical short numbers from
+different constellations.
+
+```python
+import pynmea2
+from pynmea2 import SatelliteReconciler
+
+reconciler = SatelliteReconciler()
+for line in open('track.nmea'):
+    reconciler.feed(pynmea2.parse(line))
+reconciler.flush()
+
+reconciler.seen_satellites()      # distinct physical satellites in GSV
+reconciler.used_satellites()      # distinct physical satellites in GSA
+reconciler.used_not_seen()        # GSA entries missing from the GSV cycles
+reconciler.signal_summary()       # satellite -> observed NMEA 4.10 signal IDs
+reconciler.dual_band_satellites() # satellites folded from two bands
+print(reconciler.report())
+```
+
+The constellation is proven from the talker ID (`GP`, `GL`, ...), the NMEA
+4.10 extended satellite ID ranges or the signal ID on mixed `GN` sentences.
+Legacy sentences without any usable system identifier cannot be assigned to a
+constellation; `legacy_ambiguity()` then returns the provable lower/upper
+satellite count and the satellite numbers that remain ambiguous together with
+their candidate constellations.  See
+[examples/reconcile_satellites.py](/examples/reconcile_satellites.py) for a
+worked "12 reported vs. 9 listed" example.
+
