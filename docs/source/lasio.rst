@@ -62,7 +62,14 @@ Modifying data
 Writing data out
 ----------------
 .. automethod:: lasio.LASFile.write
+.. automethod:: lasio.LASFile.verify_roundtrip
 .. autofunction:: lasio.writer.write
+.. autofunction:: lasio.writer.verify_export
+.. autofunction:: lasio.roundtrip.verify_roundtrip
+.. autoclass:: lasio.roundtrip.RoundTripReport
+    :members:
+.. autoclass:: lasio.roundtrip.RoundTripConflict
+    :members:
 .. autofunction:: lasio.writer.get_formatter_function
 .. autofunction:: lasio.writer.get_section_order_function
 .. autofunction:: lasio.writer.get_section_widths
@@ -85,6 +92,7 @@ Custom exceptions
 .. autoclass:: lasio.exceptions.LASDataError
 .. autoclass:: lasio.exceptions.LASHeaderError
 .. autoclass:: lasio.exceptions.LASUnknownUnitError
+.. autoclass:: lasio.exceptions.LASRoundTripError
 
 Test data
 ---------

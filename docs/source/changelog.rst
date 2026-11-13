@@ -5,6 +5,15 @@ List of changes
 
 Unreleased changes (Available on GitHub)
 ----------------------------------------
+- Add :func:`lasio.roundtrip.verify_roundtrip` and
+  :meth:`lasio.LASFile.verify_roundtrip` to check fixed-width decimal exports
+  against a target column width, acceptable absolute error, and required
+  sample-identity curves. The report distinguishes duplicate identities already
+  present in the source data from collisions introduced only by rounding, and
+  returns a bounded set of conflicting samples without removing rows.
+- ``LASFile.write`` accepts ``tolerance``, ``identity``/``sample_identity`` and
+  ``verify`` to run the check before exporting; failures raise
+  :class:`lasio.exceptions.LASRoundTripError` and leave no partial file.
 
 Version 0.32 (1 August 2025)
 ----------------------------

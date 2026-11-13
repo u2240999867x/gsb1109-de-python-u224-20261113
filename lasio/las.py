@@ -3,7 +3,9 @@
 import csv
 import json
 import logging
+import os
 import re
+import tempfile
 import traceback
 from collections.abc import Sequence
 
@@ -14,6 +16,13 @@ from .las_items import CurveItem
 
 basestring = (str, bytes)
 logger = logging.getLogger(__name__)
+
+
+def _current_umask():
+    """Return the process umask without permanently changing it."""
+    mask = os.umask(0)
+    os.umask(mask)
+    return mask
 
 
 class LASFile(object):
@@ -624,12 +633,67 @@ class LASFile(object):
 
         """
         opened_file = False
+        file_ref_name = None
         if isinstance(file_ref, basestring) and not hasattr(file_ref, "write"):
             opened_file = True
-            file_ref = open(file_ref, "w")
-        writer.write(self, file_ref, **kwargs)
+            file_ref_name = file_ref
+            # Write next to the target first so a verification failure (or any
+            # other error) cannot truncate an existing file.
+            directory = os.path.dirname(os.path.abspath(file_ref_name))
+            handle, temporary_name = tempfile.mkstemp(
+                prefix=".lasio-", suffix=".las", dir=directory, text=True
+            )
+            os.close(handle)
+            file_ref = open(temporary_name, "w")
+        else:
+            temporary_name = None
+        try:
+            report = writer.write(self, file_ref, **kwargs)
+        except Exception:
+            if opened_file:
+                file_ref.close()
+                try:
+                    os.remove(temporary_name)
+                except OSError:
+                    pass
+            raise
         if opened_file:
             file_ref.close()
+            if os.path.exists(file_ref_name):
+                target_mode = os.stat(file_ref_name).st_mode & 0o777
+            else:
+                target_mode = 0o666 & ~_current_umask()
+            try:
+                os.chmod(temporary_name, target_mode)
+            except OSError:
+                pass
+            os.replace(temporary_name, file_ref_name)
+        return report
+
+    def verify_roundtrip(self, *args, **kwargs):
+        """Check fixed-width decimal formatting before exporting.
+
+        This is the :class:`lasio.LASFile` shortcut for
+        :func:`lasio.roundtrip.verify_roundtrip`.  See that function for the
+        meaning of ``column_width``, ``tolerance`` and ``identity``.
+
+        Returns:
+            :class:`lasio.roundtrip.RoundTripReport`
+        """
+        from . import roundtrip
+
+        report = roundtrip.verify_roundtrip(self, *args, **kwargs)
+        self.last_roundtrip_report = report
+        return report
+
+    # Common alternative spellings.
+    check_roundtrip = verify_roundtrip
+    roundtrip_check = verify_roundtrip
+    verify_round_trip = verify_roundtrip
+
+    def check_export(self, *args, **kwargs):
+        """Alias for :meth:`verify_roundtrip`."""
+        return self.verify_roundtrip(*args, **kwargs)
 
     def to_excel(self, filename):
         """Export LAS file to a Microsoft Excel workbook.

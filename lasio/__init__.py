@@ -60,6 +60,8 @@ from .las import JSONEncoder, LASFile
 from .las_items import CurveItem, HeaderItem, SectionItems
 from .las_version import version
 from .reader import open_file
+from .roundtrip import RoundTripConflict, RoundTripReport, check_roundtrip, verify_roundtrip
+from .writer import verify_export
 
 __version__ = version()
 

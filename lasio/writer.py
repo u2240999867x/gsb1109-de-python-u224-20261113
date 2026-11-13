@@ -10,6 +10,153 @@ from .las_items import CurveItem, HeaderItem, OrderedDict, SectionItems
 logger = logging.getLogger(__name__)
 
 
+def _auto_numeric_field_width(fmt):
+    """Reproduce the width the writer auto-selects for *fmt*.
+
+    The writer starts at 10 characters and grows the field until the formatted
+    value of ``numpy.pi`` fits, leaving one character of padding.
+    """
+    length = 10
+    try:
+        test = fmt % np.pi
+    except (TypeError, ValueError):
+        return -1
+    while len(test) > (length - 1):
+        length += 1
+    return length
+
+
+def verify_export(
+    las,
+    column_width=None,
+    tolerance=None,
+    identity=None,
+    *,
+    fmt="%.5f",
+    column_fmt=None,
+    len_numeric_field=None,
+    sample_identity=None,
+    acceptable_error=None,
+    raise_on_failure=False,
+):
+    """Check what :func:`write` would produce, without writing anything.
+
+    This is the writer-side counterpart of
+    :func:`lasio.roundtrip.verify_roundtrip`: it uses the same format strings
+    and width model as :func:`write`, including the writer's auto-sized field
+    width when ``len_numeric_field`` is None.
+
+    Returns:
+        :class:`lasio.roundtrip.RoundTripReport`
+    """
+    return _run_roundtrip_check(
+        las,
+        None,
+        verify=True,
+        tolerance=tolerance,
+        identity=identity,
+        sample_identity=sample_identity,
+        fmt=fmt,
+        column_fmt=column_fmt or {},
+        len_numeric_field=len_numeric_field,
+        verify_fmt=None,
+        verify_column_width=None,
+        column_width=column_width,
+        target_width=None,
+        acceptable_error=acceptable_error,
+        raise_on_failure=raise_on_failure,
+    )
+
+
+def _run_roundtrip_check(
+    las,
+    file_object=None,
+    *,
+    verify,
+    tolerance,
+    identity,
+    sample_identity,
+    fmt,
+    column_fmt,
+    len_numeric_field,
+    verify_fmt,
+    verify_column_width,
+    column_width,
+    target_width,
+    acceptable_error,
+    raise_on_failure,
+):
+    """Run pre-export verification when requested and return its report."""
+    if identity is None:
+        identity = sample_identity
+    if tolerance is None:
+        tolerance = acceptable_error
+    if column_width is None:
+        column_width = target_width
+
+    if verify is False:
+        return None
+    if verify is None:
+        # Automatic mode: an explicit tolerance is the signal that the caller
+        # wants the export checked.
+        if tolerance is None:
+            return None
+    if verify not in (None, True, False):
+        raise ValueError("verify must be True, False or None")
+
+    from . import roundtrip
+
+    if verify_column_width is not None:
+        width = verify_column_width
+    elif column_width is not None:
+        width = column_width
+    elif len_numeric_field == -1:
+        width = -1
+    elif len_numeric_field is None:
+        width = _auto_numeric_field_width(fmt)
+    else:
+        width = len_numeric_field
+
+    # Verification models the formatting that will actually be written.  The
+    # target width is a budget: formatted values longer than it are reported as
+    # width overflows.  Explicit ``verify_fmt``/``column_fmt`` take priority;
+    # otherwise the writer's own ``fmt`` applies to every column.
+    if verify_fmt is not None:
+        verify_formats = verify_fmt
+    elif column_fmt:
+        verify_formats = {
+            curve.mnemonic: column_fmt.get(index, fmt)
+            for index, curve in enumerate(las.curves)
+        }
+    else:
+        verify_formats = fmt
+
+    if tolerance is None:
+        raise ValueError(
+            "tolerance must be supplied when verify=True (export check requires "
+            "an acceptable absolute error)"
+        )
+    if identity is None and len(las.curves) == 0:
+        raise ValueError("cannot verify sampling identity without curves")
+
+    report = roundtrip.verify_roundtrip(
+        las,
+        column_width=width,
+        tolerance=tolerance,
+        identity=identity,
+        fmt=verify_formats,
+    )
+    las.last_roundtrip_report = report
+    if file_object is not None:
+        try:
+            setattr(file_object, "last_roundtrip_report", report)
+        except (AttributeError, TypeError):
+            pass
+    if raise_on_failure:
+        report.raise_for_status()
+    return report
+
+
 def write(
     las,
     file_object,
@@ -27,6 +174,16 @@ def write(
     header_width=60,
     data_section_header="~ASCII",
     mnemonics_header=False,
+    verify=None,
+    tolerance=None,
+    identity=None,
+    sample_identity=None,
+    column_width=None,
+    target_width=None,
+    acceptable_error=None,
+    verify_fmt=None,
+    verify_column_width=None,
+    raise_on_failure=True,
 ):
     """Write a LAS files.
 
@@ -65,6 +222,24 @@ def write(
         data_section_header (str): default "~ASCII"
         mnemonics_header (bool): include mnemonic curve names in the
             data_section_header at the top of data section
+        verify (bool or None): run :func:`lasio.roundtrip.verify_roundtrip`
+            before writing.  If None, verification runs when ``tolerance``
+            and ``identity`` (or ``sample_identity``) are supplied.  A failing
+            report prevents the write when ``raise_on_failure`` is True.
+        tolerance (float or dict): acceptable absolute error for the
+            round-trip check.
+        identity (str or sequence): curve mnemonic(s) defining sampling
+            identity (normally the depth/index curve).  ``sample_identity`` is
+            an alias.  Defaults to the first curve if verification is enabled
+            with ``verify=True``.
+        verify_fmt (str or dict): explicit numeric format used by the
+            verification model.  Defaults to ``fmt``/``column_fmt``.
+        verify_column_width (int): explicit numeric field width model.  Defaults
+            to ``len_numeric_field`` when it is positive.
+        raise_on_failure (bool): if True (default), a failed round-trip check
+            raises :class:`lasio.exceptions.LASRoundTripError` before any
+            output is written.  If False, the report is returned/attached and
+            writing proceeds.
 
     Creating an output file is not the only side-effect of this function. It
     will also modify the STRT, STOP and STEP HeaderItems so that they correctly
@@ -79,9 +254,30 @@ def write(
     You should avoid calling this function directly - instead use the
     :meth:`lasio.LASFile.write` method.
 
+    Returns:
+        A :class:`lasio.roundtrip.RoundTripReport` when verification ran,
+        otherwise None.
+
     """
     if column_fmt is None:
         column_fmt = {}
+    report = _run_roundtrip_check(
+        las,
+        file_object,
+        verify=verify,
+        tolerance=tolerance,
+        identity=identity,
+        sample_identity=sample_identity,
+        fmt=fmt,
+        column_fmt=column_fmt,
+        len_numeric_field=len_numeric_field,
+        verify_fmt=verify_fmt,
+        verify_column_width=verify_column_width,
+        column_width=column_width,
+        target_width=target_width,
+        acceptable_error=acceptable_error,
+        raise_on_failure=raise_on_failure,
+    )
     if wrap is None:
         wrap = las.version["WRAP"] == "YES"
     elif wrap is True:
@@ -319,6 +515,8 @@ def write(
                 )
             file_object.write(line + "\n")
             line_counter += 1
+
+    return report
 
 
 def standardize_value(value, unit=None):

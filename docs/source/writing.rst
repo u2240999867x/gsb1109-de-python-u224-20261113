@@ -614,3 +614,84 @@ Here the data section is output as a tight comma separated data set.
   1669.87500,123.45000,2550.00000,0.45000,123.45000,123.45000,110.20000,105.60000
   1669.75000,123.45000,2550.00000,0.45000,123.45000,123.45000,110.20000,105.60000
 
+
+.. _roundtrip-check:
+
+Checking fixed-width exports before writing
+-------------------------------------------
+
+A LAS file can be written and read back by lasio with full precision, but many
+consumers treat the data section as fixed-width decimal fields. In those
+systems a width budget combined with a format string can round two distinct
+depths (or other identification curves) to the same text, so cross-referencing
+by depth silently loses a sample even though the row is still present in the
+file.
+
+:func:`lasio.roundtrip.verify_roundtrip` (also available as
+:meth:`lasio.LASFile.verify_roundtrip`) models the formatting before export.
+It takes three essential inputs:
+
+- ``column_width``: the target width of each numeric field (a scalar, a dict
+  keyed by mnemonic or column index, or one entry per curve). ``len_numeric_field``
+  as used by :func:`lasio.writer.write` is accepted as an alias.
+- ``tolerance``: the acceptable absolute error after formatting and reading
+  back. ``acceptable_error`` is accepted as an alias.
+- ``identity``: the curve or curves that define a sample's identity, normally
+  the depth/index curve. ``sample_identity`` is accepted as an alias.
+
+.. code-block:: python
+
+  >>> import lasio
+  >>> las = lasio.examples.open("2.0/sample_2.0.las")
+  >>> report = las.verify_roundtrip(
+  ...     column_width=10, tolerance=1e-4, identity="DEPT"
+  ... )
+  >>> report.ok
+  True
+  >>> report.precision["DEPT"]
+  5
+
+The returned :class:`lasio.roundtrip.RoundTripReport` never modifies or
+deletes rows. It separates two situations that are easy to confuse:
+
+- ``report.source_duplicates``: identity groups that were already repeated in
+  the input data. These are reported for information and do not by themselves
+  fail the check.
+- ``report.rounding_collisions``: distinct source identities that collapse to
+  the same formatted identity. These do fail the check.
+
+When the budget cannot satisfy the request, ``report.conflicts`` contains a
+small, bounded set of concrete rows as evidence (controlled by
+``max_examples``). Values longer than ``column_width`` are listed in
+``report.width_overflows``.
+
+.. code-block:: python
+
+  >>> las = lasio.LASFile()
+  >>> las.append_curve("DEPT", [1670.0, 1670.0004, 1670.0008])
+  >>> las.append_curve("GR", [1.0, 2.0, 3.0])
+  >>> report = las.verify_roundtrip(
+  ...     column_width=10, tolerance=0.01, identity="DEPT", fmt="%.3f"
+  ... )
+  >>> report.ok
+  False
+  >>> len(report.rounding_collisions)
+  1
+  >>> len(las.data)
+  3
+
+To make the check part of an export, pass ``tolerance`` and ``identity`` to
+``LASFile.write``. A failing report raises
+:class:`lasio.exceptions.LASRoundTripError` before anything is written, and a
+file opened by path is not created, and an existing file is left untouched.
+Passing ``raise_on_failure=False`` writes anyway and returns the failing report;
+``verify=False`` disables the check. To see the result without writing
+anything, call :func:`lasio.writer.verify_export` with the same formatting
+arguments.
+
+.. code-block:: python
+
+  >>> las.write("out.las", tolerance=0.01, identity="DEPT", fmt="%.3f")
+  Traceback (most recent call last):
+  ...
+  lasio.exceptions.LASRoundTripError: ...
