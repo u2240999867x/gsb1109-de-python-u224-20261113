@@ -1062,3 +1062,79 @@ It produces a JSON schema that is more difficult to read by humans.
         "$id": "https://example.com/my-schema.json",
         "$schema": "http://json-schema.org/draft-07/schema#"
     }
+
+Comparing conversion orders
+---------------------------
+
+Cleaning a supplier field often combines three steps: removing a unit,
+recognising null markers, and converting to fixed-point decimals.  The same
+three steps in a different order can change which records pass and which
+cleaned values are produced.  ``Pipeline`` makes the order explicit, and
+``compare_pipelines`` runs both orders over the same original rows and reports
+the differences that matter.
+
+.. code:: python
+
+    >>> from schema import (
+    ...     FixedPoint, NullToNone, Pipeline, Schema, StripUnit, compare_pipelines
+    ... )
+
+    >>> null_first = Schema(
+    ...     {"mass": Pipeline(NullToNone(), StripUnit(), FixedPoint(2))}
+    ... )
+    >>> unit_first = Schema(
+    ...     {"mass": Pipeline(StripUnit(), FixedPoint(2), NullToNone())}
+    ... )
+    >>> report = compare_pipelines(
+    ...     null_first, unit_first, [{"mass": "n/a"}, {"mass": "12.5 kg"}]
+    ... )
+
+    >>> [record.index for record in report.pass_to_reject]
+    [0]
+    >>> [record.index for record in report.both_pass_changed]
+    []
+
+A record that is ``"n/a"`` passes the null-first order because the marker is
+turned into ``None`` before a unit is required.  In the unit-first order the
+same text becomes ``Quantity('n/a', None)`` and the fixed-point step rejects
+it.  Rows that both orders clean successfully are compared field by field;
+differences are classified as ``unit`` or ``numeric`` in
+``record.changes``.
+
+``StripUnit`` separates the number from its unit before conversion;
+``decimal`` is used throughout so no binary floating-point rounding is
+introduced.  ``FixedPoint(places=2)`` quantises half-up by default, and its
+``unit_scales`` argument performs a unit conversion before quantisation.
+
+Replayable examples
+~~~~~~~~~~~~~~~~~~~
+
+Every evaluation gets its own deep copy of the original row.  A converter that
+mutates a shared object in place therefore cannot affect the other order, and
+``report.replay(index)`` runs both orders again from the pristine row:
+
+.. code:: python
+
+    >>> old, new = report.replay(0)
+    >>> old.passed, new.passed
+    (True, False)
+
+For each distinct kind of difference the report keeps a minimised example.
+Irrelevant fields are removed while the same difference still reproduces, so a
+data reviewer can see exactly which input decides whether to accept the new
+order:
+
+.. code:: python
+
+    >>> example = report.examples[0]
+    >>> example.kind
+    'pass_to_reject'
+    >>> example.record
+    {'mass': 'n/a'}
+    >>> example.removed_fields
+    []
+
+``report.summary()`` returns counts by category, and ``report.to_dict()``
+returns a JSON-serialisable form suitable for a review ticket.  Use
+``compare_schema_pipelines`` (an alias) or pass any object with ``validate``;
+``And`` and ``Or`` compositions work as well as ``Schema`` and ``Pipeline``.

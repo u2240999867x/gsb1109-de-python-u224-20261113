@@ -1,6 +1,7 @@
 from __future__ import with_statement
 
 import copy
+from decimal import Decimal
 import json
 import os
 import platform
@@ -19,11 +20,15 @@ from pytest import mark, raises
 from schema import (
     And,
     Const,
+    FixedPoint,
     Forbidden,
     Hook,
     Literal,
+    NullToNone,
     Optional,
     Or,
+    Pipeline,
+    Quantity,
     Regex,
     Schema,
     SchemaError,
@@ -31,7 +36,9 @@ from schema import (
     SchemaMissingKeyError,
     SchemaUnexpectedTypeError,
     SchemaWrongKeyError,
+    StripUnit,
     Use,
+    compare_pipelines,
 )
 
 if sys.version_info[0] == 3:
@@ -2100,3 +2107,140 @@ def test_tuple_key_error_message_does_not_crash():
     with raises(SchemaError) as exc_info:
         Schema({("a", "b"): int}).validate({("a", "b"): "not-an-int"})
     assert "Key '('a', 'b')' error:" in exc_info.value.code
+
+
+def _conversion_pipeline(order):
+    if order == "null-first":
+        return Pipeline(NullToNone(), StripUnit(), FixedPoint(2))
+    if order == "unit-first":
+        return Pipeline(StripUnit(), FixedPoint(2), NullToNone())
+    raise AssertionError(order)
+
+
+def _conversion_schema(order):
+    return Schema({"value": _conversion_pipeline(order)})
+
+
+def test_conversion_order_pass_to_reject():
+    rows = [
+        {"value": "n/a"},
+        {"value": "NULL kg"},
+        {"value": "12.5 kg"},
+    ]
+    report = compare_pipelines(
+        _conversion_schema("null-first"), _conversion_schema("unit-first"), rows
+    )
+    assert report.pass_to_reject == [
+        record for record in report.records if record.kind == "pass_to_reject"
+    ]
+    assert [record.index for record in report.pass_to_reject] == [0]
+    assert report.pass_to_reject[0].old.value == {"value": None}
+    assert report.pass_to_reject[0].new.error is not None
+
+
+def test_conversion_order_both_pass_unit_and_numeric_change():
+    old = Schema(
+        {
+            "mass": Pipeline(
+                StripUnit(default_unit="kg"),
+                FixedPoint(2, unit_scales={"kg": ("t", "0.001")}),
+            )
+        }
+    )
+    new = Schema(
+        {"mass": Pipeline(StripUnit(default_unit="kg"), FixedPoint(2))}
+    )
+    report = compare_pipelines(old, new, [{"mass": "1200"}, {"mass": "2400"}])
+    assert len(report.both_pass_changed) == 2
+    change = report.both_pass_changed[0].changes
+    assert {(item.category, item.path) for item in change} == {
+        ("unit", ("mass", "unit")),
+        ("numeric", ("mass", "value")),
+    }
+    # The same kind of difference on another row does not create a second example.
+    assert len(report.examples) == 1
+
+
+def test_conversion_order_example_survives_removing_unrelated_fields():
+    old = Schema(
+        {
+            "value": Pipeline(NullToNone(), StripUnit(), FixedPoint(2)),
+            Optional("annotation"): {str: str},
+        }
+    )
+    new = Schema(
+        {
+            "value": Pipeline(StripUnit(), FixedPoint(2), NullToNone()),
+            Optional("annotation"): {str: str},
+        }
+    )
+    row = {"value": "n/a", "annotation": {"a": "x", "b": "y"}}
+    report = compare_pipelines(old, new, [row])
+    example = report.examples[0]
+    assert example.kind == "pass_to_reject"
+    # The optional annotation field disappears as a whole; only the field that
+    # actually triggers the difference remains in the review example.
+    assert example.record == {"value": "n/a"}
+    assert ("annotation",) in example.removed_fields
+    assert example.new.passed is False
+    # Removing fields never changes the caller's original row.
+    assert row == {"value": "n/a", "annotation": {"a": "x", "b": "y"}}
+
+
+class _InPlaceConversion:
+    """A converter that writes its result back into the supplied object."""
+
+    def validate(self, data, **kwargs):
+        data["raw"] = "rewritten"
+        return data
+
+
+def test_conversion_order_isolates_in_place_conversion():
+    rows = [{"value": {"raw": "original"}, "keep": ["shared"]}]
+    report = compare_pipelines(
+        Schema({"value": _InPlaceConversion(), "keep": list}),
+        Schema({"value": {"raw": str}, "keep": list}),
+        rows,
+    )
+    assert report.records[0].kind == "both_pass_changed"
+    replay_old, replay_new = report.replay(0)
+    assert replay_old.passed
+    assert replay_old.value == {
+        "value": {"raw": "rewritten"},
+        "keep": ["shared"],
+    }
+    assert replay_new.passed
+    assert replay_new.value == {
+        "value": {"raw": "original"},
+        "keep": ["shared"],
+    }
+    # The row held by the report, not just the caller's copy, stayed pristine.
+    assert report._rows[0] == {"value": {"raw": "original"}, "keep": ["shared"]}
+
+
+def test_conversion_order_reports_both_rejections():
+    report = compare_pipelines(
+        Schema({"value": Pipeline(StripUnit(), FixedPoint(2))}),
+        Schema({"value": Pipeline(FixedPoint(2), StripUnit())}),
+        [{"value": "abc kg"}],
+    )
+    assert report.records[0].kind == "both_reject"
+    assert report.summary()["both_reject"] == 1
+
+
+def test_conversion_scalar_steps_handle_units_and_nulls():
+    assert NullToNone().validate(" NULL ") is None
+    assert NullToNone().validate(Quantity("N/A", "kg")) is None
+    assert StripUnit(units=["kg"], default_unit="kg").validate("12kg") == Quantity(
+        "12", "kg"
+    )
+    assert StripUnit(units=["kg"]).validate(3) == Quantity(3, "kg")
+    assert FixedPoint(2).validate("1,234.567") == Decimal("1234.57")
+    assert FixedPoint(2).validate("(12.345)") == Decimal("-12.35")
+
+
+def test_conversion_unit_scale_quantises_once():
+    step = FixedPoint(2, unit_scales={"kg": ("t", "0.001")})
+    assert step.validate(Quantity("999.995", "kg")) == Quantity(
+        Decimal("1.00"), "t"
+    )

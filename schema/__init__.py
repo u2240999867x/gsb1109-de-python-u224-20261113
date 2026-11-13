@@ -2,8 +2,10 @@
 obtained from config-files, forms, external services or command-line
 parsing, converted from JSON/YAML (or something else) to Python data-types."""
 
+import copy
 import inspect
 import re
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -12,6 +14,7 @@ from typing import (
     Generic,
     Iterable,
     List,
+    Mapping,
     NoReturn,
     Sequence,
     Set,
@@ -45,6 +48,16 @@ __all__ = [
     "Forbidden",
     "Const",
     "Literal",
+    "StripUnit",
+    "NullToNone",
+    "FixedPoint",
+    "Pipeline",
+    "Quantity",
+    "compare_pipelines",
+    "compare_schema_pipelines",
+    "ReplayReport",
+    "RecordDiff",
+    "ConversionExample",
     "SchemaError",
     "SchemaWrongKeyError",
     "SchemaMissingKeyError",
@@ -970,6 +983,863 @@ class Literal:
     @property
     def schema(self) -> Any:
         return self._schema
+
+
+class Quantity:
+    """A scalar with its unit kept separate from the numeric value."""
+
+    __slots__ = ("value", "unit")
+
+    def __init__(self, value: Any, unit: Union[str, None] = None) -> None:
+        self.value = value
+        self.unit = unit
+
+    def __eq__(self, other: Any) -> bool:
+        return (
+            isinstance(other, Quantity)
+            and self.value == other.value
+            and self.unit == other.unit
+        )
+
+    def __ne__(self, other: Any) -> bool:
+        return not self == other
+
+    def __hash__(self) -> int:
+        return hash((self.value, self.unit))
+
+    def __repr__(self) -> str:
+        if self.unit is None:
+            return f"Quantity({self.value!r})"
+        return f"Quantity({self.value!r}, {self.unit!r})"
+
+
+_NULL_TOKENS = frozenset(
+    ("", "-", "--", "na", "n/a", "null", "none", "nil", "n.a.")
+)
+
+
+def _is_null_token(value: Any) -> bool:
+    return isinstance(value, str) and value.strip().casefold() in _NULL_TOKENS
+
+
+class NullToNone:
+    """Recognise textual null markers and turn them into ``None``.
+
+    The check is deliberately applied to the scalar that is currently in the
+    pipeline.  ``"NULL kg"`` is therefore null for a ``Quantity`` only after
+    :class:`StripUnit` has separated the value from its unit; before that it is
+    an ordinary string.  That distinction is what makes ordering observable.
+    """
+
+    def __init__(self, tokens: Union[Iterable[str], None] = None) -> None:
+        self.tokens = (
+            frozenset(token.strip().casefold() for token in tokens)
+            if tokens is not None
+            else _NULL_TOKENS
+        )
+
+    def __repr__(self) -> str:
+        return "NullToNone()"
+
+    def __call__(self, data: Any) -> Any:
+        return self.validate(data)
+
+    def _is_null(self, value: Any) -> bool:
+        return (
+            isinstance(value, str)
+            and value.strip().casefold() in self.tokens
+        )
+
+    def validate(self, data: Any, **kwargs: Any) -> Any:
+        if data is None:
+            return None
+        if isinstance(data, Quantity):
+            if self._is_null(data.value):
+                return None
+            return data
+        if self._is_null(data):
+            return None
+        return data
+
+
+class StripUnit:
+    """Separate a scalar such as ``"12.5 kg"`` into :class:`Quantity`.
+
+    A unit is optional when ``default_unit`` is supplied.  ``units`` may be a
+    mapping of accepted spellings to canonical names; unmatched units are then
+    rejected instead of being silently kept.  A plain sequence of accepted
+    units is converted to an identity mapping.
+    """
+
+    _SCALAR = re.compile(
+        r"^\s*(?P<value>[^\s]+)(?:\s+(?P<unit>[^\s]+))?\s*$"
+    )
+    _ATTACHED_UNIT = re.compile(
+        r"^\s*(?P<value>[+-]?(?:\d+(?:[.,]\d*)?|\.\d+)"
+        r"(?:[eE][+-]?\d+)?)\s*(?P<unit>[^\d\s]+)\s*$"
+    )
+
+    def __init__(
+        self,
+        units: Union[Mapping[str, str], Iterable[str], None] = None,
+        default_unit: Union[str, None] = None,
+        case_sensitive: bool = True,
+    ) -> None:
+        self.default_unit = default_unit
+        self.case_sensitive = case_sensitive
+        if units is None:
+            self.units: Union[Dict[str, str], None] = None
+        elif isinstance(units, Mapping):
+            self.units = dict(units)
+        else:
+            self.units = {unit: unit for unit in units}
+        if self.units is not None and not case_sensitive:
+            self.units = {
+                key.casefold(): value for key, value in self.units.items()
+            }
+
+    def __repr__(self) -> str:
+        return "StripUnit()"
+
+    def _canonical_unit(
+        self, unit: Union[str, None], default_unit: Union[str, None] = None
+    ) -> Union[str, None]:
+        if unit is None:
+            return self.default_unit if default_unit is None else default_unit
+        if self.units is None:
+            return unit
+        key = unit if self.case_sensitive else unit.casefold()
+        if key not in self.units:
+            default_key = (
+                self.default_unit
+                if self.case_sensitive or self.default_unit is None
+                else self.default_unit.casefold()
+            )
+            if unit.casefold() != default_key:
+                raise SchemaError(f"unknown unit {unit!r}")
+            return self.default_unit
+        return self.units[key]
+
+    def __call__(self, data: Any) -> Any:
+        return self.validate(data)
+
+    def validate(self, data: Any, **kwargs: Any) -> Any:
+        if data is None:
+            return None
+        if isinstance(data, Quantity):
+            return Quantity(data.value, self._canonical_unit(data.unit))
+        if not isinstance(data, str):
+            if isinstance(data, (int, float, Decimal)) and not isinstance(
+                data, bool
+            ):
+                units = list(self.units) if self.units is not None else []
+                if self.default_unit is None and len(units) == 1:
+                    default_unit = units[0]
+                else:
+                    default_unit = self.default_unit
+                return Quantity(data, self._canonical_unit(None, default_unit))
+            raise SchemaError(f"{data!r} is not a scalar with a unit")
+        match = self._SCALAR.match(data)
+        if match is not None and match.group("unit") is not None:
+            return Quantity(
+                match.group("value"), self._canonical_unit(match.group("unit"))
+            )
+        attached = self._ATTACHED_UNIT.match(data)
+        if attached is not None:
+            return Quantity(
+                attached.group("value"),
+                self._canonical_unit(attached.group("unit")),
+            )
+        if match is None:
+            raise SchemaError(f"{data!r} is not a scalar with a unit")
+        return Quantity(match.group("value"), self._canonical_unit(None))
+
+
+class FixedPoint:
+    """Convert a numeric scalar to a :class:`~decimal.Decimal`.
+
+    ``places`` is the number of fractional digits and defaults to two.  A
+    :class:`Quantity` keeps its unit.  ``unit_scales`` maps a source unit to
+    ``(target_unit, factor)`` and lets the same step perform a real unit
+    conversion; only the numeric value is quantised afterwards.
+    """
+
+    def __init__(
+        self,
+        places: int = 2,
+        rounding: str = ROUND_HALF_UP,
+        unit_scales: Union[
+            Mapping[str, Tuple[str, Any]], None
+        ] = None,
+    ) -> None:
+        self.places = places
+        self.rounding = rounding
+        self.unit_scales = dict(unit_scales) if unit_scales else {}
+
+    def __repr__(self) -> str:
+        return f"FixedPoint(places={self.places!r})"
+
+    def _decimal(self, value: Any) -> Decimal:
+        if isinstance(value, bool):
+            raise SchemaError(f"{value!r} is not a number")
+        if isinstance(value, Decimal):
+            number = value
+        elif isinstance(value, (int, float)):
+            number = Decimal(str(value))
+        elif isinstance(value, str):
+            text = value.strip().replace(",", "")
+            if text.startswith("(") and text.endswith(")"):
+                text = "-" + text[1:-1]
+            try:
+                number = Decimal(text)
+            except InvalidOperation:
+                raise SchemaError(f"{value!r} is not a number")
+        else:
+            raise SchemaError(f"{value!r} is not a number")
+        if not number.is_finite():
+            raise SchemaError(f"{value!r} is not a finite number")
+        return number
+
+    def _quantise(self, number: Decimal) -> Decimal:
+        quantum = Decimal(1).scaleb(-self.places)
+        return number.quantize(quantum, rounding=self.rounding)
+
+    def _convert_value(self, value: Any) -> Decimal:
+        return self._quantise(self._decimal(value))
+
+    def __call__(self, data: Any) -> Any:
+        return self.validate(data)
+
+    def validate(self, data: Any, **kwargs: Any) -> Any:
+        if data is None:
+            return None
+        if isinstance(data, Quantity):
+            if data.value is None:
+                return None
+            # Convert first so the final quantisation happens only once; a
+            # pre-rounded value would introduce avoidable drift.
+            number = self._decimal(data.value)
+            unit = data.unit
+            if unit in self.unit_scales:
+                target, factor = self.unit_scales[unit]
+                number = number * Decimal(str(factor))
+                unit = target
+            return Quantity(self._quantise(number), unit)
+        return self._convert_value(data)
+
+
+class Pipeline:
+    """An ordered sequence of validation/conversion steps.
+
+    ``Pipeline`` follows the same left-to-right convention as :class:`And`.
+    Each side of a comparison, and every replay, starts from a fresh deep copy
+    of the caller's original row.  That is what keeps an in-place conversion
+    from leaking into the other order or into a retry.
+    """
+
+    def __init__(self, *steps: Any, error: Union[str, None] = None) -> None:
+        self.steps = steps
+        self.error = error
+
+    def __repr__(self) -> str:
+        return f"Pipeline({', '.join(repr(step) for step in self.steps)})"
+
+    def __call__(self, data: Any) -> Any:
+        return self.validate(data)
+
+    def apply(self, data: Any) -> Any:
+        """Run the steps without making a defensive copy."""
+        for step in self.steps:
+            if isinstance(step, Pipeline):
+                data = step.apply(data)
+            elif hasattr(step, "validate"):
+                data = step.validate(data)
+            elif callable(step):
+                result = step(data)
+                if isinstance(result, bool):
+                    if not result:
+                        raise SchemaError(f"{_callable_str(step)}({data!r}) is false")
+                else:
+                    data = result
+            else:
+                raise SchemaError(f"{step!r} is not a pipeline step")
+        return data
+
+    def validate(self, data: Any, **kwargs: Any) -> Any:
+        try:
+            return self.apply(copy.deepcopy(data))
+        except SchemaError as error:
+            if self.error is None:
+                raise
+            raise SchemaError(
+                [None] + error.autos,
+                [self.error.format(data)] + error.errors,
+            )
+
+
+def _evaluate(rule: Any, row: Any) -> "ReplayOutcome":
+    """Run one rule against a private copy of ``row``."""
+    work = copy.deepcopy(row)
+    try:
+        if isinstance(rule, Pipeline):
+            value = rule.apply(work)
+        elif isinstance(rule, Schema):
+            value = rule.validate(work)
+        elif hasattr(rule, "validate"):
+            value = rule.validate(work)
+        elif callable(rule):
+            value = rule(work)
+            if isinstance(value, bool):
+                if not value:
+                    raise SchemaError("predicate returned false")
+                value = work
+        else:
+            raise SchemaError(f"{rule!r} is not a rule")
+    except SchemaError as error:
+        return ReplayOutcome(False, None, error)
+    except Exception as error:  # noqa: BLE001 - bad conversions are rejections
+        return ReplayOutcome(False, None, error)
+    return ReplayOutcome(True, value, None)
+
+
+class ReplayOutcome:
+    """The result of evaluating one order against one row."""
+
+    __slots__ = ("passed", "value", "error")
+
+    def __init__(self, passed: bool, value: Any, error: Any) -> None:
+        self.passed = passed
+        self.value = value
+        self.error = error
+
+    def __repr__(self) -> str:
+        if self.passed:
+            return f"ReplayOutcome(passed=True, value={self.value!r})"
+        return f"ReplayOutcome(passed=False, error={self.error!r})"
+
+    @property
+    def error_type(self) -> Union[str, None]:
+        return type(self.error).__name__ if self.error is not None else None
+
+    @property
+    def error_text(self) -> Union[str, None]:
+        if self.error is None:
+            return None
+        return str(self.error)
+
+
+class ValueChange:
+    """One leaf-level difference between two passing results."""
+
+    __slots__ = ("path", "category", "old", "new")
+
+    def __init__(
+        self, path: Tuple[Any, ...], category: str, old: Any, new: Any
+    ) -> None:
+        self.path = path
+        self.category = category
+        self.old = old
+        self.new = new
+
+    def __repr__(self) -> str:
+        return (
+            f"ValueChange(path={self.path!r}, category={self.category!r}, "
+            f"old={self.old!r}, new={self.new!r})"
+        )
+
+
+def _is_number(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float, Decimal)):
+        return True
+    if isinstance(value, str):
+        try:
+            Decimal(value.strip().replace(",", ""))
+        except InvalidOperation:
+            return False
+        return True
+    return False
+
+
+def _as_decimal(value: Any) -> Union[Decimal, None]:
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return Decimal(str(value))
+    if isinstance(value, str):
+        try:
+            return Decimal(value.strip().replace(",", ""))
+        except InvalidOperation:
+            return None
+    return None
+
+
+def _diff_values(old: Any, new: Any, path: Tuple[Any, ...] = ()) -> List[ValueChange]:
+    changes: List[ValueChange] = []
+    if isinstance(old, Quantity) or isinstance(new, Quantity):
+        if not isinstance(old, Quantity) or not isinstance(new, Quantity):
+            changes.append(ValueChange(path, "other", old, new))
+            return changes
+        if old.unit != new.unit:
+            changes.append(ValueChange(path + ("unit",), "unit", old.unit, new.unit))
+        old_number, new_number = _as_decimal(old.value), _as_decimal(new.value)
+        if old.value == new.value:
+            pass
+        elif old_number is not None and new_number is not None:
+            if old_number != new_number:
+                changes.append(
+                    ValueChange(path + ("value",), "numeric", old.value, new.value)
+                )
+        else:
+            changes.append(
+                ValueChange(path + ("value",), "other", old.value, new.value)
+            )
+        return changes
+    if isinstance(old, dict) and isinstance(new, dict):
+        for key in sorted(set(old) | set(new), key=repr):
+            if key not in old or key not in new:
+                changes.append(
+                    ValueChange(path + (key,), "other", old.get(key), new.get(key))
+                )
+            else:
+                changes.extend(_diff_values(old[key], new[key], path + (key,)))
+        return changes
+    if isinstance(old, (list, tuple)) and isinstance(new, (list, tuple)):
+        if len(old) != len(new):
+            changes.append(ValueChange(path, "other", old, new))
+        for index in range(min(len(old), len(new))):
+            changes.extend(_diff_values(old[index], new[index], path + (index,)))
+        return changes
+    old_number, new_number = _as_decimal(old), _as_decimal(new)
+    if old == new:
+        return changes
+    if old_number is not None and new_number is not None:
+        if old_number != new_number:
+            changes.append(ValueChange(path, "numeric", old, new))
+    else:
+        changes.append(ValueChange(path, "other", old, new))
+    return changes
+
+
+class ConversionExample:
+    """A minimised row that still reproduces one kind of difference."""
+
+    __slots__ = (
+        "kind",
+        "signature",
+        "record",
+        "original",
+        "removed_fields",
+        "old",
+        "new",
+        "changes",
+    )
+
+    def __init__(
+        self,
+        kind: str,
+        signature: Any,
+        record: Any,
+        original: Any,
+        removed_fields: List[Tuple[Any, ...]],
+        old: ReplayOutcome,
+        new: ReplayOutcome,
+        changes: List[ValueChange],
+    ) -> None:
+        self.kind = kind
+        self.signature = signature
+        self.record = record
+        self.original = original
+        self.removed_fields = removed_fields
+        self.old = old
+        self.new = new
+        self.changes = changes
+
+    def __repr__(self) -> str:
+        return (
+            f"ConversionExample(kind={self.kind!r}, record={self.record!r}, "
+            f"removed_fields={self.removed_fields!r})"
+        )
+
+
+class RecordDiff:
+    """The outcome for one input row, including a minimised example."""
+
+    __slots__ = (
+        "index",
+        "kind",
+        "original",
+        "old",
+        "new",
+        "changes",
+        "example",
+        "signature",
+    )
+
+    def __init__(
+        self,
+        index: int,
+        kind: str,
+        original: Any,
+        old: ReplayOutcome,
+        new: ReplayOutcome,
+        changes: List[ValueChange],
+        example: ConversionExample,
+        signature: Any,
+    ) -> None:
+        self.index = index
+        self.kind = kind
+        self.original = original
+        self.old = old
+        self.new = new
+        self.changes = changes
+        self.example = example
+        self.signature = signature
+
+    def __repr__(self) -> str:
+        return (
+            f"RecordDiff(index={self.index!r}, kind={self.kind!r}, "
+            f"example={self.example.record!r})"
+        )
+
+
+def _error_tag(outcome: ReplayOutcome) -> str:
+    if outcome.error is None:
+        return ""
+    text = str(outcome.error).splitlines()[0]
+    return f"{type(outcome.error).__name__}:{text}"
+
+
+def _change_signature(changes: List[ValueChange]) -> Tuple[Any, ...]:
+    return tuple(
+        sorted((change.category, change.path) for change in changes)
+    )
+
+
+def _diff_signature(
+    old: ReplayOutcome, new: ReplayOutcome, changes: List[ValueChange]
+) -> Tuple[Any, ...]:
+    if old.passed and not new.passed:
+        return ("pass_to_reject", _error_tag(new))
+    if not old.passed and new.passed:
+        return ("reject_to_pass", _error_tag(old))
+    if not old.passed and not new.passed:
+        return ("both_reject", _error_tag(old), _error_tag(new))
+    if changes:
+        return ("both_pass_changed", _change_signature(changes))
+    return ("same",)
+
+
+def _example_key(record: "RecordDiff") -> Any:
+    if record.kind == "both_pass_changed":
+        return ("both_pass_changed", _change_signature(record.changes))
+    return record.signature
+
+
+def _delete_path(data: Any, path: Tuple[Any, ...]) -> Any:
+    if not path:
+        return data
+    parent = data
+    for part in path[:-1]:
+        parent = parent[part]
+    if isinstance(parent, dict):
+        del parent[path[-1]]
+    elif isinstance(parent, (list, tuple)):
+        del parent[path[-1]]
+    else:
+        raise TypeError("cannot delete from this value")
+    return data
+
+
+def _candidate_paths(data: Any, path: Tuple[Any, ...] = ()) -> List[Tuple[Any, ...]]:
+    """Return deletable field paths, deepest containers first.
+
+    A path that names a container is a candidate only once it is empty, so a
+    nested object disappears as a whole field instead of leaving ``{}`` behind.
+    """
+    paths: List[Tuple[Any, ...]] = []
+    if isinstance(data, dict):
+        for key in sorted(data, key=repr):
+            child = path + (key,)
+            paths.extend(_candidate_paths(data[key], child))
+            paths.append(child)
+    elif isinstance(data, (list, tuple)):
+        for index, value in enumerate(data):
+            paths.extend(_candidate_paths(value, path + (index,)))
+            paths.append(path + (index,))
+    return paths
+
+
+def _minimise(old: Any, new: Any, record: Any) -> Any:
+    current = copy.deepcopy(record)
+    baseline = _compare_once(old, new, current)
+    signature = _example_signature(baseline)
+    changed = True
+    while changed:
+        changed = False
+        # Prefer removing a whole field over removing only its children.  A
+        # field is only a candidate once it is empty, so this pass empties
+        # containers first and the next pass removes the container field.
+        for path in sorted(_candidate_paths(current), key=len, reverse=True):
+            trial = copy.deepcopy(current)
+            try:
+                _delete_path(trial, path)
+            except (KeyError, IndexError, TypeError):
+                continue
+            if _example_signature(_compare_once(old, new, trial)) == signature:
+                current = trial
+                changed = True
+                break
+    return current
+
+
+def _compare_once(old: Any, new: Any, row: Any) -> Any:
+    old_outcome = _evaluate(old, row)
+    new_outcome = _evaluate(new, row)
+    changes = (
+        _diff_values(old_outcome.value, new_outcome.value)
+        if old_outcome.passed and new_outcome.passed
+        else []
+    )
+    return _diff_signature(old_outcome, new_outcome, changes), changes
+
+
+def _example_signature(comparison: Any) -> Any:
+    signature, changes = comparison
+    if signature[0] == "both_pass_changed":
+        return ("both_pass_changed", _change_signature(changes))
+    return signature
+
+
+def _removed_paths(original: Any, reduced: Any) -> List[Tuple[Any, ...]]:
+    removed: List[Tuple[Any, ...]] = []
+    if isinstance(original, dict) and isinstance(reduced, dict):
+        for key in sorted(set(original) - set(reduced), key=repr):
+            removed.append((key,))
+        for key in sorted(set(original) & set(reduced), key=repr):
+            removed.extend(
+                (key,) + path
+                for path in _removed_paths(original[key], reduced[key])
+            )
+    elif isinstance(original, (list, tuple)) and isinstance(reduced, (list, tuple)):
+        for index in range(min(len(original), len(reduced))):
+            removed.extend(
+                (index,) + path
+                for path in _removed_paths(original[index], reduced[index])
+            )
+    return removed
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, Quantity):
+        return {"value": _jsonable(value.value), "unit": value.unit}
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    return value
+
+
+class ReplayReport:
+    """The complete, replayable comparison of two rule orders."""
+
+    def __init__(self, records: List[RecordDiff], old: Any, new: Any, rows: List[Any]) -> None:
+        self.records = records
+        self._old = old
+        self._new = new
+        self._rows = copy.deepcopy(rows)
+
+    @property
+    def differences(self) -> List[RecordDiff]:
+        return [record for record in self.records if record.kind != "same"]
+
+    @property
+    def pass_to_reject(self) -> List[RecordDiff]:
+        return [record for record in self.records if record.kind == "pass_to_reject"]
+
+    @property
+    def reject_to_pass(self) -> List[RecordDiff]:
+        return [record for record in self.records if record.kind == "reject_to_pass"]
+
+    @property
+    def both_pass_changed(self) -> List[RecordDiff]:
+        return [
+            record for record in self.records if record.kind == "both_pass_changed"
+        ]
+
+    @property
+    def both_reject(self) -> List[RecordDiff]:
+        return [record for record in self.records if record.kind == "both_reject"]
+
+    @property
+    def examples(self) -> List[ConversionExample]:
+        """One minimised example per distinct kind of actual difference.
+
+        Two rows that both change ``mass`` from kg to t are the same difference
+        for review purposes, even if their numeric values differ.  The example
+        key therefore uses the difference category and path, not the value.
+        """
+        seen: Set[Any] = set()
+        examples: List[ConversionExample] = []
+        for record in self.differences:
+            key = _example_key(record)
+            if key in seen:
+                continue
+            seen.add(key)
+            examples.append(record.example)
+        return examples
+
+    def replay(self, index: int) -> Tuple[ReplayOutcome, ReplayOutcome]:
+        """Re-run both orders from the pristine row at ``index``."""
+        row = copy.deepcopy(self._rows[index])
+        return _evaluate(self._old, row), _evaluate(self._new, row)
+
+    def replay_record(self, record: Any) -> Tuple[ReplayOutcome, ReplayOutcome]:
+        """Re-run both orders from a supplied original row."""
+        return _evaluate(self._old, record), _evaluate(self._new, record)
+
+    def summary(self) -> Dict[str, int]:
+        return {
+            "rows": len(self.records),
+            "differences": len(self.differences),
+            "pass_to_reject": len(self.pass_to_reject),
+            "reject_to_pass": len(self.reject_to_pass),
+            "both_pass_changed": len(self.both_pass_changed),
+            "both_reject": len(self.both_reject),
+            "examples": len(self.examples),
+        }
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "summary": self.summary(),
+            "records": [
+                {
+                    "index": record.index,
+                    "kind": record.kind,
+                    "original": _jsonable(record.original),
+                    "old": {
+                        "passed": record.old.passed,
+                        "value": _jsonable(record.old.value),
+                        "error": record.old.error_text,
+                    },
+                    "new": {
+                        "passed": record.new.passed,
+                        "value": _jsonable(record.new.value),
+                        "error": record.new.error_text,
+                    },
+                    "changes": [
+                        {
+                            "path": ".".join(str(part) for part in change.path),
+                            "category": change.category,
+                            "old": _jsonable(change.old),
+                            "new": _jsonable(change.new),
+                        }
+                        for change in record.changes
+                    ],
+                    "example": {
+                        "kind": record.example.kind,
+                        "record": _jsonable(record.example.record),
+                        "removed_fields": [
+                            ".".join(str(part) for part in path)
+                            for path in record.example.removed_fields
+                        ],
+                    },
+                }
+                for record in self.records
+            ],
+            "examples": [
+                {
+                    "kind": example.kind,
+                    "record": _jsonable(example.record),
+                    "removed_fields": [
+                        ".".join(str(part) for part in path)
+                        for path in example.removed_fields
+                    ],
+                }
+                for example in self.examples
+            ],
+        }
+
+
+def compare_pipelines(
+    old: Any, new: Any, rows: Iterable[Any], *, objects: bool = False
+) -> ReplayReport:
+    """Compare two rule orders over the same original rows.
+
+    ``old`` and ``new`` may be :class:`Pipeline`, a :class:`Schema`, an
+    ``And``/``Or`` composition, or any object with ``validate``.  Every
+    evaluation receives its own deep copy of the row, so a conversion that
+    mutates a shared object in place cannot influence the other order or a
+    replay from the same original row.
+
+    Pass ``objects=True`` when rows are shared objects that must be compared
+    by identity rather than serialised.  A converter that deliberately
+    mutates its input in place is then still isolated by the private copies
+    used for both branches and for every replay.
+    """
+    source_rows = (
+        list(copy.deepcopy(rows))
+        if objects
+        else list(copy.deepcopy(list(rows)))
+    )
+    records: List[RecordDiff] = []
+    for index, original in enumerate(source_rows):
+        old_outcome = _evaluate(old, original)
+        new_outcome = _evaluate(new, original)
+        changes = (
+            _diff_values(old_outcome.value, new_outcome.value)
+            if old_outcome.passed and new_outcome.passed
+            else []
+        )
+        signature = _diff_signature(old_outcome, new_outcome, changes)
+        kind = signature[0]
+        reduced = _minimise(old, new, original)
+        example_outcome = _evaluate(old, reduced)
+        example_new_outcome = _evaluate(new, reduced)
+        example_changes = (
+            _diff_values(example_outcome.value, example_new_outcome.value)
+            if example_outcome.passed and example_new_outcome.passed
+            else []
+        )
+        example = ConversionExample(
+            kind=kind,
+            signature=signature,
+            record=reduced,
+            original=copy.deepcopy(original),
+            removed_fields=_removed_paths(original, reduced),
+            old=example_outcome,
+            new=example_new_outcome,
+            changes=example_changes,
+        )
+        records.append(
+            RecordDiff(
+                index=index,
+                kind=kind,
+                original=copy.deepcopy(original),
+                old=old_outcome,
+                new=new_outcome,
+                changes=changes,
+                example=example,
+                signature=signature,
+            )
+        )
+    return ReplayReport(records, old, new, source_rows)
+
+
+def compare_schema_pipelines(
+    old: Any, new: Any, rows: Iterable[Any], *, objects: bool = False
+) -> ReplayReport:
+    """Alias for :func:`compare_pipelines`, named for schema rule sets."""
+    return compare_pipelines(old, new, rows, objects=objects)
+
+
+# Common spellings used by data teams when describing the two orders.
+compare_orders = compare_pipelines
 
 
 class Const(Schema):
