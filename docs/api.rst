@@ -155,6 +155,33 @@ API
 .. autofunction:: reset_messages
 
 
+Event Ordering
+--------------
+
+Guaranteed partial ordering of events timestamped on independent ports,
+calibrated from sparse shared sync observations.
+
+.. module:: mido.ordering
+
+.. autoclass:: KeyEvent
+   :members:
+
+.. autoclass:: SyncPoint
+   :members:
+
+.. autoclass:: TimeInterval
+   :members:
+
+.. autoclass:: OrderEvidence
+   :members:
+
+.. autoclass:: EventOrderer
+   :members:
+
+.. autoclass:: CalibrationError
+   :members:
+
+
 Files
 ------
 

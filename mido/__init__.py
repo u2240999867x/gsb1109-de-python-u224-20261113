@@ -54,6 +54,7 @@ Parsing objects serialized with str(message):
 
 Sub modules:
 
+    ordering -- guaranteed ordering of events from independent ports
     ports -- useful tools for working with ports
 
 For more on MIDI, see:
@@ -95,7 +96,7 @@ Getting started:
 
 from typing import TYPE_CHECKING
 
-from . import ports, sockets
+from . import ordering, ports, sockets
 from .backends.backend import Backend
 from .messages import (
     MAX_PITCHWHEEL,
@@ -141,6 +142,7 @@ __all__ = [
     "bpm2tempo",
     "format_as_string",
     "merge_tracks",
+    "ordering",
     "parse",
     "parse_all",
     "parse_string",
