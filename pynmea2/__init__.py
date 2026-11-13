@@ -15,3 +15,5 @@ from .types import *
 from .stream import NMEAStreamReader
 from .nmea_file import NMEAFile
 
+from .repeater import (Reception, Fix, Correspondence, AmbiguityGroup,
+                       Reconciliation, match_retransmissions)

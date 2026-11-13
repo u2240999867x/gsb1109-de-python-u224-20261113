@@ -123,6 +123,35 @@ and generate a NMEA string from a `NMEASentence` object:
 '$GPGGA,184353.07,1929.045,S,02410.506,E,1,04,2.6,100.00,M,-33.9,M,,0000*6D'
 ```
 
+## Matching repeater receptions
+
+When two repeaters receive the same position sentence from one base
+station, the import side can keep both receptions and reconcile them
+without using the forwarding quality flag as an identity key:
+
+```python
+import pynmea2
+
+left = pynmea2.Reception(left_sentence, 'repeater-a', station='base-1')
+right = pynmea2.Reception(right_sentence, 'repeater-b', station='base-1')
+
+result = pynmea2.match_retransmissions(
+    [left, right], position_error=15.0, reception_delay=2.0)
+
+for fix in result.fixes:
+    print(fix.forwarders, fix.qualities, [r.raw for r in fix.receptions])
+```
+
+`position_error` is the maximum great-circle distance in metres and
+`reception_delay` is the maximum difference in whole seconds between the
+truncated timestamps. A retransmission is always one reception from each
+repeater. Records are never merged transitively: closing records in the
+same second remain separate fixes, and a connected group with more than
+one feasible one-to-one correspondence is reported in
+`result.ambiguous_groups`. Each group lists every feasible correspondence
+in `group.correspondences` and the implied number of fixes in
+`group.fix_counts`.
+
 ## File reading example
 
 See [examples/read_file.py](/examples/read_file.py)
