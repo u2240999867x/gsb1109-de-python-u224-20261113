@@ -99,6 +99,8 @@ class LASFile(object):
         self._text = ""
         self.index_unit = None
         self.index_initial = None
+        self.sentinel_audit = None
+        self.null_replacements = {}
         default_items = defaults.get_default_items()
         self.sections = {
             "Version": default_items["Version"],
@@ -126,6 +128,10 @@ class LASFile(object):
         accept_regexp_sub_recommendations=True,
         index_unit=None,
         dtypes="auto",
+        sentinel_value=None,
+        sentinel_specs=None,
+        sentinel_curves=None,
+        sentinel_apply=True,
         **kwargs,
     ):
         """Read a LAS file.
@@ -177,6 +183,15 @@ class LASFile(object):
                 data types for each curve in order. Note that the conversion currently
                 only occurs via numpy.ndarray.astype() and therefore only a few simple
                 casts will work e.g. `int`, `float`, `str`.
+            sentinel_value (float): after reading, audit samples equal to this
+                value instead of trusting the file-level NULL substitution. Only
+                samples with curve-specific evidence excluding a real reading are
+                replaced with NaN; ambiguous samples keep their original value.
+            sentinel_specs (dict): explicit per-curve evidence for the audit.
+                See :func:`lasio.sentinel.audit_sentinels`.
+            sentinel_curves (iterable): restrict the audit to these curves.
+            sentinel_apply (bool): if False, record audit decisions without
+                replacing any values.
             encoding (str): character encoding to open file_ref with, using
                 :func:`io.open` (this is handled by
                 :func:`lasio.reader.open_with_codecs`)
@@ -469,6 +484,7 @@ class LASFile(object):
                     data_assigned_to_curves = {
                         curve_idx: False for curve_idx in range(len(self.curves))
                     }
+                    self.null_replacements = {}
 
                     curve_idx = 0
                     curve_length = 0
@@ -481,7 +497,14 @@ class LASFile(object):
                                     provisional_null, curve_idx
                                 )
                             )
-                            curve_arr[curve_arr == provisional_null] = np.nan
+                            null_matches = curve_arr == provisional_null
+                            if null_matches.any() and curve_idx < len(self.curves):
+                                mnemonic = self.curves[curve_idx].mnemonic
+                                self.null_replacements[mnemonic] = {
+                                    "value": float(provisional_null),
+                                    "indices": np.flatnonzero(null_matches).tolist(),
+                                }
+                            curve_arr[null_matches] = np.nan
 
                         logger.debug(
                             "Assigning data {} to curve #{}".format(
@@ -550,6 +573,104 @@ class LASFile(object):
 
         if len(self.curves) > 0:
             self.index_initial = self.index.copy()
+
+        if sentinel_value is not None:
+            self.audit_sentinel_values(
+                value=sentinel_value,
+                specs=sentinel_specs,
+                curves=sentinel_curves,
+                apply=sentinel_apply,
+            )
+
+    def audit_sentinel_values(
+        self,
+        value=-99.0,
+        specs=None,
+        curves=None,
+        apply=True,
+        include_index=False,
+    ):
+        """Audit samples that may be either a null sentinel or a real reading.
+
+        The decision is made per curve and per sample using the curve's
+        declaration, calibrated range, and same-run backup probe error. Samples
+        are replaced with ``numpy.nan`` only when the real-measurement
+        explanation is excluded. Ambiguous samples keep their original value
+        and are reported as doubts. Original values remain available through
+        ``self.sentinel_audit``.
+
+        Arguments:
+            value (float): sentinel value to audit, e.g. ``-99``.
+            specs (dict): optional explicit per-curve evidence. See
+                :func:`lasio.sentinel.audit_sentinels`.
+            curves (iterable): optional curve mnemonics to restrict the audit.
+            apply (bool): replace samples resolved as missing with NaN.
+            include_index (bool): also audit the first (index) curve.
+
+        Returns:
+            :class:`lasio.sentinel.SentinelAudit`
+        """
+        from .sentinel import audit_sentinels
+
+        audit = audit_sentinels(
+            self,
+            value=value,
+            specs=specs,
+            curves=curves,
+            apply=apply,
+            include_index=include_index,
+            null_originals=self.null_originals,
+        )
+        self.sentinel_audit = audit
+        return audit
+
+    @property
+    def null_originals(self):
+        """Return data columns with file-level NULL substitutions undone.
+
+        Returns:
+            dict of mnemonic to 1-D ndarray. Each curve is a copy of its current
+            data, except that indices recorded in :attr:`null_replacements`
+            have the original NULL value restored. Curves the reader never
+            substituted are omitted.
+        """
+        result = {}
+        for mnemonic, replacement in self.null_replacements.items():
+            curve = self.curves.get(mnemonic)
+            if curve is None:
+                continue
+            data = np.array(curve.data, copy=True)
+            indices = np.asarray(replacement["indices"], dtype=int)
+            if data.dtype.kind not in "fiu":
+                continue
+            data = data.astype(float)
+            data[indices] = replacement["value"]
+            result[mnemonic] = data
+        return result
+
+    def restore_null_originals(self, mnemonics=None):
+        """Undo file-level NULL substitutions in memory, for selected curves.
+
+        Arguments:
+            mnemonics (iterable): curve mnemonics to restore. Defaults to all
+                curves with recorded substitutions.
+
+        Returns:
+            dict of mnemonic to 1-D ndarray (the restored arrays now in use).
+        """
+        if mnemonics is None:
+            mnemonics = list(self.null_replacements.keys())
+        restored = {}
+        originals = self.null_originals
+        for mnemonic in mnemonics:
+            if mnemonic not in originals:
+                continue
+            curve = self.curves.get(mnemonic)
+            if curve is None:
+                continue
+            curve.data = originals[mnemonic]
+            restored[mnemonic] = curve.data
+        return restored
 
     def update_start_stop_step(self, STRT=None, STOP=None, STEP=None, fmt="%.5f"):
         """Configure or change STRT, STOP, and STEP values on the LASFile object.

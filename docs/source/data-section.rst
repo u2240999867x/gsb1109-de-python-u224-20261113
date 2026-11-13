@@ -334,3 +334,63 @@ We can fix it by using an explicit NULL policy.
 See ``tests/test_null_policy.py`` (`link
 <https://github.com/kinverarity1/lasio/blob/main/tests/test_null_policy.py>`__)
 for some examples.
+
+Distinguishing sentinel values from real measurements
+-----------------------------------------------------
+
+A numeric value such as ``-99`` is sometimes used as a missing indicator even
+though a sensor can legitimately record that value inside its calibrated range.
+Treating every ``-99`` as missing can therefore discard real data. lasio can
+audit such samples curve by curve instead of applying one file-level decision.
+
+Call :meth:`lasio.LASFile.audit_sentinel_values` (or
+:func:`lasio.sentinel.audit_sentinels`) after reading, or pass
+``sentinel_value=-99`` to :func:`lasio.read`. Samples are replaced with ``NaN``
+only when the evidence excludes a real measurement. When both explanations are
+possible the original value is kept and the sample is reported as a doubt.
+
+Evidence is taken from the curve declaration, from curve-specific ``~P``
+entries, and from any explicit ``specs`` you pass. Curve descriptions may state
+the evidence directly, for example::
+
+    ~C
+     DEPT.F : DEPTH
+     T_MAIN.F : TEMPERATURE MAIN PROBE {RANGE=-120,120} {BACKUP=T_BACK} {ERROR=2}
+     T_BACK.F : BACKUP TEMPERATURE MAIN PROBE {RUN=1}
+
+Equivalent ``~P`` entries use the curve mnemonic as a prefix or suffix, such as
+``T_MAIN_CAL``, ``T_MAIN_MIN``/``T_MAIN_MAX``, ``T_MAIN_BACKUP``,
+``T_MAIN_ERR``, and ``T_MAIN_RUN``.
+
+.. code-block:: python
+
+    >>> import lasio
+    >>> las = lasio.read("example.las")
+    >>> audit = las.audit_sentinel_values(-99)
+    >>> audit.summary()
+    {'sentinel': -99.0, 'applied': True, 'curves': 2, 'samples': 4,
+     'missing': 2, 'measured': 1, 'ambiguous': 1, 'replaced': 2, 'restored': 2}
+    >>> [record.decision for record in audit.for_curve("T_MAIN")]
+    ['ambiguous', 'missing', 'measured']
+    >>> audit.original_data("T_MAIN")
+    array([-99.,  55., -99.,  70., -99.])
+
+The audit keeps the original values of every curve it examined, so samples
+replaced with ``NaN`` remain queryable through ``audit.original_data()``,
+``audit.at_depth()``, and each record's ``raw_value``. If the file's ``NULL``
+header item is itself ``-99``, ``LASFile.null_replacements`` and
+``LASFile.null_originals`` retain what the reader substituted, and values that
+remain ambiguous are restored to the original number.
+
+Decisions are:
+
+* ``measured`` -- the value is inside the calibrated range and, when a backup
+  is present, the backup agrees within the stated error. The value is kept.
+* ``missing`` -- the calibrated range excludes the value, or a same-run backup
+  contradicts it beyond the combined error. The value becomes ``NaN``.
+* ``ambiguous`` -- both explanations remain possible. The value is kept and
+  reported in ``audit.doubts``.
+
+A backup is only used when it belongs to the same run. A backup that is itself
+the sentinel provides no independent evidence. Missing or conflicting evidence
+resolves to ``ambiguous`` rather than silently deleting the sample.

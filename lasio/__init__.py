@@ -60,6 +60,16 @@ from .las import JSONEncoder, LASFile
 from .las_items import CurveItem, HeaderItem, SectionItems
 from .las_version import version
 from .reader import open_file
+from .sentinel import (
+    AMBIGUOUS,
+    MEASURED,
+    MISSING,
+    CurveSentinelSpec,
+    SentinelAudit,
+    SentinelRecord,
+    audit_sentinels,
+    extract_specs,
+)
 
 __version__ = version()
 
