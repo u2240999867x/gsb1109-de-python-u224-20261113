@@ -204,3 +204,142 @@ class TestDataStringFields(unittest.TestCase):
 
 
 # vim: set et fenc=utf-8 ft=python ff=unix sts=4 sw=4 ts=4
+
+
+class TestNestedColumns(unittest.TestCase):
+    '''
+    Tests flattening of nested message formats into stable business columns.
+    '''
+
+    SUB_FORMAT = 'uint8_t x;uint8_t[2] arr;uint8_t[2] _padding0;'
+
+    @staticmethod
+    def _build_log(formats, subscriptions, data_messages):
+        content = pyulog.ULog.HEADER_BYTES + b'\x01' + struct.pack('<Q', 0)
+        for msg_type, payload in formats:
+            content += struct.pack('<HB', len(payload), ord(msg_type)) + payload
+        for msg_type, payload in subscriptions:
+            content += struct.pack('<HB', len(payload), ord(msg_type)) + payload
+        for msg_type, payload in data_messages:
+            content += struct.pack('<HB', len(payload), ord(msg_type)) + payload
+        return BytesIO(content)
+
+    @classmethod
+    def _format(cls, name, fields):
+        return ('F', bytes(name + ':' + fields, 'utf-8'))
+
+    @classmethod
+    def _subscription(cls, msg_id, name):
+        return ('A', struct.pack('<BH', 0, msg_id) + bytes(name, 'utf-8'))
+
+    @classmethod
+    def _data(cls, msg_id, payload):
+        return ('D', struct.pack('<H', msg_id) + payload)
+
+    @classmethod
+    def _sub_payload(cls, x, first, second):
+        return struct.pack('<B2B2B', x, first, second, 0, 0)
+
+    def _parse(self, outer_fields, payload):
+        formats = [self._format('sub', self.SUB_FORMAT),
+                   self._format('outer', outer_fields)]
+        subscriptions = [self._subscription(7, 'outer')]
+        data_messages = [self._data(7, payload)]
+        return pyulog.ULog(self._build_log(formats, subscriptions, data_messages))
+
+    def test_nested_paths_and_array_indices(self):
+        ''' Array elements keep their index and full source path. '''
+        payload = (struct.pack('<Q', 123) +
+                   self._sub_payload(1, 9, 10) +
+                   self._sub_payload(2, 11, 12) +
+                   b'\x00\x00' + b'\xaa\xbb\xcc')
+        ulog = self._parse('uint64_t timestamp;sub a;sub b;'
+                           'uint8_t[2] _padding0;', payload)
+        dataset = ulog.get_dataset('outer')
+
+        assert dataset.list_columns() == [
+            'timestamp', 'a.arr[0]', 'a.arr[1]', 'a.x',
+            'b.arr[0]', 'b.arr[1]', 'b.x']
+
+        arr_field = dataset.get_field_data('a.arr[1]')
+        assert arr_field.array_index == 1
+        assert arr_field.source_path == ('a', 'arr[1]')
+        assert arr_field.leaf_name == 'arr'
+        assert arr_field.is_padding is False
+
+        # Byte offsets are taken from the declared wire layout.
+        assert arr_field.offset == 10
+        assert dataset.declared_size == 20
+
+    def test_same_named_leaves_do_not_overwrite(self):
+        ''' Leaves with the same name in two submessages are separate columns. '''
+        payload = (struct.pack('<Q', 123) +
+                   self._sub_payload(1, 9, 10) +
+                   self._sub_payload(2, 11, 12) +
+                   b'\x00\x00')
+        ulog = self._parse('uint64_t timestamp;sub a;sub b;'
+                           'uint8_t[2] _padding0;', payload)
+        dataset = ulog.get_dataset('outer')
+
+        assert dataset.data['a.x'][0] == 1
+        assert dataset.data['b.x'][0] == 2
+        assert dataset.data['a.arr[0]'][0] == 9
+        assert dataset.data['b.arr[0]'][0] == 11
+
+    def test_padding_is_not_a_business_column(self):
+        ''' Alignment padding is parsed for layout but never exposed as data. '''
+        payload = (struct.pack('<Q', 123) +
+                   self._sub_payload(1, 9, 10) +
+                   b'\x00\x00')
+        ulog = self._parse('uint64_t timestamp;sub a;'
+                           'uint8_t[3] _padding0;', payload)
+        dataset = ulog.get_dataset('outer')
+
+        assert not any('_padding' in name for name in dataset.data)
+        assert not any('_padding' in name for name in dataset.list_columns())
+        assert dataset.padding_fields
+        assert all(field.is_padding for field in dataset.padding_fields)
+
+    def test_unknown_trailing_bytes_are_preserved(self):
+        ''' Bytes after the declared layout are kept with their byte range. '''
+        payload = (struct.pack('<Q', 123) +
+                   self._sub_payload(1, 9, 10) +
+                   b'\x00\x00' + b'\xaa\xbb\xcc')
+        ulog = self._parse('uint64_t timestamp;sub a;'
+                           'uint8_t[2] _padding0;', payload)
+        dataset = ulog.get_dataset('outer')
+
+        assert list(dataset.trailing_data) == [b'\xaa\xbb\xcc']
+        assert list(dataset.unknown_data) == [b'\xaa\xbb\xcc']
+        assert dataset.trailing_ranges[0] == (15, 18)
+        assert dataset.trailing_field_data[0].offset == 15
+
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            copy_path = os.path.join(tmpdirname, 'tail_copy.ulg')
+            ulog.write_ulog(copy_path)
+            copied = pyulog.ULog(copy_path)
+        copied_dataset = copied.get_dataset('outer')
+        assert list(copied_dataset.trailing_data) == [b'\xaa\xbb\xcc']
+
+    def test_definition_order_does_not_change_columns(self):
+        ''' Semantically equal logs with reordered definitions align. '''
+        payload_ab = (struct.pack('<Q', 5) +
+                      self._sub_payload(1, 9, 10) +
+                      self._sub_payload(2, 11, 12) + b'\x00\x00')
+        payload_ba = (struct.pack('<Q', 5) +
+                      self._sub_payload(2, 11, 12) +
+                      self._sub_payload(1, 9, 10) + b'\x00\x00')
+
+        ulog_ab = self._parse('uint64_t timestamp;sub a;sub b;'
+                              'uint8_t[2] _padding0;', payload_ab)
+        ulog_ba = self._parse('uint64_t timestamp;sub b;sub a;'
+                              'uint8_t[2] _padding0;', payload_ba)
+
+        dataset_ab = ulog_ab.get_dataset('outer')
+        dataset_ba = ulog_ba.get_dataset('outer')
+        assert dataset_ab.list_columns() == dataset_ba.list_columns()
+        assert list(dataset_ab.data) == list(dataset_ba.data)
+        for column in dataset_ab.data:
+            assert np.array_equal(dataset_ab.data[column],
+                                  dataset_ba.data[column])
+        assert dataset_ab == dataset_ba

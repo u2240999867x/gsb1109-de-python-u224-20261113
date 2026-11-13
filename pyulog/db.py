@@ -49,7 +49,7 @@ class DatabaseULog(ULog):
     contsructor will throw an exception. See the documentation of
     "ulog_migratedb" for more information.
     '''
-    SCHEMA_VERSION = 5
+    SCHEMA_VERSION = 6
 
     @staticmethod
     def get_db_handle(db_path):
@@ -409,6 +409,37 @@ class DatabaseULog(ULog):
             cur.close()
         self._lazy_loaded = lazy
 
+    @staticmethod
+    def _business_fields(wire_fields, wire_data):
+        """ Split stored wire fields into canonical business columns. """
+        fields = [field for field in wire_fields if not field.is_padding]
+        timestamp = None
+        business = []
+        for field in fields:
+            if field.field_name == 'timestamp':
+                timestamp = field
+            else:
+                business.append(field)
+        business.sort(key=lambda field: field.sort_key)
+        if timestamp is not None:
+            business.insert(0, timestamp)
+        data = {field.field_name: wire_data[field.field_name]
+                for field in business}
+        return business, data
+
+    @staticmethod
+    def _wire_layout(wire_fields):
+        """ Compute byte offsets for fields restored from the database. """
+        offset = 0
+        required_size = 0
+        for field in wire_fields:
+            field.offset = offset
+            field.size = ULog.get_field_size(field.type_str)
+            offset += field.size
+            if not field.is_padding:
+                required_size = offset
+        return offset, required_size
+
     def get_dataset(self, name, multi_instance=0, lazy=False, db_cursor=None, caching=True):
         '''
         Access a specific dataset and its data series from the database.
@@ -446,27 +477,45 @@ class DatabaseULog(ULog):
 
         with db_context:
             cur.execute('''
-                SELECT Id, TimestampIndex, MessageId
+                SELECT Id, TimestampIndex, MessageId, UnknownOffset
                 FROM ULogDataset
                 WHERE DatasetName = ? AND MultiId = ? AND ULogId = ?
                 ''', (name, multi_instance, self._pk))
             dataset_result = cur.fetchone()
             if dataset_result is None:
                 raise KeyError(f'Dataset with name {name} and multi id {multi_instance} not found.')
-            dataset_id, timestamp_idx, msg_id = dataset_result
+            dataset_id, timestamp_idx, msg_id, unknown_offset = dataset_result
             fields = []
             data = {}
+            wire_fields = []
+            wire_data = {}
+            trailing_data = []
+            declared_size = 0
+            required_size = 0
             if not lazy:
                 cur.execute('''
                     SELECT TopicName, DataType, ValueArray
                     FROM ULogField
                     WHERE DatasetId = ?
+                    ORDER BY Id
                     ''', (dataset_id,))
                 field_results = cur.fetchall()
                 for field_name, data_type, value_bytes in field_results:
-                    fields.append(DatabaseULog._FieldData(field_name=field_name,type_str=data_type))
+                    wire_fields.append(DatabaseULog._FieldData(
+                        field_name=field_name, type_str=data_type))
                     dtype = DatabaseULog._UNPACK_TYPES[data_type][2]
-                    data[field_name] = np.frombuffer(value_bytes, dtype=dtype)
+                    wire_data[field_name] = np.frombuffer(value_bytes, dtype=dtype)
+                fields, data = self._business_fields(wire_fields, wire_data)
+                declared_size, required_size = self._wire_layout(wire_fields)
+                if not unknown_offset:
+                    unknown_offset = declared_size
+                cur.execute('''
+                    SELECT SampleIndex, Value
+                    FROM ULogDatasetTrailingData
+                    WHERE DatasetId = ?
+                    ORDER BY SampleIndex
+                    ''', (dataset_id,))
+                trailing_data = [bytes(value) for _, value in cur.fetchall()]
 
         # If caching=True but there is no existing dataset we could append a
         # new one to self._data_list, but that could be considered a
@@ -476,6 +525,14 @@ class DatabaseULog(ULog):
             existing_dataset.timestamp_idx = timestamp_idx
             existing_dataset.field_data = fields
             existing_dataset.data = data
+            existing_dataset._wire_fields = wire_fields
+            existing_dataset._wire_data = wire_data
+            existing_dataset.padding_fields = [
+                field for field in wire_fields if field.is_padding]
+            existing_dataset.trailing_offset = unknown_offset
+            existing_dataset.declared_size = declared_size
+            existing_dataset.trailing_data = self._trailing_array(
+                trailing_data, data)
             dataset = existing_dataset
         else:
             dataset = DatabaseULog.DatabaseData(
@@ -486,7 +543,26 @@ class DatabaseULog(ULog):
                 field_data=fields,
                 data=data,
             )
+            dataset._wire_fields = wire_fields
+            dataset._wire_data = wire_data
+            dataset.padding_fields = [
+                field for field in wire_fields if field.is_padding]
+            dataset.trailing_offset = unknown_offset
+            dataset.declared_size = declared_size
+            dataset.trailing_data = self._trailing_array(trailing_data, data)
         return dataset
+
+    @staticmethod
+    def _trailing_array(trailing_data, data):
+        if 'timestamp' in data:
+            num_samples = len(data['timestamp'])
+        else:
+            num_samples = len(trailing_data)
+        trailing = np.empty(num_samples, dtype=object)
+        for index in range(num_samples):
+            value = trailing_data[index] if index < len(trailing_data) else b''
+            trailing[index] = bytes(value)
+        return trailing
 
     def save(self, append_json=False):
         '''
@@ -543,22 +619,28 @@ class DatabaseULog(ULog):
 
             # data_list
             for dataset in self.data_list:
+                unknown_offset = getattr(dataset, 'trailing_offset', None)
+                if unknown_offset is None:
+                    unknown_offset = 0
                 cur.execute('''
                     INSERT INTO ULogDataSet
-                    (DatasetName, MultiId, MessageId, TimestampIndex, ULogId)
+                    (DatasetName, MultiId, MessageId, TimestampIndex, UnknownOffset, ULogId)
                     VALUES
-                    (?, ?, ?, ?, ?)
+                    (?, ?, ?, ?, ?, ?)
                     ''', (
                         dataset.name,
                         dataset.multi_id,
                         dataset.msg_id,
                         dataset.timestamp_idx,
+                        unknown_offset,
                         self._pk,
                     )
                 )
                 dataset_id = cur.lastrowid
-                for field in dataset.field_data:
-                    values = dataset.data[field.field_name]
+                wire_fields = getattr(dataset, '_wire_fields', dataset.field_data)
+                wire_data = getattr(dataset, '_wire_data', dataset.data)
+                for field in wire_fields:
+                    values = wire_data[field.field_name]
                     values_bytes = values.tobytes()
                     if append_json:
                         # Precision is only good enough up to a few decimals,
@@ -589,6 +671,20 @@ class DatabaseULog(ULog):
                             dataset_id,
                         )
                     )
+
+                trailing = getattr(dataset, 'trailing_data', None)
+                if trailing is not None:
+                    cur.executemany('''
+                        INSERT INTO ULogDatasetTrailingData
+                        (DatasetId, SampleIndex, Value)
+                        VALUES
+                        (?, ?, ?)
+                        ''', [(
+                            dataset_id,
+                            sample_index,
+                            bytes(value),
+                        ) for sample_index, value in enumerate(trailing)
+                        if value])
 
             # dropouts
             cur.executemany('''
@@ -759,6 +855,12 @@ class DatabaseULog(ULog):
             self.timestamp_idx = timestamp_idx
             self.field_data = field_data
             self.data = data
+            self._wire_fields = list(field_data)
+            self._wire_data = data or {}
+            self.padding_fields = []
+            self.trailing_data = np.empty(0, dtype=object)
+            self.trailing_offset = 0
+            self.declared_size = 0
 
     class DatabaseMessageDropout(ULog.MessageDropout):
         '''

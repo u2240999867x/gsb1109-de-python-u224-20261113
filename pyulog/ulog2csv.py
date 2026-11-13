@@ -99,7 +99,7 @@ def convert_ulog2csv(ulog_file_name, messages, output, delimiter, time_s, time_e
         data_keys = []
         string_array_sizes = {}
         for f in data.field_data:
-            if f.field_name.startswith('_padding'):
+            if f.is_padding:
                 continue
             result = array_pattern.fullmatch(f.field_name)
             if result and f.type_str == 'char':  # string (array of char's)
