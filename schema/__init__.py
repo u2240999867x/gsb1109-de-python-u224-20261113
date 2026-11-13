@@ -51,6 +51,12 @@ __all__ = [
     "SchemaForbiddenKeyError",
     "SchemaUnexpectedTypeError",
     "SchemaOnlyOneAllowedError",
+    "Contract",
+    "FieldSpec",
+    "Relation",
+    "RepairPlan",
+    "RepairPlanner",
+    "RepairSearchLimitError",
 ]
 
 
@@ -986,3 +992,13 @@ def _callable_str(callable_: Callable[..., Any]) -> str:
 
 def _plural_s(sized: Sized) -> str:
     return "s" if len(sized) > 1 else ""
+
+
+from .repair import (  # noqa: E402
+    Contract,
+    FieldSpec,
+    Relation,
+    RepairPlan,
+    RepairPlanner,
+    RepairSearchLimitError,
+)

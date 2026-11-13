@@ -502,6 +502,86 @@ You can exit with ``sys.exit(exc.code)`` if you want to show the messages
 to the user without traceback. ``error`` messages are given precedence in that
 case.
 
+Repairing records against a contract
+-------------------------------------------------------------------------------
+
+A ``Contract`` extends validation with the allowed values of each field, the
+cost of re-checking that field against the supplier's original document, and
+the relations that must hold between fields.  ``Contract.repair`` reports every
+failure with its original fields, then picks the cheapest group of fields whose
+amendment makes the record pass the same contract.  It never changes the input
+record; the amendment is a review lead for a human.
+
+.. code:: python
+
+    >>> from schema import Contract, FieldSpec, Relation
+
+    >>> contract = Contract(
+    ...     {
+    ...         "region": FieldSpec(["EU", "US"], cost=1, source="registry"),
+    ...         "currency": FieldSpec(["EUR", "USD"], cost=2, source="registry"),
+    ...         "tax": FieldSpec(["standard", "zero"], cost=4, source="finance"),
+    ...     },
+    ...     relations=[
+    ...         Relation(
+    ...             "region-currency",
+    ...             ["region", "currency"],
+    ...             lambda r: (r["region"] == "EU") == (r["currency"] == "EUR"),
+    ...         ),
+    ...         Relation(
+    ...             "zero-tax-only-eur",
+    ...             ["currency", "tax"],
+    ...             lambda r: not (r["tax"] == "zero" and r["currency"] != "EUR"),
+    ...         ),
+    ...     ],
+    ... )
+
+    >>> record = {"region": "EU", "currency": "USD", "tax": "zero"}
+    >>> plan = contract.repair(record)
+    >>> plan.best_cost
+    2
+    >>> plan.options[0].amendments
+    {'currency': 'EUR'}
+    >>> record["currency"]
+    'USD'
+
+Fields listed in ``verified`` stay fixed, and the planner gives up rather than
+touching them.  When several cheapest groups tie on cost, the plan keeps all of
+them; if they would draw on different sources the status becomes
+``requires_arbitration`` so a duty officer can choose:
+
+.. code:: python
+
+    >>> plan = contract.repair(record, verified=["tax"])
+    >>> plan.status
+    'repairable'
+    >>> plan.options[0].amendments
+    {'currency': 'EUR'}
+
+If two cheapest groups cost the same but would query different sources, the plan
+returns both and asks for arbitration instead of picking one:
+
+.. code:: python
+
+    >>> tied = Contract(
+    ...     {
+    ...         "a": FieldSpec([1, 2], cost=3, source="left"),
+    ...         "b": FieldSpec([1, 2], cost=3, source="right"),
+    ...     },
+    ...     relations=[
+    ...         Relation(
+    ...             "sum-even",
+    ...             ["a", "b"],
+    ...             lambda r: (r["a"] + r["b"]) % 2 == 0,
+    ...         )
+    ...     ],
+    ... )
+    >>> tied_plan = tied.repair({"a": 1, "b": 2})
+    >>> tied_plan.status, tied_plan.best_cost
+    ('requires_arbitration', 3)
+    >>> [(o.fields, o.sources) for o in tied_plan.options]
+    [(('a',), ('left',)), (('b',), ('right',))]
+
 A JSON API example
 -------------------------------------------------------------------------------
 
