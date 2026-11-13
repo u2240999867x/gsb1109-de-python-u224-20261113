@@ -45,6 +45,10 @@ __all__ = [
     "Forbidden",
     "Const",
     "Literal",
+    "Rule",
+    "ConditionalRequired",
+    "MutuallyExclusive",
+    "RequiredTogether",
     "SchemaError",
     "SchemaWrongKeyError",
     "SchemaMissingKeyError",
@@ -569,6 +573,10 @@ class Schema(object):
             try:
                 return s.validate(data, **kwargs)
             except SchemaError as x:
+                if e is None and _contains_rule(s):
+                    # Keep the specific error type of explicit cross-field
+                    # rules (e.g. SchemaMissingKeyError) instead of re-wrapping.
+                    raise
                 raise SchemaError(
                     [None] + x.autos, [e.format(data) if e else None] + x.errors
                 )
@@ -942,6 +950,193 @@ class Forbidden(Hook):
         )
 
 
+class Rule:
+    """Base class for explicit cross-field rules over a whole mapping.
+
+    Rules validate the dict as a unit (not a single key), so they compose
+    with ``And`` at the dict level::
+
+        Schema(
+            And(
+                {"event_type": str, Optional("original_txn_id"): Or(None, str)},
+                ConditionalRequired("event_type", "refund", "original_txn_id"),
+            )
+        )
+
+    "Present" always means "the key exists in the data". An explicit
+    ``None`` value counts as present, so the three business states
+    (key absent / explicit null / concrete value) stay distinguishable.
+
+    Each rule can also be rendered as a SQLite ``CHECK`` expression via
+    :meth:`to_sql_check`, so the same convention can be enforced on a
+    staging table for writers that bypass this library (see
+    ``schema.sqlite``).
+    """
+
+    @property
+    def keys(self) -> Tuple:
+        """All dict keys this rule refers to."""
+        raise NotImplementedError
+
+    def validate(self, data: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError
+
+    def to_sql_check(
+        self, column: Callable[[Any], str], presence: Callable[[Any], str]
+    ) -> str:
+        """Render this rule as a SQLite CHECK expression.
+
+        :param column: maps a key name to its SQL column expression.
+        :param presence: maps a key name to a SQL boolean expression that is
+            true when the key was present in the original event.
+        """
+        raise NotImplementedError
+
+    @staticmethod
+    def _ensure_mapping(data: Any) -> None:
+        if not isinstance(data, dict):
+            raise SchemaUnexpectedTypeError(
+                "%r should be a mapping for cross-field rules" % (data,)
+            )
+
+
+class ConditionalRequired(Rule):
+    """Require keys to be present when another key holds a given value.
+
+    Example: ``ConditionalRequired("event_type", "refund", "original_txn_id")``
+    means a refund event must carry the ``original_txn_id`` key, while other
+    events may omit it entirely. A present ``None`` satisfies the rule.
+    """
+
+    def __init__(
+        self,
+        trigger_key: Any,
+        trigger_value: Any,
+        *required_keys: Any,
+        error: Union[str, None] = None,
+    ) -> None:
+        if not required_keys:
+            raise ValueError("ConditionalRequired needs at least one required key")
+        self._trigger_key: Any = trigger_key
+        self._trigger_value: Any = trigger_value
+        self._required_keys: Tuple = required_keys
+        self._error: Union[str, None] = error
+
+    def __repr__(self) -> str:
+        return "%s(%r, %r, %s)" % (
+            self.__class__.__name__,
+            self._trigger_key,
+            self._trigger_value,
+            ", ".join(repr(k) for k in self._required_keys),
+        )
+
+    @property
+    def keys(self) -> Tuple:
+        return (self._trigger_key,) + self._required_keys
+
+    def validate(self, data: Any, **kwargs: Any) -> Any:
+        self._ensure_mapping(data)
+        if (
+            self._trigger_key in data
+            and data[self._trigger_key] == self._trigger_value
+        ):
+            missing = [k for k in self._required_keys if k not in data]
+            if missing:
+                message = "Missing key%s %s: required when %r == %r" % (
+                    _plural_s(missing),
+                    ", ".join(repr(k) for k in missing),
+                    self._trigger_key,
+                    self._trigger_value,
+                )
+                raise SchemaMissingKeyError(message, self._error)
+        return data
+
+    def to_sql_check(
+        self, column: Callable[[Any], str], presence: Callable[[Any], str]
+    ) -> str:
+        condition = " AND ".join(presence(k) for k in self._required_keys)
+        return "(%s IS NULL OR %s != %s OR (%s))" % (
+            column(self._trigger_key),
+            column(self._trigger_key),
+            _sql_literal(self._trigger_value),
+            condition,
+        )
+
+
+class MutuallyExclusive(Rule):
+    """Allow at most one of the given keys to be present."""
+
+    def __init__(self, *keys: Any, error: Union[str, None] = None) -> None:
+        if len(keys) < 2:
+            raise ValueError("MutuallyExclusive needs at least two keys")
+        self._keys: Tuple = keys
+        self._error: Union[str, None] = error
+
+    def __repr__(self) -> str:
+        return "%s(%s)" % (
+            self.__class__.__name__,
+            ", ".join(repr(k) for k in self._keys),
+        )
+
+    @property
+    def keys(self) -> Tuple:
+        return self._keys
+
+    def validate(self, data: Any, **kwargs: Any) -> Any:
+        self._ensure_mapping(data)
+        present = [k for k in self._keys if k in data]
+        if len(present) > 1:
+            message = "Mutually exclusive keys present: %s" % ", ".join(
+                repr(k) for k in present
+            )
+            raise SchemaOnlyOneAllowedError(message, self._error)
+        return data
+
+    def to_sql_check(
+        self, column: Callable[[Any], str], presence: Callable[[Any], str]
+    ) -> str:
+        return "((%s) <= 1)" % " + ".join(presence(k) for k in self._keys)
+
+
+class RequiredTogether(Rule):
+    """Require the given keys to be either all present or all absent."""
+
+    def __init__(self, *keys: Any, error: Union[str, None] = None) -> None:
+        if len(keys) < 2:
+            raise ValueError("RequiredTogether needs at least two keys")
+        self._keys: Tuple = keys
+        self._error: Union[str, None] = error
+
+    def __repr__(self) -> str:
+        return "%s(%s)" % (
+            self.__class__.__name__,
+            ", ".join(repr(k) for k in self._keys),
+        )
+
+    @property
+    def keys(self) -> Tuple:
+        return self._keys
+
+    def validate(self, data: Any, **kwargs: Any) -> Any:
+        self._ensure_mapping(data)
+        present = [k for k in self._keys if k in data]
+        if 0 < len(present) < len(self._keys):
+            message = "Keys must appear together: %s (got %s)" % (
+                ", ".join(repr(k) for k in self._keys),
+                ", ".join(repr(k) for k in present),
+            )
+            raise SchemaError(message, self._error)
+        return data
+
+    def to_sql_check(
+        self, column: Callable[[Any], str], presence: Callable[[Any], str]
+    ) -> str:
+        first = presence(self._keys[0])
+        return "(%s)" % " AND ".join(
+            "%s = %s" % (first, presence(k)) for k in self._keys[1:]
+        )
+
+
 class Literal:
     def __init__(
         self,
@@ -984,5 +1179,27 @@ def _callable_str(callable_: Callable[..., Any]) -> str:
     return str(callable_)
 
 
+def _contains_rule(s: Any) -> bool:
+    """Whether a validator is or contains an explicit cross-field Rule."""
+    if isinstance(s, Rule):
+        return True
+    if isinstance(s, And):
+        return any(_contains_rule(arg) for arg in s.args)
+    return False
+
+
 def _plural_s(sized: Sized) -> str:
     return "s" if len(sized) > 1 else ""
+
+
+def _sql_literal(value: Any) -> str:
+    """Render a Python constant as a SQLite literal."""
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, str):
+        return "'" + value.replace("'", "''") + "'"
+    raise TypeError(f"No SQLite literal for {value!r}")

@@ -3,6 +3,12 @@
 
 ## Unreleased
 
+### Features
+
+* Add explicit cross-field rules: `ConditionalRequired`, `MutuallyExclusive` and `RequiredTogether`, composable with `And` at the dict level. Key presence is tracked separately from `None` values, so absent / explicit null / concrete value stay distinguishable.
+
+* Add `schema.sqlite` module: `create_table_ddl` compiles a dict schema plus rules into a SQLite `CREATE TABLE` with `CHECK` constraints, and `event_to_row` / `row_to_event` convert between events and staging rows via generated `__present` flag columns. Constructs that cannot migrate (`Use`, lambda predicates, `Regex`, hooks, callable defaults, nested structures) are reported through `UnmigratableError`.
+
 
 ## v0.7.8 (2025-10-11)
 

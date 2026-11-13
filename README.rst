@@ -417,6 +417,80 @@ Here's an example where a `Deprecated` class is added to log warnings whenever a
     ...
     WARNING: `test` is deprecated. custom error message.
 
+Cross-field rules
+~~~~~~~~~~~~~~~~~
+
+Some conventions span several keys of the same dict. Explicit rules state
+them declaratively and compose with ``And`` at the dict level:
+
+.. code:: python
+
+    from schema import And, ConditionalRequired, Optional, Or, Schema
+
+    event_schema = Schema(
+        And(
+            {
+                "event_type": str,
+                "amount": Or(int, float),
+                Optional("original_txn_id"): Or(None, str),
+            },
+            ConditionalRequired("event_type", "refund", "original_txn_id"),
+        )
+    )
+
+Available rules:
+
+- ``ConditionalRequired(trigger_key, trigger_value, *required_keys)`` --
+  the required keys must be *present* when the trigger key holds the given
+  value. Above, refunds must carry ``original_txn_id`` while normal
+  transactions may omit it entirely.
+- ``MutuallyExclusive(*keys)`` -- at most one of the keys may be present.
+- ``RequiredTogether(*keys)`` -- the keys must be all present or all absent.
+
+"Present" means "the key exists in the data". An explicit ``None`` counts
+as present, so the three business states (key absent / explicit null /
+concrete value) never collapse into one. Rules raise specific errors:
+``SchemaMissingKeyError`` for ``ConditionalRequired`` and
+``SchemaOnlyOneAllowedError`` for ``MutuallyExclusive``.
+
+SQLite staging tables
+~~~~~~~~~~~~~~~~~~~~~
+
+``schema.sqlite`` mirrors the same convention as a SQLite staging table, so
+writers that insert directly into the database follow the same rules:
+
+.. code:: python
+
+    from schema.sqlite import create_table_ddl, event_to_row, row_to_event
+
+    ddl = create_table_ddl("events", event_schema)
+    # CREATE TABLE "events" (
+    #   "event_type" TEXT NOT NULL,
+    #   "amount" REAL NOT NULL,
+    #   "original_txn_id" TEXT,
+    #   "original_txn_id__present" INTEGER NOT NULL DEFAULT 0,
+    #   ...
+    #   CHECK (("event_type" IS NULL OR "event_type" != 'refund'
+    #           OR ("original_txn_id__present" = 1)))
+    # );
+
+Optional keys whose value may be ``None`` get a generated
+``<key>__present`` flag column. Use ``event_to_row`` when writing and
+``row_to_event`` when reading back, and the three states (absent / explicit
+null / value) survive the round trip instead of collapsing into one NULL.
+
+Only a subset of **schema** constructs maps to SQL ``CHECK`` constraints.
+Custom Python-side transformations cannot run inside SQLite, and
+``create_table_ddl`` raises ``UnmigratableError`` listing every one of them:
+
+- ``Use(...)`` -- arbitrary Python callables that transform values.
+- lambda / function predicates -- opaque Python code.
+- ``Regex`` -- Python ``re`` has no built-in SQLite equivalent.
+- ``Hook`` / ``Forbidden`` value handlers -- Python callbacks (a
+  ``Forbidden`` key is enforced implicitly: no column is created for it).
+- callable ``Optional`` defaults -- Python code, not a SQL ``DEFAULT``.
+- nested dicts / lists / sets -- need JSON storage, not a scalar column.
+
 Extra Keys
 ~~~~~~~~~~
 
