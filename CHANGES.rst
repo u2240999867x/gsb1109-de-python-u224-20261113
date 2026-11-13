@@ -1,6 +1,17 @@
 Changes
 =======
 
+0.5.2 (unreleased)
+------------------
+
+* Added ``PaymentPlan.parse`` (alias ``parse_payment_plan``) for parsing
+  rental/lease payment plan strings in the agreed keyword format. It splits
+  cash flows into mandatory and optional payments, dates upfront payments on
+  the signing date and installments on month ends, limits promotions to the
+  first three installments, derives deposit refundability from the component
+  text, and exposes a ``total_lower_bound`` for pages that only disclose a
+  minimum monthly payment.
+
 0.5.1 (2026-03-19)
 ------------------
 

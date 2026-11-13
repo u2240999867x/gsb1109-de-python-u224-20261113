@@ -166,6 +166,59 @@ Price(amount=Decimal('140.600'), currency='$')
 Price(amount=Decimal('140600'), currency='$')
 
 
+Rental payment plans
+--------------------
+
+Rental quote pages put promotional monthly payments, the first-installment
+fee and the final buyout on the same line.  ``PaymentPlan.parse`` reads such
+a line written in the agreed keyword format (Chinese keywords, semicolon- or
+space-separated components) and splits it into ``mandatory`` and ``optional``
+cash flows; ``parse_payment_plan`` is an alias:
+
+>>> from price_parser import PaymentPlan
+>>> plan = PaymentPlan.parse(
+...     "首付 2000元；押金 3000元 可退；首期手续费 500元；"
+...     "促销月付 999元 前3期；月付 1299元 第4-12期；尾款买断 8000元",
+...     signing_date="2026-11-14",
+... )
+>>> plan.term_months
+12
+>>> plan.mandatory_total
+Decimal('20188')
+>>> [(flow.kind, flow.period, flow.amount, flow.due_date.isoformat())
+...  for flow in plan.mandatory[:4]]
+[('down_payment', None, Decimal('2000'), '2026-11-14'), ('deposit', None, Decimal('3000'), '2026-11-14'), ('fee', None, Decimal('500'), '2026-11-14'), ('promo_installment', 1, Decimal('999'), '2026-12-31')]
+>>> [(flow.kind, flow.amount) for flow in plan.optional]
+[('balloon', Decimal('8000')), ('deposit_refund', Decimal('-3000'))]
+
+Cash flow dates follow two rules: upfront components (down payment, deposit,
+first-installment fee) are due on the ``signing_date``, while installment
+*n*, the buyout and a refundable deposit are dated on the last calendar day
+of the relevant month.
+
+Promotions are only accepted for the first three installments; a promotional
+component covering later periods raises ``PaymentParseError``.  Whether a
+deposit is refundable is taken from the component itself: ``可退`` produces a
+negative ``deposit_refund`` flow in ``optional``, ``不退`` produces no
+refund, and an undeclared deposit is never guessed.
+
+When the page only discloses a minimum monthly payment, no installment
+schedule is fabricated and the minimum is never multiplied by the full term
+as a quoted total.  Instead, ``total_lower_bound`` keeps the best lower
+bound that can actually be computed:
+
+>>> plan = PaymentPlan.parse(
+...     "首付 2000元；最低月供 999元；共12期",
+...     signing_date="2026-11-14",
+... )
+>>> plan.is_lower_bound
+True
+>>> plan.mandatory_total
+Decimal('2000')
+>>> plan.total_lower_bound
+Decimal('13988')
+
+
 Contributing
 ============
 
