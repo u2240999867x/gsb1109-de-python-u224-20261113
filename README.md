@@ -42,6 +42,55 @@ You can replace those tables (dropping them before restoring them) using the `--
 ```bash
 sqlite-diffable load restored.db dump/ --replace
 ```
+## Preserving SQLite storage classes
+
+SQLite stores every value using one of five storage classes: `NULL`, `INTEGER`, `REAL`, `TEXT` or `BLOB`. Older versions of this tool serialized rows with `json.dumps(..., default=repr)`, which turned a `BLOB` into its Python `repr` string. That made an empty `BLOB` (`b''`), an empty `TEXT` (`''`) and `NULL` impossible to tell apart in a dump, and a `BLOB` could not be distinguished from a `TEXT` value that happened to contain the same characters.
+
+New dumps preserve the storage class of every cell:
+
+- `NULL`, integers, floats and text are stored as their normal JSON values.
+- `BLOB` values are stored as `{"$sqlite": "blob", "hex": "..."}`, including empty BLOBs (`{"$sqlite": "blob", "hex": ""}`).
+
+A dump directory also gets a `.sqlite-diffable.json` manifest recording that its tables use the typed format.
+
+```json
+[1, {"$sqlite": "blob", "hex": ""}, "", null, "b''"]
+```
+
+Loading that row restores an empty BLOB, an empty text string, NULL and a text value that looks like a BLOB, each with the correct `typeof()`.
+
+`sqlite-diffable objects` shows the tagged BLOB representation by default. Use `objects --legacy` to display BLOBs the way the old exporter did, as `b'...'` strings.
+
+### Upgrading an old dump directory
+
+Old untyped dumps are still accepted by `load`, but you can upgrade the files in place first:
+```bash
+sqlite-diffable migrate dump/
+```
+This rewrites each `.ndjson` file in the typed format. A value is only ambiguous if it is exactly the Python `repr()` of a BLOB, such as `"b'\\x00'"`—only then could it have come from either a BLOB or a TEXT column. A string such as `b"abc"` is a valid Python bytes literal but its canonical `repr()` is `b'abc'`, so it was never produced by the old exporter and is treated as TEXT.
+
+If you still have the original database, pass it with `--source`. It is opened read-only and used as evidence:
+```bash
+sqlite-diffable migrate dump/ --source original.db
+sqlite-diffable load restored.db dump/ --source original.db
+```
+Without `--source`, every ambiguous cell is written as a pending marker that records both interpretations:
+```json
+{
+  "$sqlite": "pending",
+  "status": "needs-review",
+  "reason": "legacy-value-is-valid-bytes-literal",
+  "legacy": "b'\\x00'",
+  "candidates": [
+    {"$sqlite": "blob", "hex": "00"},
+    {"$sqlite": "text", "value": "b'\\x00'"}
+  ]
+}
+```
+Loading refuses to guess while pending cells remain. Confirm each one by replacing the marker with the correct typed cell (as above) and load again, re-run `migrate --source original.db`, or pass `--allow-pending` to load those cells as `NULL`.
+
+An empty BLOB and an empty TEXT string are never ambiguous: the old exporter wrote them as `"b''"` and `""`, which remain distinct.
+
 ## Converting to JSON objects
 
 Table rows are stored in the `.ndjson` files as newline-delimited JSON arrays, like this:
@@ -100,6 +149,8 @@ Each table is represented as two files. The first, `table_name.metadata.json`, c
 It is an object with three keys: `name` is the name of the table, `columns` is an array of column strings and `schema` is the SQL schema text used for tha table.
 
 The second file, `table_name.ndjson`, contains newline-delimited JSON (aka [JSON Lines](https://jsonlines.org/)) for every row in the table. Each row is represented as a JSON array with items corresponding to each of the columns defined in the metadata.
+
+Typed dumps also include `.sqlite-diffable.json`, a manifest that identifies the format and which tables have been upgraded. `BLOB` cells use the tagged object described above.
 
 That file for the `redirects_redirect.ndjson` table might look like this:
 
