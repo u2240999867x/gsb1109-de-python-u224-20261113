@@ -60,6 +60,18 @@ from .las import JSONEncoder, LASFile
 from .las_items import CurveItem, HeaderItem, SectionItems
 from .las_version import version
 from .reader import open_file
+from .well_correlation import (
+    Anchor,
+    Conflict,
+    CorrelationConflictError,
+    CorrelationEngine,
+    CorrelationError,
+    IntervalResult,
+    Marker,
+    MarkerSpecificationError,
+    StretchLimits,
+    correlate_wells,
+)
 
 __version__ = version()
 

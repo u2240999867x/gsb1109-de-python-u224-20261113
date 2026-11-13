@@ -96,3 +96,8 @@ Test data
 Logging
 -------
 .. autofunction:: lasio.add_logging_level
+
+Well-to-well depth correlation
+------------------------------
+.. automodule:: lasio.well_correlation
+    :members:
