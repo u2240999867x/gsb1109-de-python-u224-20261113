@@ -92,6 +92,51 @@ For example, `latitude` and `longitude` properties exist as helpers to access th
 Sentence types that pynmea2 has no definition for are still parsed: a talker sentence is returned as a plain `TalkerSentence` and a proprietary sentence as a plain `ProprietarySentence`, with the raw field values in `data`. Input that is not an NMEA sentence still raises `ParseError`.
 
 
+## Compass deviation table audit
+
+`pynmea2.compass` audits a magnetic compass deviation table (罗经自差表)
+against recorded NMEA data. The table is organised by ship's heading band;
+each `HDG` sentence supplies the magnetic sensor heading plus deviation and
+variation (each tagged E/W), while `HDT` (or the true course in `RMC`)
+supplies the reference true heading.
+
+Angle arithmetic is always wrapped, so the 359 deg -> 1 deg seam never
+produces a spurious 358 deg error. East deviation/variation is positive,
+west is negative. References are only paired inside a configurable time
+window, and a turn where several references match one `HDG` is reported as
+an error range rather than a single value.
+
+```python
+from pynmea2 import compass
+
+# {band centre in degrees: signed deviation}, E positive / W negative
+table = {0: 2.0, 90: 7.0, 180: -13.0, 270: 7.0}
+
+audit = compass.audit_file('compass.log', table, step=15,
+                           max_time_gap=5.0, tolerance=2.0,
+                           spread_tolerance=2.0)
+print(compass.format_report(audit))
+```
+
+Per-band and overall verdicts distinguish four situations:
+
+- `ok` — the tabulated correction reproduces the reference true heading;
+- `constant_bias` — every populated band shows the same residual, i.e. a
+  heading-independent offset rather than an east/west problem;
+- `sign_flipped` — residuals match the prediction of reversing the E/W
+  letter (residual = -2 × tabulated deviation);
+- `inconclusive` — turn-induced range too wide, mixed evidence, or a single
+  populated band, so bias versus sign reversal cannot currently be separated.
+
+A command line front end is also available; the table file lists
+`heading magnitude E/W` (or a signed deviation) per line:
+
+```bash
+python -m pynmea2.compass compass.log --table deviation.txt --step 15 --window 5
+```
+
+See `examples/compass_audit.py` for a self-contained worked example.
+
 ## Checksums
 
 parse has an optional argument:
