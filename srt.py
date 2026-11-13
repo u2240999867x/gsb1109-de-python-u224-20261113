@@ -112,15 +112,33 @@ class Subtitle(object):
                         line separators, only \\n. This is taken care of
                         already if you use :py:func:`srt.parse` to generate
                         Subtitle objects.
+    :param str source_reel: The identifier of the source reel this subtitle
+                            was cut from, if it was placed on the final-cut
+                            timeline by :py:func:`apply_edl`
+    :param int source_index: The index of the subtitle on its source reel
+                             that this subtitle was cut from, if it was
+                             placed on the final-cut timeline by
+                             :py:func:`apply_edl`
     """
 
     # pylint: disable=R0913
-    def __init__(self, index, start, end, content, proprietary=""):
+    def __init__(
+        self,
+        index,
+        start,
+        end,
+        content,
+        proprietary="",
+        source_reel=None,
+        source_index=None,
+    ):
         self.index = index
         self.start = start
         self.end = end
         self.content = content
         self.proprietary = proprietary
+        self.source_reel = source_reel
+        self.source_index = source_index
 
     def __hash__(self):
         return hash(frozenset(vars(self).items()))
@@ -177,6 +195,60 @@ class Subtitle(object):
             prop=output_proprietary,
             content=output_content,
             eol=eol,
+        )
+
+
+class EditDecision(object):
+    r"""
+    A single entry in an edit decision list (EDL). It describes one segment
+    of the final programme: which source reel the segment is cut from, the
+    in/out points on that reel's timeline, and where the segment sits in the
+    final play order.
+
+    .. doctest::
+
+        >>> from datetime import timedelta
+        >>> EditDecision(reel='A', source_in=timedelta(seconds=10),
+        ...              source_out=timedelta(seconds=20), play_order=1)
+        EditDecision(reel='A', source_in=datetime.timedelta(seconds=10), source_out=datetime.timedelta(seconds=20), play_order=1)
+
+    :param str reel: The identifier of the source reel this segment is cut
+                     from
+    :param source_in: The in-point on the source reel's timeline
+    :type source_in: :py:class:`datetime.timedelta`
+    :param source_out: The out-point on the source reel's timeline
+    :type source_out: :py:class:`datetime.timedelta`
+    :param int play_order: Where this segment plays in the final programme.
+                           Segments are laid out in ascending play order; if
+                           None, the order the decisions are passed to
+                           :py:func:`apply_edl` is used
+    :raises ValueError: If the out-point is not after the in-point
+    """
+
+    def __init__(self, reel, source_in, source_out, play_order=None):
+        if source_out <= source_in:
+            raise ValueError(
+                "source_out must be after source_in, got {} -> {}".format(
+                    source_in, source_out
+                )
+            )
+        self.reel = reel
+        self.source_in = source_in
+        self.source_out = source_out
+        self.play_order = play_order
+
+    @property
+    def duration(self):
+        """The duration of this segment on the final-cut timeline."""
+        return self.source_out - self.source_in
+
+    def __repr__(self):
+        return "%s(reel=%r, source_in=%r, source_out=%r, play_order=%r)" % (
+            type(self).__name__,
+            self.reel,
+            self.source_in,
+            self.source_out,
+            self.play_order,
         )
 
 
@@ -311,6 +383,107 @@ def sort_and_reindex(subtitles, start_index=1, in_place=False, skip=True):
         subtitle.index = sub_num - skipped_subs
 
         yield subtitle
+
+
+def apply_edl(subtitles, decisions, start_index=1):
+    r"""
+    Project subtitles timed against source reels onto the final-cut timeline
+    described by an edit decision list.
+
+    Decisions are laid out back to back in play order, each one mapping its
+    ``[source_in, source_out)`` window onto the next free stretch of the
+    final-cut timeline. Every subtitle that is at least partially visible
+    inside a decision's window is copied onto the final timeline:
+
+    * If a cut boundary slices through a subtitle, the subtitle is clipped
+      so that only the actually visible part remains.
+    * Subtitles that fall entirely outside the window are dropped.
+    * If the same source range plays more than once (a replay), each
+      resulting copy gets its own fresh sequential index, while
+      ``source_reel`` and ``source_index`` point back to the subtitle it was
+      cut from, so both copies can be traced to the same source subtitle.
+
+    .. doctest::
+
+        >>> from datetime import timedelta
+        >>> subs = [Subtitle(index=1, start=timedelta(seconds=5),
+        ...                  end=timedelta(seconds=15), content='hello')]
+        >>> edl = [EditDecision(reel='A', source_in=timedelta(seconds=10),
+        ...                     source_out=timedelta(seconds=20))]
+        >>> list(apply_edl(subs, edl))  # doctest: +ELLIPSIS
+        [Subtitle(...start=datetime.timedelta(0), end=datetime.timedelta(seconds=5)...)]
+
+    :param subtitles: :py:class:`Subtitle` objects timed against the source
+                      reels referenced by the decisions
+    :param decisions: :py:class:`EditDecision` objects describing the final
+                      cut
+    :param int start_index: The index to start numbering output subtitles
+                            from
+    :returns: The subtitles on the final-cut timeline, in play order
+    :rtype: :term:`generator` of :py:class:`Subtitle` objects
+    """
+    subtitles = list(subtitles)
+    decisions = sorted(
+        decisions,
+        key=lambda decision: (
+            decision.play_order is None,
+            decision.play_order if decision.play_order is not None else 0,
+        ),
+    )
+
+    index = start_index
+    final_in = ZERO_TIMEDELTA
+    for decision in decisions:
+        shift = final_in - decision.source_in
+        for subtitle in subtitles:
+            start = max(subtitle.start, decision.source_in)
+            end = min(subtitle.end, decision.source_out)
+            if start >= end:
+                # Not visible in this segment; the whole line was cut away.
+                continue
+            yield Subtitle(
+                index=index,
+                start=start + shift,
+                end=end + shift,
+                content=subtitle.content,
+                proprietary=subtitle.proprietary,
+                source_reel=decision.reel,
+                source_index=subtitle.index,
+            )
+            index += 1
+        final_in += decision.duration
+
+
+def subtitles_in_range(subtitles, start, end):
+    r"""
+    Find the subtitles visible inside a time range, using each subtitle's
+    own start and end times on the timeline being queried.
+
+    Since :py:func:`apply_edl` clips subtitles at cut boundaries, parts of a
+    line that were edited away are never reported when reverse-looking-up a
+    segment of the final cut.
+
+    .. doctest::
+
+        >>> from datetime import timedelta
+        >>> subs = [Subtitle(index=1, start=timedelta(seconds=1),
+        ...                  end=timedelta(seconds=5), content='visible')]
+        >>> [s.content for s in subtitles_in_range(subs, timedelta(seconds=4), timedelta(seconds=6))]
+        ['visible']
+        >>> list(subtitles_in_range(subs, timedelta(seconds=5), timedelta(seconds=6)))
+        []
+
+    :param subtitles: :py:class:`Subtitle` objects on the timeline to query
+    :param start: The start of the range to look up
+    :type start: :py:class:`datetime.timedelta`
+    :param end: The end of the range to look up
+    :type end: :py:class:`datetime.timedelta`
+    :returns: The subtitles visible at any point in ``[start, end)``
+    :rtype: :term:`generator` of :py:class:`Subtitle` objects
+    """
+    for subtitle in subtitles:
+        if subtitle.start < end and subtitle.end > start:
+            yield subtitle
 
 
 def _should_skip_sub(subtitle):

@@ -771,3 +771,212 @@ def test_parse_file_with_missing_index(input_subs):  # cf. issue #51
 
     # ...and sort the same.
     assert srt.compose(subs_no_index) == srt.compose(subs_zero_index)
+
+
+def _edl_sub(index, start_secs, end_secs, content, proprietary=""):
+    return srt.Subtitle(
+        index=index,
+        start=timedelta(seconds=start_secs),
+        end=timedelta(seconds=end_secs),
+        content=content,
+        proprietary=proprietary,
+    )
+
+
+def test_edit_decision_requires_out_after_in():
+    with pytest.raises(ValueError):
+        srt.EditDecision(
+            reel="A",
+            source_in=timedelta(seconds=10),
+            source_out=timedelta(seconds=10),
+        )
+
+
+def test_edit_decision_repr():
+    decision = srt.EditDecision(
+        reel="A",
+        source_in=timedelta(seconds=1),
+        source_out=timedelta(seconds=2),
+        play_order=1,
+    )
+    assert "EditDecision" in repr(decision)
+    assert "A" in repr(decision)
+
+
+def test_apply_edl_reorders_segments_onto_final_timeline():
+    # The opening (0-10s) was moved to the end of the final cut.
+    subs = [
+        _edl_sub(1, 1, 4, "opening"),
+        _edl_sub(2, 12, 18, "body"),
+    ]
+    edl = [
+        srt.EditDecision(
+            reel="A",
+            source_in=timedelta(seconds=10),
+            source_out=timedelta(seconds=40),
+            play_order=1,
+        ),
+        srt.EditDecision(
+            reel="A",
+            source_in=timedelta(seconds=0),
+            source_out=timedelta(seconds=10),
+            play_order=2,
+        ),
+    ]
+
+    projected = list(srt.apply_edl(subs, edl))
+
+    assert [(sub.start, sub.end, sub.content) for sub in projected] == [
+        (timedelta(seconds=2), timedelta(seconds=8), "body"),
+        (timedelta(seconds=31), timedelta(seconds=34), "opening"),
+    ]
+    # Each copy gets its own fresh identity on the final timeline...
+    assert [sub.index for sub in projected] == [1, 2]
+    # ...while still tracing back to the source subtitles.
+    assert [sub.source_index for sub in projected] == [2, 1]
+    assert [sub.source_reel for sub in projected] == ["A", "A"]
+
+
+def test_apply_edl_without_play_order_keeps_given_order():
+    subs = [_edl_sub(1, 0, 5, "x")]
+    edl = [
+        srt.EditDecision(
+            reel="A",
+            source_in=timedelta(seconds=0),
+            source_out=timedelta(seconds=10),
+        ),
+        srt.EditDecision(
+            reel="A",
+            source_in=timedelta(seconds=0),
+            source_out=timedelta(seconds=10),
+        ),
+    ]
+
+    projected = list(srt.apply_edl(subs, edl))
+
+    assert [(sub.start, sub.end) for sub in projected] == [
+        (timedelta(seconds=0), timedelta(seconds=5)),
+        (timedelta(seconds=10), timedelta(seconds=15)),
+    ]
+
+
+def test_apply_edl_clips_subtitles_at_cut_boundaries():
+    subs = [_edl_sub(7, 5, 25, "long line", proprietary="X1")]
+    edl = [
+        srt.EditDecision(
+            reel="A",
+            source_in=timedelta(seconds=10),
+            source_out=timedelta(seconds=20),
+        )
+    ]
+
+    projected = list(srt.apply_edl(subs, edl))
+
+    # Only the actually visible part of the line survives the cut.
+    assert len(projected) == 1
+    assert (projected[0].start, projected[0].end) == (
+        timedelta(seconds=0),
+        timedelta(seconds=10),
+    )
+    assert projected[0].source_index == 7
+    assert projected[0].proprietary == "X1"
+
+
+def test_apply_edl_drops_subtitles_outside_cut():
+    subs = [
+        _edl_sub(1, 0, 10, "before"),
+        _edl_sub(2, 20, 30, "after"),
+        _edl_sub(3, 10, 20, "kept"),
+    ]
+    edl = [
+        srt.EditDecision(
+            reel="A",
+            source_in=timedelta(seconds=10),
+            source_out=timedelta(seconds=20),
+        )
+    ]
+
+    projected = list(srt.apply_edl(subs, edl))
+
+    assert [sub.content for sub in projected] == ["kept"]
+
+
+def test_apply_edl_replay_gives_each_copy_own_identity():
+    subs = [_edl_sub(3, 10, 12, "replay me")]
+    edl = [
+        srt.EditDecision(
+            reel="A",
+            source_in=timedelta(seconds=10),
+            source_out=timedelta(seconds=20),
+            play_order=1,
+        ),
+        srt.EditDecision(
+            reel="A",
+            source_in=timedelta(seconds=10),
+            source_out=timedelta(seconds=20),
+            play_order=2,
+        ),
+    ]
+
+    projected = list(srt.apply_edl(subs, edl))
+
+    assert len(projected) == 2
+    first, second = projected
+    # Two distinct identities on the final timeline...
+    assert first.index != second.index
+    assert first != second
+    assert (first.start, first.end) == (timedelta(0), timedelta(seconds=2))
+    assert (second.start, second.end) == (
+        timedelta(seconds=10),
+        timedelta(seconds=12),
+    )
+    # ...that both trace back to the same source subtitle.
+    assert first.source_index == second.source_index == 3
+    assert first.source_reel == second.source_reel == "A"
+
+
+def test_apply_edl_output_can_be_composed_and_reparsed():
+    subs = [_edl_sub(1, 5, 15, "hello")]
+    edl = [
+        srt.EditDecision(
+            reel="A",
+            source_in=timedelta(seconds=10),
+            source_out=timedelta(seconds=20),
+        )
+    ]
+
+    projected = list(srt.apply_edl(subs, edl))
+    reparsed = list(srt.parse(srt.compose(projected)))
+
+    assert [(sub.start, sub.end, sub.content) for sub in reparsed] == [
+        (timedelta(0), timedelta(seconds=5), "hello")
+    ]
+
+
+def test_subtitles_in_range_does_not_include_cut_away_parts():
+    subs = [_edl_sub(1, 0, 30, "half cut away")]
+    edl = [
+        srt.EditDecision(
+            reel="A",
+            source_in=timedelta(seconds=0),
+            source_out=timedelta(seconds=10),
+        )
+    ]
+    projected = list(srt.apply_edl(subs, edl))
+
+    # The source line ran to 00:30, but only 00:00-00:10 survived the cut,
+    # so looking up a later segment of the final cut must not find it.
+    assert (
+        list(
+            srt.subtitles_in_range(
+                projected, timedelta(seconds=20), timedelta(seconds=25)
+            )
+        )
+        == []
+    )
+    assert [
+        sub.content
+        for sub in srt.subtitles_in_range(
+            projected, timedelta(seconds=5), timedelta(seconds=6)
+        )
+    ] == ["half cut away"]
