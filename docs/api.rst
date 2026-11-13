@@ -155,6 +155,34 @@ API
 .. autofunction:: reset_messages
 
 
+Serial Scheduling
+^^^^^^^^^^^^^^^^^
+
+.. module:: mido.serial
+
+.. autoclass:: SerialEvent
+   :members:
+   :inherited-members:
+   :undoc-members:
+
+.. autoclass:: ScheduledEvent
+   :members:
+   :inherited-members:
+   :undoc-members:
+
+.. autoclass:: SerialSchedule
+   :members:
+   :inherited-members:
+   :undoc-members:
+
+.. autoclass:: ScheduleConflict
+   :members:
+   :inherited-members:
+   :undoc-members:
+
+.. autofunction:: schedule_events
+
+
 Files
 ------
 

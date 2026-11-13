@@ -308,4 +308,6 @@ Iterates through messages as they arrive on the :term:`port` until the
 
 .. include:: socket.rst
 
+.. include:: serial.rst
+
 .. include:: custom.rst

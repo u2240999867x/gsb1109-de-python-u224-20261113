@@ -120,6 +120,13 @@ from .midifiles import (
     tick2second,
 )
 from .parser import Parser, parse, parse_all
+from .serial import (
+    ScheduleConflict,
+    ScheduledEvent,
+    SerialEvent,
+    SerialSchedule,
+    schedule_events,
+)
 from .syx import read_syx_file, write_syx_file
 from .version import version_info
 
@@ -137,6 +144,10 @@ __all__ = [
     "MidiFile",
     "MidiTrack",
     "Parser",
+    "ScheduleConflict",
+    "ScheduledEvent",
+    "SerialEvent",
+    "SerialSchedule",
     "UnknownMetaMessage",
     "bpm2tempo",
     "format_as_string",
@@ -149,6 +160,7 @@ __all__ = [
     "read_syx_file",
     "second2tick",
     "sockets",
+    "schedule_events",
     "tempo2bpm",
     "tick2second",
     "version_info",
