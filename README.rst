@@ -166,6 +166,96 @@ Price(amount=Decimal('140.600'), currency='$')
 Price(amount=Decimal('140600'), currency='$')
 
 
+Currency resolution
+-------------------
+
+The parser returns the symbol as printed on the page, but a bare ``$`` is
+ambiguous: many currencies use it, so the same merchant can mean CAD, AUD and
+USD on its Canadian, Australian and American stores. ``CurrencyResolver``
+maps an observed symbol to one currency code using explicit declarations.
+
+Declarations have three levels, consulted from the narrowest to the broadest
+scope:
+
+* ``EvidenceLevel.ITEM`` -- a currency declared for one product;
+* ``EvidenceLevel.STORE`` -- a currency declared for one store, optionally
+  restricted to an effective time window;
+* ``EvidenceLevel.SITE`` -- the default currency of a whole site.
+
+>>> from datetime import date
+>>> from price_parser import (
+...     CurrencyDeclaration,
+...     CurrencyResolver,
+...     EvidenceLevel,
+...     ResolutionStatus,
+... )
+>>> resolver = CurrencyResolver([
+...     CurrencyDeclaration(declaration_id="ca-store", currency="CAD",
+...                         level=EvidenceLevel.STORE, store_id="ca"),
+...     CurrencyDeclaration(declaration_id="au-store", currency="AUD",
+...                         level=EvidenceLevel.STORE, store_id="au"),
+...     CurrencyDeclaration(declaration_id="us-store", currency="USD",
+...                         level=EvidenceLevel.STORE, store_id="us"),
+... ])
+>>> canadian = resolver.resolve("$", store_id="ca")
+>>> canadian.currency
+'CAD'
+>>> canadian.evidence.declaration_id
+'ca-store'
+>>> resolver.resolve("$", store_id="au").currency
+'AUD'
+>>> resolver.resolve("$", store_id="us").currency
+'USD'
+
+An item-level declaration overrides the store and site defaults, but only for
+that product:
+
+>>> item = CurrencyDeclaration(declaration_id="sku-1-usd", currency="USD",
+...                            level=EvidenceLevel.ITEM, item_id="sku-1")
+>>> with_item = CurrencyResolver([*resolver.declarations, item])
+>>> with_item.resolve("$", item_id="sku-1", store_id="ca").currency
+'USD'
+>>> with_item.resolve("$", item_id="sku-2", store_id="ca").currency
+'CAD'
+
+If declarations at the same level support different currencies, the row is
+suspended instead of guessed:
+
+>>> conflicting = CurrencyResolver([
+...     CurrencyDeclaration(declaration_id="says-cad", currency="CAD",
+...                         level=EvidenceLevel.STORE, store_id="ca"),
+...     CurrencyDeclaration(declaration_id="says-usd", currency="USD",
+...                         level=EvidenceLevel.STORE, store_id="ca"),
+... ])
+>>> held = conflicting.resolve("$", store_id="ca")
+>>> held.status is ResolutionStatus.SUSPENDED
+True
+>>> held.is_suspended
+True
+>>> held.currency is None
+True
+
+Timed declarations only apply when the resolution date falls inside their
+window, so today's store settings never backfill historical pages. Recomputing
+an old quote keeps the exact declaration that drove the conclusion:
+
+>>> timed = CurrencyResolver([
+...     CurrencyDeclaration(declaration_id="old-cad", currency="CAD",
+...                         level=EvidenceLevel.STORE, store_id="ca",
+...                         effective_until=date(2026, 10, 31)),
+...     CurrencyDeclaration(declaration_id="new-usd", currency="USD",
+...                         level=EvidenceLevel.STORE, store_id="ca",
+...                         effective_from=date(2026, 11, 1)),
+... ])
+>>> timed.resolve("$", store_id="ca", as_of=date(2026, 9, 1)).currency
+'CAD'
+>>> recomputed = timed.resolve("$", store_id="ca", as_of=date(2026, 11, 14))
+>>> recomputed.currency
+'USD'
+>>> recomputed.evidence.declaration_id
+'new-usd'
+
+
 Contributing
 ============
 

@@ -1,6 +1,15 @@
 Changes
 =======
 
+0.6.0 (unreleased)
+------------------
+
+* Added ``CurrencyResolver`` and ``CurrencyDeclaration`` for resolving
+  ambiguous currency symbols (such as ``$``) from item-, store- and
+  site-level declarations. Store declarations support effective time windows,
+  same-level conflicts suspend the row instead of guessing, and every
+  resolution keeps the declaration it is based on for audit and recomputation.
+
 0.5.1 (2026-03-19)
 ------------------
 
