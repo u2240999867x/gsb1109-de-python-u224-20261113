@@ -1,9 +1,26 @@
 import click
 import json
 import pathlib
+import re
 import sqlite_utils
 import sqlite3
 import sys
+
+
+INTERNAL_TABLES = {"sqlite_sequence"}
+AUTOINCREMENT_RE = re.compile(r"\bAUTOINCREMENT\b", re.IGNORECASE)
+
+
+def _table_uses_autoincrement(schema):
+    return bool(AUTOINCREMENT_RE.search(schema))
+
+
+def _read_sequences(conn):
+    try:
+        rows = conn.execute("SELECT name, seq FROM sqlite_sequence").fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    return {name: seq for name, seq in rows}
 
 
 @click.group()
@@ -50,25 +67,81 @@ def dump(dbpath, output, tables, all, exclude):
         tables = set(conn.table_names()) - set(exclude)
     else:
         tables = set(tables) - set(exclude)
-    for table in tables:
+    sequences = _read_sequences(conn)
+    for table in sorted(tables):
+        if table in INTERNAL_TABLES:
+            # Internal tables such as sqlite_sequence are archived per-table
+            # inside the metadata files instead of being dumped as rows.
+            click.echo(
+                "Skipping internal table '{}'; AUTOINCREMENT state is "
+                "archived in each table's metadata instead.".format(table),
+                err=True,
+            )
+            continue
         tablename = table.replace("/", "")
         filepath = output / "{}.ndjson".format(tablename)
         metapath = output / "{}.metadata.json".format(tablename)
+        schema = conn[table].schema
         # Dump rows to filepath
         with filepath.open("w") as fp:
             for row in conn[table].rows:
                 fp.write(json.dumps(list(row.values()), default=repr) + "\n")
             fp.close()
+        # Archive the AUTOINCREMENT high-water mark so that restored tables
+        # keep allocating ids past numbers that were used (and possibly voided)
+        # in the original database, even when the table has been emptied.
+        metadata = {
+            "name": table,
+            "columns": [c.name for c in conn[table].columns],
+            "schema": schema,
+        }
+        if _table_uses_autoincrement(schema):
+            metadata["autoincrement"] = True
+            metadata["sequence"] = sequences.get(table)
         # Dump out metadata
-        metapath.open("w").write(
-            json.dumps(
-                {
-                    "name": table,
-                    "columns": [c.name for c in conn[table].columns],
-                    "schema": conn[table].schema,
-                },
-                indent=4,
-            )
+        metapath.open("w").write(json.dumps(metadata, indent=4))
+
+
+def _quote_ident(name):
+    return '"{}"'.format(name.replace('"', '""'))
+
+
+def _read_legacy_sequences(directory):
+    # Dumps written by older versions of this tool exported sqlite_sequence
+    # as an ordinary table. Those files cannot be loaded directly (the name
+    # is reserved) but the values still describe the old high-water marks.
+    legacy_path = directory / "sqlite_sequence.ndjson"
+    if not legacy_path.exists():
+        return {}
+    sequences = {}
+    for line in legacy_path.open():
+        if not line.strip():
+            continue
+        name, seq = json.loads(line)
+        sequences[name] = seq
+    return sequences
+
+
+def _restore_sequence(db, table, target_seq):
+    # sqlite_sequence only exists once an AUTOINCREMENT table has held a row.
+    # Upsert the high-water mark without ever lowering it below the rows just
+    # restored, so voided numbers of emptied tables are not reissued.
+    if target_seq is None:
+        return
+    current = db.execute(
+        "SELECT seq FROM sqlite_sequence WHERE name = ?", (table,)
+    ).fetchone()
+    if current is not None and current[0] >= target_seq:
+        return
+    if current is None:
+        db.execute(
+            "INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)",
+            (table, target_seq),
+        )
+    else:
+        db.execute(
+            "UPDATE sqlite_sequence SET seq = ? WHERE name = ?",
+            (target_seq, table),
         )
 
 
@@ -92,13 +165,18 @@ def load(dbpath, directory, replace):
     """
     db = sqlite_utils.Database(dbpath)
     directory = pathlib.Path(directory)
+    legacy_sequences = _read_legacy_sequences(directory)
     metadatas = directory.glob("*.metadata.json")
-    for metadata in metadatas:
+    for metadata in sorted(metadatas):
         info = json.loads(metadata.read_text())
+        table = info["name"]
+        if table in INTERNAL_TABLES:
+            # Restored via the per-table sequence metadata, not as a table.
+            continue
         columns = info["columns"]
         schema = info["schema"]
-        if db[info["name"]].exists() and replace:
-            db[info["name"]].drop()
+        if db[table].exists() and replace:
+            db[table].drop()
         try:
             db.execute(schema)
         except sqlite3.OperationalError as ex:
@@ -113,7 +191,39 @@ def load(dbpath, directory, replace):
             for line in ndjson.open()
             if line.strip()
         )
-        db[info["name"]].insert_all(rows)
+        db[table].insert_all(rows)
+        if not _table_uses_autoincrement(schema):
+            continue
+        # Restore the AUTOINCREMENT high-water mark. New dumps carry it in
+        # the metadata; legacy dumps may carry it in sqlite_sequence.ndjson;
+        # otherwise only the largest surviving rowid can be reconstructed.
+        archived_seq = info.get("sequence")
+        legacy_seq = legacy_sequences.get(table)
+        row_max = db.execute(
+            "SELECT MAX(rowid) FROM {}".format(_quote_ident(table))
+        ).fetchone()[0]
+        if "sequence" in info:
+            # New archive format: a null value means no sequence existed yet,
+            # and the restored rows already determine the starting point.
+            target_seq = archived_seq if archived_seq is not None else row_max
+        elif legacy_seq is not None:
+            target_seq = legacy_seq
+        else:
+            target_seq = row_max
+            click.echo(
+                "Warning: no archived AUTOINCREMENT sequence for table "
+                "'{}'; restoring only the high-water mark of surviving rows "
+                "({}). Numbers assigned to rows that were deleted before the "
+                "dump cannot be recovered and may be reissued.".format(
+                    table,
+                    row_max if row_max is not None else "none",
+                ),
+                err=True,
+            )
+        if target_seq is not None and row_max is not None:
+            target_seq = max(target_seq, row_max)
+        _restore_sequence(db, table, target_seq)
+        db.conn.commit()
 
 
 @cli.command()

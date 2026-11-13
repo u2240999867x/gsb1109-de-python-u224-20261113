@@ -99,6 +99,58 @@ Each table is represented as two files. The first, `table_name.metadata.json`, c
 
 It is an object with three keys: `name` is the name of the table, `columns` is an array of column strings and `schema` is the SQL schema text used for tha table.
 
+For tables declared with `AUTOINCREMENT`, two extra keys are archived:
+
+```json
+{
+    "name": "invoices",
+    "columns": ["id", "no"],
+    "schema": "CREATE TABLE [invoices] (\n   [id] INTEGER PRIMARY KEY AUTOINCREMENT,\n   [no] TEXT\n)",
+    "autoincrement": true,
+    "sequence": 3
+}
+```
+
+`sequence` is the high-water mark from SQLite's internal `sqlite_sequence`
+table at dump time, i.e. the largest id ever allocated (including ids whose
+rows have since been deleted). On load that value is written back so the
+restored table keeps allocating ids past numbers that were already used or
+voided. A `null` value means the table had never held a row.
+
+The internal `sqlite_sequence` table itself is never dumped as rows; its
+state is carried inside these metadata files. Asking for it explicitly just
+prints a skip message.
+
+## AUTOINCREMENT semantics and restoring old dumps
+
+The three common integer-key shapes behave differently, and only the rows
+plus the archived sequence can be restored exactly:
+
+- **Ordinary `INTEGER PRIMARY KEY`** (no `AUTOINCREMENT`): SQLite computes
+  the next id from `max(rowid) + 1` of the surviving rows. Restoring the rows
+  is enough; nothing else is archived.
+- **Explicitly written large numbers on an ordinary key**: if those rows were
+  deleted before the dump, SQLite itself has forgotten them, so the gap
+  cannot be preserved by any backup. The next allocation follows
+  `max(rowid) + 1` again — declare the column `AUTOINCREMENT` if voided
+  numbers must never be reused.
+- **`AUTOINCREMENT` tables, including emptied ones**: the high-water mark
+  lives in `sqlite_sequence`, not in the rows, so it is archived in the
+  metadata even when the table contains no rows at all.
+
+When loading a directory produced by an older version of this tool:
+
+- If it contains a `sqlite_sequence.ndjson` file, those high-water marks are
+  applied automatically (the reserved table name is no longer loaded
+  directly).
+- If the directory contains only the row files and basic metadata, every row
+  is still restored exactly, but sequence state is limited to
+  `max(rowid)` of the surviving rows. A warning is printed for each affected
+  table: numbers assigned to rows deleted before the dump cannot be
+  reconstructed and may be reissued, so an emptied `AUTOINCREMENT` table will
+  restart at 1. Re-dump with the current version to capture full sequence
+  state.
+
 The second file, `table_name.ndjson`, contains newline-delimited JSON (aka [JSON Lines](https://jsonlines.org/)) for every row in the table. Each row is represented as a JSON array with items corresponding to each of the columns defined in the metadata.
 
 That file for the `redirects_redirect.ndjson` table might look like this:
