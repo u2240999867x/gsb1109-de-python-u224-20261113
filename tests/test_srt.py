@@ -771,3 +771,197 @@ def test_parse_file_with_missing_index(input_subs):  # cf. issue #51
 
     # ...and sort the same.
     assert srt.compose(subs_no_index) == srt.compose(subs_zero_index)
+
+
+QUOTED_EXCERPT = (
+    "7\n"
+    "00:00:10,000 --> 00:00:12,000\n"
+    "证人引用了另一份字幕：\n"
+    "\n"
+    "2\n"
+    "00:00:01,000 --> 00:00:02,000\n"
+    "这是被引用的原话\n"
+    "\n"
+    "8\n"
+    "00:00:13,000 --> 00:00:15,000\n"
+    "后文证词\n"
+)
+
+PRECEDING_ANCHOR = next(
+    iter(srt.parse("6\n00:00:08,000 --> 00:00:09,000\n前文\n"))
+)
+FOLLOWING_ANCHOR = next(
+    iter(srt.parse("9\n00:00:16,000 --> 00:00:17,000\n再后文\n"))
+)
+
+
+def test_loose_parse_splits_quoted_subtitle_apart():
+    # Documents the problem the ambiguous split helper works around: the
+    # quoted blank line, number and timecode look like real block boundaries.
+    loose_subs = list(srt.parse(QUOTED_EXCERPT))
+    assert [sub.index for sub in loose_subs] == [7, 2, 8]
+
+
+def test_enumerate_split_candidates_covers_every_boundary_subset():
+    candidates = list(srt.enumerate_split_candidates(QUOTED_EXCERPT))
+
+    # Two interior headers, each may or may not start a real block.
+    assert len(candidates) == 4
+    assert sorted(len(blocks) for blocks in candidates) == [1, 2, 2, 3]
+
+    # Splitting must never lose or reorder any raw text.
+    assert all("".join(blocks) == QUOTED_EXCERPT for blocks in candidates)
+
+
+def test_enumerate_split_candidates_raises_without_header():
+    with pytest.raises(srt.SRTParseError):
+        list(srt.enumerate_split_candidates("plain text, no srt here"))
+
+    with pytest.raises(srt.SRTParseError):
+        list(
+            srt.enumerate_split_candidates(
+                "garbage\n1\n00:00:01,000 --> 00:00:02,000\nx\n"
+            )
+        )
+
+
+def test_resolve_without_anchors_reports_shortest_ambiguous_span():
+    resolution = srt.resolve_ambiguous_split(QUOTED_EXCERPT)
+
+    assert not resolution.unique
+    assert resolution.blocks is None
+    assert len(resolution.candidates) == 4
+    assert resolution.ambiguity_start == QUOTED_EXCERPT.find("2\n")
+    assert resolution.ambiguity_end == len(QUOTED_EXCERPT)
+    assert resolution.ambiguity_content.startswith("2\n")
+
+    with pytest.raises(srt.AmbiguousSRTParseError) as thrown_exc:
+        resolution.to_subtitles()
+    assert thrown_exc.value.resolution is resolution
+
+
+def test_resolve_with_contiguous_anchor_indices_is_unique():
+    resolution = srt.resolve_ambiguous_split(
+        QUOTED_EXCERPT,
+        PRECEDING_ANCHOR,
+        FOLLOWING_ANCHOR,
+        contiguous_indices=True,
+    )
+
+    assert resolution.unique
+    assert resolution.ambiguity_start is None
+    assert resolution.ambiguity_content is None
+
+    subtitles = resolution.to_subtitles()
+    assert [sub.index for sub in subtitles] == [7, 8]
+
+    # The quoted subtitle is retained verbatim inside block 7, blank line,
+    # number and timecode included.
+    assert subtitles[0].content.startswith("证人引用了另一份字幕：")
+    assert (
+        "2\n00:00:01,000 --> 00:00:02,000\n这是被引用的原话"
+        in subtitles[0].content
+    )
+    assert subtitles[1].content == "后文证词"
+
+
+def test_resolve_noncontiguous_indices_narrows_ambiguity_span():
+    resolution = srt.resolve_ambiguous_split(
+        QUOTED_EXCERPT, contiguous_indices=False
+    )
+
+    assert not resolution.unique
+    index_sets = set(
+        tuple(srt.parse_single_block(block).index for block in candidate)
+        for candidate in resolution.candidates
+    )
+    assert index_sets == {(7, 2), (7, 2, 8)}
+
+    # The shared prefix (up to block 2) is no longer in dispute; review can
+    # resume at the last questionable header.
+    assert resolution.ambiguity_content.startswith("8\n")
+    assert resolution.ambiguity_start == QUOTED_EXCERPT.find("8\n")
+
+
+def test_resolve_accepts_raw_text_and_file_like_anchors():
+    from io import StringIO
+
+    resolution = srt.resolve_ambiguous_split(
+        StringIO(QUOTED_EXCERPT.replace("\n", "\r\n")),
+        "6\n00:00:08,000 --> 00:00:09,000\n前文\n",
+        StringIO("9\n00:00:16,000 --> 00:00:17,000\n再后文\n"),
+        contiguous_indices=True,
+    )
+
+    assert resolution.unique
+    subtitles = resolution.to_subtitles()
+    assert [sub.index for sub in subtitles] == [7, 8]
+    assert all("\r" not in block for block in resolution.blocks)
+
+
+def test_resolve_raises_when_no_split_matches_anchors():
+    impossible_preceding = next(
+        iter(srt.parse("100\n00:00:08,000 --> 00:00:09,000\n前文\n"))
+    )
+
+    with pytest.raises(srt.SRTParseError):
+        srt.resolve_ambiguous_split(
+            QUOTED_EXCERPT,
+            preceding=impossible_preceding,
+            contiguous_indices=True,
+        )
+
+
+def test_resolve_raises_without_valid_header():
+    with pytest.raises(srt.SRTParseError):
+        srt.resolve_ambiguous_split("plain text, no srt here")
+
+
+def test_parse_single_block_keeps_quoted_srt_data_as_content():
+    block = (
+        "7\n"
+        "00:00:10,000 --> 00:00:12,000\n"
+        "证人引用了另一份字幕：\n"
+        "\n"
+        "2\n"
+        "00:00:01,000 --> 00:00:02,000\n"
+        "这是被引用的原话\n"
+    )
+
+    subtitle = srt.parse_single_block(block)
+
+    assert subtitle.index == 7
+    assert subtitle.content.splitlines() == [
+        "证人引用了另一份字幕：",
+        "",
+        "2",
+        "00:00:01,000 --> 00:00:02,000",
+        "这是被引用的原话",
+    ]
+
+
+def test_parse_single_block_without_index_line():
+    subtitle = srt.parse_single_block(
+        "00:00:01,000 --> 00:00:02,000\nhello\n"
+    )
+
+    assert subtitle.index is None
+    assert subtitle.content == "hello"
+
+
+def test_parse_single_block_raises_on_invalid_block():
+    with pytest.raises(srt.SRTParseError):
+        srt.parse_single_block("not an srt block")
+
+
+@given(st.lists(subtitles(), min_size=1, max_size=5))
+def test_split_candidates_roundtrip_well_formed_input(input_subs):
+    composed = srt.compose(input_subs, reindex=False, strict=False)
+
+    candidates = list(srt.enumerate_split_candidates(composed))
+    assert all("".join(blocks) == composed for blocks in candidates)
+
+    finest = max(candidates, key=len)
+    assert len(finest) == len(input_subs)
+    reparsed = [srt.parse_single_block(block) for block in finest]
+    subs_eq(reparsed, input_subs)

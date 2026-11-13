@@ -1,0 +1,135 @@
+#!/usr/bin/env python
+
+"""Inspect how ambiguous SRT text should be split into subtitle blocks."""
+
+import codecs
+import logging
+import sys
+
+import srt
+import srt_tools.utils
+
+log = logging.getLogger(__name__)
+
+EXIT_AMBIGUOUS = 3
+EXIT_ERROR = 1
+
+BLOCK_DELIMITER = "--- block {number} (index {index}) ---"
+
+
+def parse_args():
+    examples = {
+        "Check an excerpt with verified neighbouring subtitles": (
+            "srt ambiguous-split -i excerpt.srt --preceding before.srt "
+            "--following after.srt --contiguous-indices yes"
+        ),
+        "Only report where the ambiguity starts, without index checks": (
+            "srt ambiguous-split -i excerpt.srt"
+        ),
+    }
+    parser = srt_tools.utils.basic_parser(
+        description=__doc__,
+        examples=examples,
+        no_output=True,
+        hide_no_strict=True,
+    )
+    parser.add_argument(
+        "--preceding",
+        metavar="FILE",
+        help="a file containing the verified subtitle immediately before "
+        "the excerpt",
+    )
+    parser.add_argument(
+        "--following",
+        metavar="FILE",
+        help="a file containing the verified subtitle immediately after "
+        "the excerpt",
+    )
+    parser.add_argument(
+        "--contiguous-indices",
+        choices=("yes", "no"),
+        help="whether the block indices in the excerpt are verified to be "
+        "strictly consecutive (yes) or verified to contain gaps (no); "
+        "omit to leave indices unchecked",
+    )
+    return parser.parse_args()
+
+
+def read_text(stream_or_path, encoding):
+    read_encoding = encoding or "utf-8-sig"
+    if stream_or_path in srt_tools.utils.DASH_STREAM_MAP.values():
+        reader = codecs.getreader(read_encoding)(
+            srt_tools.utils.STDIN_BYTESTREAM
+        )
+        return reader.read()
+    with codecs.open(stream_or_path, "r", encoding=read_encoding) as input_f:
+        return input_f.read()
+
+
+def read_anchor(path, encoding):
+    if path is None:
+        return None
+    return next(iter(srt.parse(read_text(path, encoding))))
+
+
+def print_unique(resolution):
+    subtitles = resolution.to_subtitles()
+    print("Unique split found: %d subtitle block(s)." % len(subtitles))
+    for number, (block, subtitle) in enumerate(
+        zip(resolution.blocks, subtitles), start=1
+    ):
+        print(BLOCK_DELIMITER.format(number=number, index=subtitle.index))
+        print(block.strip("\n"))
+
+
+def print_ambiguous(resolution):
+    print(
+        "Still ambiguous: %d segmentations remain consistent with the "
+        "anchors." % len(resolution.candidates)
+    )
+    for number, candidate in enumerate(resolution.candidates, start=1):
+        indices = [srt.parse_single_block(block).index for block in candidate]
+        print("  interpretation %d: indices %s" % (number, indices))
+
+    print(
+        "Shortest ambiguous span: chars %d-%d"
+        % (resolution.ambiguity_start, resolution.ambiguity_end)
+    )
+    print("Review from here:")
+    print(resolution.ambiguity_content.strip("\n"))
+
+
+def main():
+    args = parse_args()
+    logging.basicConfig(level=args.log_level)
+
+    try:
+        excerpt = read_text(args.input, args.encoding)
+        preceding = read_anchor(args.preceding, args.encoding)
+        following = read_anchor(args.following, args.encoding)
+        contiguous = (
+            None
+            if args.contiguous_indices is None
+            else args.contiguous_indices == "yes"
+        )
+
+        resolution = srt.resolve_ambiguous_split(
+            excerpt,
+            preceding=preceding,
+            following=following,
+            contiguous_indices=contiguous,
+        )
+    except srt.SRTParseError as thrown_exc:
+        log.critical("Could not resolve split: %s", thrown_exc)
+        sys.exit(EXIT_ERROR)
+
+    if resolution.unique:
+        print_unique(resolution)
+        sys.exit(0)
+
+    print_ambiguous(resolution)
+    sys.exit(EXIT_AMBIGUOUS)
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()

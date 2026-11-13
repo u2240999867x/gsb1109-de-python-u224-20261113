@@ -115,3 +115,103 @@ def test_tools_support():
 
     for args in matrix:
         assert_supports_all_io_methods(*args)
+
+
+AMBIGUOUS_EXCERPT = (
+    "7\n"
+    "00:00:10,000 --> 00:00:12,000\n"
+    "证人引用了另一份字幕：\n"
+    "\n"
+    "2\n"
+    "00:00:01,000 --> 00:00:02,000\n"
+    "这是被引用的原话\n"
+    "\n"
+    "8\n"
+    "00:00:13,000 --> 00:00:15,000\n"
+    "后文证词\n"
+)
+
+
+def _write_tmp(content):
+    fd, path = tempfile.mkstemp()
+    with os.fdopen(fd, "w") as input_f:
+        input_f.write(content)
+    return path
+
+
+def _run_ambiguous_split(cmd, stdin=None):
+    full_cmd = [sys.executable, "srt_tools/srt-ambiguous-split"] + cmd
+    proc = subprocess.Popen(
+        full_cmd,
+        env={"PYTHONPATH": ".", "SystemRoot": r"C:\Windows"},
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    raw_out, _ = proc.communicate(stdin)
+    return proc.returncode, raw_out.decode("utf-8-sig")
+
+
+def test_ambiguous_split_reports_span_without_anchors():
+    excerpt_path = _write_tmp(AMBIGUOUS_EXCERPT)
+    try:
+        returncode, output = _run_ambiguous_split(["-i", excerpt_path])
+    finally:
+        os.remove(excerpt_path)
+
+    assert returncode == 3
+    assert "Still ambiguous" in output
+    assert "Shortest ambiguous span" in output
+    assert "00:00:01,000 --> 00:00:02,000" in output
+
+
+def test_ambiguous_split_unique_with_verified_anchors():
+    excerpt_path = _write_tmp(AMBIGUOUS_EXCERPT)
+    preceding_path = _write_tmp(
+        "6\n00:00:08,000 --> 00:00:09,000\n前文\n"
+    )
+    following_path = _write_tmp(
+        "9\n00:00:16,000 --> 00:00:17,000\n再后文\n"
+    )
+    try:
+        returncode, output = _run_ambiguous_split(
+            [
+                "-i",
+                excerpt_path,
+                "--preceding",
+                preceding_path,
+                "--following",
+                following_path,
+                "--contiguous-indices",
+                "yes",
+            ]
+        )
+    finally:
+        for path in (excerpt_path, preceding_path, following_path):
+            os.remove(path)
+
+    assert returncode == 0
+    assert "Unique split found: 2" in output
+    # The quoted subtitle survives intact inside block 7.
+    assert "这是被引用的原话" in output
+    assert "block 2 (index 8)" in output
+
+
+def test_ambiguous_split_reads_stdin():
+    returncode, output = _run_ambiguous_split(
+        ["--contiguous-indices", "no"],
+        stdin=AMBIGUOUS_EXCERPT.encode("utf-8"),
+    )
+
+    assert returncode == 3
+    assert "interpretation 1: indices [7, 2]" in output
+
+
+def test_ambiguous_split_errors_on_unparseable_input():
+    bad_path = _write_tmp("not an srt file at all\n")
+    try:
+        returncode, output = _run_ambiguous_split(["-i", bad_path])
+    finally:
+        os.remove(bad_path)
+
+    assert returncode == 1

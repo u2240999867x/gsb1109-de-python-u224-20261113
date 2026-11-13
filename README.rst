@@ -98,6 +98,30 @@ That's easy enough to sort out:
 
 See the srt_tools/ directory for more information.
 
+Resolving ambiguous block boundaries
+====================================
+
+When a subtitle quotes another subtitle verbatim, the quoted blank lines,
+numbers and timecodes look like real block boundaries. Loose parsing then
+splits the quote apart, while strict parsing loses the text after the blank
+line. The ``ambiguous-split`` tool enumerates every structurally plausible
+split, and uses the subtitles verified before and after the excerpt as
+anchors to decide which one is correct:
+
+.. code::
+
+    $ srt ambiguous-split -i excerpt.srt \
+        --preceding before.srt --following after.srt \
+        --contiguous-indices yes
+    Unique split found: 2 subtitle block(s).
+    --- block 1 (index 7) ---
+    ...
+
+If the anchors still leave more than one interpretation, the tool exits with
+status 3 and prints the shortest ambiguous span, so review can resume from
+exactly the text that remains in doubt. The same logic is available from
+Python via ``srt.resolve_ambiguous_split``.
+
 .. _hanzidentifier: https://github.com/tsroten/hanzidentifier
 
 Library

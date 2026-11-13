@@ -5,6 +5,7 @@
 
 from __future__ import unicode_literals
 import functools
+import itertools
 import re
 from datetime import timedelta
 import logging
@@ -75,6 +76,25 @@ SRT_REGEX = re.compile(
 )
 
 ZERO_TIMEDELTA = timedelta(0)
+
+# A line that looks like a timestamp line, optionally preceded by an index
+# line. Used by the ambiguous split logic to find plausible block boundaries
+# inside raw text that may contain blank lines and quoted SRT data.
+TIMESTAMP_LINE_REGEX = re.compile(
+    r"^({ts}) *-[ -] *> *({ts}) ?({proprietary})$".format(
+        ts=RGX_TIMESTAMP, proprietary=RGX_PROPRIETARY
+    ),
+    re.MULTILINE,
+)
+BLOCK_HEADER_REGEX = re.compile(
+    r"^(?:{idx}{eof})?{ts} *-[ -] *> *{ts} ?{proprietary}$".format(
+        idx=RGX_INDEX,
+        ts=RGX_TIMESTAMP,
+        proprietary=RGX_PROPRIETARY,
+        eof=RGX_POSSIBLE_CRLF,
+    ),
+    re.MULTILINE,
+)
 
 # Info message if truthy return -> Function taking a Subtitle, skip if True
 SUBTITLE_SKIP_CONDITIONS = (
@@ -476,6 +496,436 @@ def compose(
     return "".join(subtitle.to_srt(strict=strict, eol=eol) for subtitle in subtitles)
 
 
+def _normalise_split_input(srt_content):
+    """
+    Read a file-like object if needed, and normalise CRLF line endings to LF,
+    as :func:`parse` does for content.
+    """
+    if isinstance(srt_content, FILE_TYPES):
+        srt_content = srt_content.read()
+    return srt_content.replace("\r\n", "\n")
+
+
+def _coerce_subtitle(subtitle):
+    """
+    Accept either a Subtitle object or raw SRT block text (and file-like
+    objects), and return a Subtitle.
+    """
+    if subtitle is None or isinstance(subtitle, Subtitle):
+        return subtitle
+    if isinstance(subtitle, FILE_TYPES):
+        subtitle = subtitle.read()
+    return next(iter(parse(subtitle)))
+
+
+def parse_single_block(block):
+    r"""
+    Parse one raw SRT block into a single :class:`Subtitle`, treating every
+    line after the block header as content.
+
+    Unlike :func:`parse`, this never re-splits on timestamp-looking lines, so
+    blank lines, numbers and timecodes quoted inside the content are retained
+    verbatim. Use this on the blocks returned by
+    :func:`resolve_ambiguous_split`, whose boundaries have already been
+    determined.
+
+    .. doctest::
+
+        >>> block = (
+        ...     "7\n"
+        ...     "00:00:10,000 --> 00:00:12,000\n"
+        ...     "证人引用了另一份字幕：\n"
+        ...     "\n"
+        ...     "2\n"
+        ...     "00:00:01,000 --> 00:00:02,000\n"
+        ...     "这是被引用的原话\n"
+        ... )
+        >>> sub = parse_single_block(block)
+        >>> sub.index
+        7
+        >>> sub.content.splitlines()
+        ['证人引用了另一份字幕：', '', '2', '00:00:01,000 --> 00:00:02,000', '这是被引用的原话']
+
+    :param str block: One verbatim SRT block
+    :rtype: Subtitle
+    :raises SRTParseError: If the block does not start with a valid header
+    """
+    block = block.replace("\r\n", "\n")
+    header_match = BLOCK_HEADER_REGEX.match(block)
+    if header_match is None:
+        raise SRTParseError(0, len(block), block)
+
+    # Split on \n only: str.splitlines() also treats characters like the
+    # U+001E record separator as line boundaries, which may legally appear in
+    # proprietary metadata and would otherwise be silently dropped.
+    header_lines = block[: header_match.end()].split("\n")
+    timestamp_match = TIMESTAMP_LINE_REGEX.match(header_lines[0])
+    if timestamp_match:
+        raw_index = None
+        raw_start, raw_end, proprietary = timestamp_match.groups()
+    else:
+        raw_index = header_lines[0].strip()
+        try:
+            raw_index = int(raw_index)
+        except ValueError:
+            # Index 123.4, same handling as in parse().
+            raw_index = int(raw_index.split(".")[0])
+        raw_start, raw_end, proprietary = TIMESTAMP_LINE_REGEX.match(
+            header_lines[1]
+        ).groups()
+
+    content = block[header_match.end():]
+    content = content.lstrip("\n").rstrip("\n")
+
+    return Subtitle(
+        index=raw_index,
+        start=srt_timestamp_to_timedelta(raw_start),
+        end=srt_timestamp_to_timedelta(raw_end),
+        content=content,
+        proprietary=proprietary,
+    )
+
+
+def _find_block_headers(srt_content):
+    """
+    Find every plausible SRT block header in ``srt_content``. A header is an
+    optional index line followed by a timestamp line.
+
+    :returns: ``(start, end, index)`` tuples, where ``index`` is None when no
+              index line was present.
+    """
+    headers = []
+    for match in BLOCK_HEADER_REGEX.finditer(srt_content):
+        # Split on \n only: str.splitlines() also treats characters like the
+        # U+001E record separator as line boundaries, which may legally appear
+        # in proprietary metadata and would otherwise be silently dropped.
+        header_lines = match.group(0).split("\n")
+        if TIMESTAMP_LINE_REGEX.match(header_lines[0]):
+            index = None
+        else:
+            raw_index = header_lines[0].strip()
+            try:
+                index = int(raw_index)
+            except ValueError:
+                # Index 123.4, same handling as in parse().
+                index = int(raw_index.split(".")[0])
+        headers.append((match.start(), match.end(), index))
+    return headers
+
+
+def enumerate_split_candidates(srt_content):
+    r'''
+    Enumerate every structurally plausible way to split raw SRT text into
+    subtitle blocks.
+
+    A line that looks like a timestamp (optionally preceded by an index line)
+    may either start a real subtitle block, or be part of a subtitle's quoted
+    content. Every subset of the plausible headers found after the first one
+    is therefore treated as a possible set of block boundaries.
+
+    The number of candidates grows exponentially with the number of plausible
+    headers, so pass the localised excerpt under review rather than a whole
+    subtitle file.
+
+    :param srt_content: Subtitles in SRT format
+    :type srt_content: str or a file-like object
+    :returns: Each candidate as a tuple of raw, verbatim SRT block strings
+    :rtype: :term:`generator` of tuples of str
+    :raises SRTParseError: If no block header can be found, or text precedes
+                           the first header
+    '''
+    srt_content = _normalise_split_input(srt_content)
+    headers = _find_block_headers(srt_content)
+
+    if not headers:
+        raise SRTParseError(0, len(srt_content), srt_content)
+
+    first_start = headers[0][0]
+    if srt_content[:first_start].strip():
+        raise SRTParseError(0, first_start, srt_content[:first_start])
+
+    header_starts = [start for start, _, _ in headers]
+    interior_starts = header_starts[1:]
+
+    for width in range(len(interior_starts) + 1):
+        for chosen in itertools.combinations(interior_starts, width):
+            boundaries = [header_starts[0]]
+            boundaries.extend(chosen)
+            yield tuple(
+                srt_content[boundaries[cur]:boundaries[cur + 1]]
+                if cur + 1 < len(boundaries)
+                else srt_content[boundaries[cur]:]
+                for cur in range(len(boundaries))
+            )
+
+
+def _blocks_for_boundaries(srt_content, boundaries):
+    return tuple(
+        srt_content[boundaries[cur]:boundaries[cur + 1]]
+        if cur + 1 < len(boundaries)
+        else srt_content[boundaries[cur]:]
+        for cur in range(len(boundaries))
+    )
+
+
+def _boundaries_match_anchors(
+    boundaries, index_at, preceding, following, contiguous_indices
+):
+    if contiguous_indices is None:
+        return True
+
+    indices = [index_at[start] for start in boundaries]
+    if any(index is None for index in indices):
+        return False
+
+    is_contiguous = all(
+        indices[cur] == indices[cur - 1] + 1 for cur in range(1, len(indices))
+    )
+
+    if contiguous_indices:
+        if not is_contiguous:
+            return False
+        if (
+            preceding is not None
+            and preceding.index is not None
+            and indices[0] != preceding.index + 1
+        ):
+            return False
+        if (
+            following is not None
+            and following.index is not None
+            and indices[-1] != following.index - 1
+        ):
+            return False
+        return True
+
+    # The indices were verified as NOT contiguous.
+    if is_contiguous:
+        return False
+    if (
+        preceding is not None
+        and preceding.index is not None
+        and indices[0] <= preceding.index
+    ):
+        return False
+    if (
+        following is not None
+        and following.index is not None
+        and indices[-1] >= following.index
+    ):
+        return False
+    return True
+
+
+def _ambiguity_span(boundary_sets, total_len):
+    """
+    Find the shortest span that all surviving segmentations disagree on.
+    Boundary positions agreed on by every candidate delimit an unambiguous
+    prefix and suffix; everything in between is the ambiguous range.
+    """
+    min_len = min(len(boundaries) for boundaries in boundary_sets)
+
+    prefix_len = 0
+    while prefix_len < min_len and all(
+        boundaries[prefix_len] == boundary_sets[0][prefix_len]
+        for boundaries in boundary_sets
+    ):
+        prefix_len += 1
+
+    suffix_len = 0
+    while suffix_len < min_len - prefix_len and all(
+        boundaries[len(boundaries) - 1 - suffix_len]
+        == boundary_sets[0][len(boundary_sets[0]) - 1 - suffix_len]
+        for boundaries in boundary_sets
+    ):
+        suffix_len += 1
+
+    disputed_starts = [
+        boundaries[prefix_len]
+        for boundaries in boundary_sets
+        if len(boundaries) > prefix_len
+    ]
+    ambiguity_start = min(disputed_starts)
+
+    if suffix_len:
+        reference = boundary_sets[0]
+        ambiguity_end = reference[len(reference) - suffix_len]
+    else:
+        ambiguity_end = total_len
+
+    return ambiguity_start, ambiguity_end
+
+
+def resolve_ambiguous_split(
+    srt_content, preceding=None, following=None, contiguous_indices=None
+):
+    r'''
+    Resolve how ambiguous raw SRT text should be split into subtitle blocks,
+    using verified neighbouring subtitles as anchors.
+
+    Loose parsing splits at every blank line, so a subtitle whose content
+    quotes another subtitle verbatim (blank lines, numbers and a timecode line
+    included) gets torn apart. Strict parsing instead discards or chokes on
+    the text following the blank line. This helper enumerates every
+    structurally plausible split and keeps those consistent with the anchors.
+
+    ``preceding`` and ``following`` are the verified subtitles immediately
+    before and after the excerpt, given as :class:`Subtitle` objects, raw SRT
+    block text, or file-like objects. ``contiguous_indices`` verifies whether
+    the block indices are strictly consecutive: True to require it, False to
+    require a gap, or None not to check indices at all.
+
+    .. doctest::
+
+        >>> raw = (
+        ...     "7\n"
+        ...     "00:00:10,000 --> 00:00:12,000\n"
+        ...     "证人引用了另一份字幕：\n"
+        ...     "\n"
+        ...     "2\n"
+        ...     "00:00:01,000 --> 00:00:02,000\n"
+        ...     "这是被引用的原话\n"
+        ...     "\n"
+        ...     "8\n"
+        ...     "00:00:13,000 --> 00:00:15,000\n"
+        ...     "后文证词\n"
+        ... )
+        >>> preceding = next(iter(parse(
+        ...     "6\n00:00:08,000 --> 00:00:09,000\n前文\n"
+        ... )))
+        >>> following = next(iter(parse(
+        ...     "9\n00:00:16,000 --> 00:00:17,000\n再后文\n"
+        ... )))
+        >>> resolution = resolve_ambiguous_split(
+        ...     raw, preceding, following, contiguous_indices=True
+        ... )
+        >>> resolution.unique
+        True
+        >>> len(resolution.blocks)
+        2
+        >>> subs = resolution.to_subtitles()
+        >>> [sub.index for sub in subs]
+        [7, 8]
+        >>> subs[0].content.splitlines()[-1]
+        '这是被引用的原话'
+
+    With no anchors, several splits remain plausible, and the shortest
+    ambiguous span is reported instead of guessing:
+
+    .. doctest::
+
+        >>> resolution = resolve_ambiguous_split(raw)
+        >>> resolution.unique
+        False
+        >>> raw[resolution.ambiguity_start:].startswith("2\n")
+        True
+        >>> resolution.ambiguity_end == len(raw)
+        True
+
+    :param srt_content: The ambiguous excerpt in SRT format
+    :type srt_content: str or a file-like object
+    :param preceding: The verified subtitle immediately before the excerpt
+    :param following: The verified subtitle immediately after the excerpt
+    :param bool contiguous_indices: Whether block indices are verified to be
+                                    strictly consecutive
+    :returns: A :class:`SplitResolution` describing the surviving splits
+    :rtype: SplitResolution
+    :raises SRTParseError: If no structurally valid header exists, or no
+                           candidate split is consistent with the anchors
+    '''
+    srt_content = _normalise_split_input(srt_content)
+    headers = _find_block_headers(srt_content)
+
+    if not headers:
+        raise SRTParseError(0, len(srt_content), srt_content)
+
+    first_start = headers[0][0]
+    if srt_content[:first_start].strip():
+        raise SRTParseError(0, first_start, srt_content[:first_start])
+
+    preceding = _coerce_subtitle(preceding)
+    following = _coerce_subtitle(following)
+
+    index_at = {start: index for start, _, index in headers}
+    header_starts = [start for start, _, _ in headers]
+    interior_starts = header_starts[1:]
+
+    surviving_boundaries = []
+    for width in range(len(interior_starts) + 1):
+        for chosen in itertools.combinations(interior_starts, width):
+            boundaries = [header_starts[0]]
+            boundaries.extend(chosen)
+            if _boundaries_match_anchors(
+                boundaries, index_at, preceding, following, contiguous_indices
+            ):
+                surviving_boundaries.append(tuple(boundaries))
+
+    if not surviving_boundaries:
+        raise SRTParseError(0, len(srt_content), srt_content)
+
+    surviving_candidates = [
+        _blocks_for_boundaries(srt_content, boundaries)
+        for boundaries in surviving_boundaries
+    ]
+
+    if len(surviving_candidates) == 1:
+        return SplitResolution(srt_content, (surviving_candidates[0],))
+
+    ambiguity_start, ambiguity_end = _ambiguity_span(
+        surviving_boundaries, len(srt_content)
+    )
+    return SplitResolution(
+        srt_content,
+        tuple(surviving_candidates),
+        ambiguity_start,
+        ambiguity_end,
+    )
+
+
+class SplitResolution(object):
+    """
+    The result of :func:`resolve_ambiguous_split`.
+
+    :param str srt_content: The normalised excerpt that was examined
+    :param candidates: Every surviving split, each a tuple of raw SRT block
+                       strings
+    :param int ambiguity_start: Char offset where the shortest ambiguous span
+                                begins (None when the split is unique)
+    :param int ambiguity_end: Char offset where the shortest ambiguous span
+                              ends
+    """
+
+    def __init__(
+        self, srt_content, candidates, ambiguity_start=None, ambiguity_end=None
+    ):
+        self.srt_content = srt_content
+        self.candidates = tuple(candidates)
+        self.unique = len(self.candidates) == 1
+        self.blocks = self.candidates[0] if self.unique else None
+        self.ambiguity_start = ambiguity_start
+        self.ambiguity_end = ambiguity_end
+
+    @property
+    def ambiguity_content(self):
+        """The raw text covered by the shortest ambiguous span."""
+        if self.ambiguity_start is None:
+            return None
+        return self.srt_content[self.ambiguity_start:self.ambiguity_end]
+
+    def to_subtitles(self):
+        """
+        Parse the blocks of a unique split into :class:`Subtitle` objects.
+
+        Quoted SRT data inside a block is preserved as content rather than
+        being split again.
+
+        :raises AmbiguousSRTParseError: If more than one split remains
+        """
+        if not self.unique:
+            raise AmbiguousSRTParseError(self)
+        return [parse_single_block(block) for block in self.blocks]
+
+
 class SRTParseError(Exception):
     """
     Raised when part of an SRT block could not be parsed.
@@ -503,6 +953,24 @@ class TimestampParseError(ValueError):
     """
     Raised when an SRT timestamp could not be parsed.
     """
+
+
+class AmbiguousSRTParseError(SRTParseError):
+    """
+    Raised when an excerpt can be split into subtitle blocks in more than one
+    way consistent with the supplied anchors.
+
+    :param SplitResolution resolution: The surviving splits and the shortest
+                                       ambiguous span, for manual review
+    """
+
+    def __init__(self, resolution):
+        super(AmbiguousSRTParseError, self).__init__(
+            resolution.ambiguity_start,
+            resolution.ambiguity_end,
+            resolution.ambiguity_content,
+        )
+        self.resolution = resolution
 
 
 class _ShouldSkipException(Exception):
