@@ -2,7 +2,8 @@ import unittest
 import pytest
 import mwclient
 from mwclient.listing import List, NestedList, GeneratorList
-from mwclient.listing import Category, PageList, RevisionsIterator
+from mwclient.listing import Category, PageList, PageProperty, RevisionsIterator
+from mwclient.listing import continuation_modules, merge_page_info
 from mwclient.page import Page
 
 import unittest.mock as mock
@@ -507,6 +508,384 @@ class TestList(unittest.TestCase):
         )
         vals = [x for x in rvi]
         assert len(vals) == 0
+
+
+class TestContinuationModules:
+
+    def test_attribute_tokens_to_properties(self):
+        # Tokens are split per property instead of kept as one blob
+        modules = continuation_modules(
+            {'clcontinue': 'A|B', 'elcontinue': 'C', 'continue': '-||'},
+            prefix='el', list_name='extlinks'
+        )
+        assert modules == {'categories': 'A|B', 'extlinks': 'C'}
+
+    def test_listing_token_kept_distinct(self):
+        # The listing's own branch is not confused with a page property
+        modules = continuation_modules(
+            {'gcmcontinue': 'X', 'continue': '-||'},
+            prefix='cm', list_name='categorymembers'
+        )
+        assert modules == {'categorymembers': 'X'}
+
+    def test_unknown_token_stays_visible(self):
+        # Extension tokens keep their own module name instead of becoming the
+        # listing's next-page token
+        modules = continuation_modules(
+            {'xyzcontinue': 'X', 'continue': '-||'}, prefix='ap', list_name='allpages'
+        )
+        assert modules == {'xyz': 'X'}
+
+    def test_empty_continuation(self):
+        assert continuation_modules(None) == {}
+        assert continuation_modules({}) == {}
+
+
+class TestMergePageInfo:
+
+    def test_lists_are_joined_and_deduplicated(self):
+        target = {'title': 'A', 'categories': [{'title': 'C1'}]}
+        merge_page_info(target, {'categories': [{'title': 'C1'}, {'title': 'C2'}]})
+        assert target['categories'] == [{'title': 'C1'}, {'title': 'C2'}]
+
+    def test_absent_keys_do_not_clear_values(self):
+        target = {'title': 'A', 'extlinks': [{'*': 'u1'}]}
+        merge_page_info(target, {'title': 'A'})
+        assert target['extlinks'] == [{'*': 'u1'}]
+
+    def test_explicit_empty_list_is_kept(self):
+        target = {'title': 'A', 'categories': [{'title': 'C1'}]}
+        merge_page_info(target, {'categories': []})
+        assert target['categories'] == [{'title': 'C1'}]
+
+    def test_repeated_revision_is_merged_by_revid(self):
+        target = {'title': 'A', 'revisions': [{'revid': 5, 'user': 'Bob'}]}
+        merge_page_info(
+            target, {'revisions': [{'revid': 5, 'user': 'Bob', '*': 'text'}]}
+        )
+        assert target['revisions'] == [
+            {'revid': 5, 'user': 'Bob', '*': 'text'}
+        ]
+
+
+class TestPropertyContinuation:
+
+    @mock.patch('mwclient.client.Site')
+    def test_property_continuation_and_completion(self, mock_site):
+        # A property split over several responses yields every member once,
+        # even when a retried chunk repeats the boundary member.
+        mock_site.api_limit = 500
+        page = mock.MagicMock()
+        page.site = mock_site
+        page.name = 'P'
+        mock_site.get.side_effect = [
+            {
+                'continue': {'elcontinue': 'X', 'continue': '-||'},
+                'query': {'pages': {'1': {
+                    'title': 'P', 'extlinks': [{'*': 'u1'}]
+                }}}
+            },
+            {
+                'continue': {'elcontinue': 'Y', 'continue': '-||'},
+                'query': {'pages': {'1': {
+                    'title': 'P', 'extlinks': [{'*': 'u1'}, {'*': 'u2'}]
+                }}}
+            },
+            {
+                'batchcomplete': '',
+                'query': {'pages': {'1': {
+                    'title': 'P', 'extlinks': [{'*': 'u3'}]
+                }}}
+            },
+        ]
+        lst = PageProperty(page, 'extlinks', 'el', return_values='*')
+        assert list(lst) == ['u1', 'u2', 'u3']
+        assert lst.complete is True
+        assert lst.property_status('extlinks').complete is True
+
+    @mock.patch('mwclient.client.Site')
+    def test_categories_complete_while_other_property_continues(self, mock_site):
+        # The response only continues extlinks.  Categories must be reported
+        # complete instead of copying the batch's pending state.
+        mock_site.api_limit = 500
+        mock_site.get.side_effect = [
+            {
+                'continue': {'elcontinue': 'X', 'continue': '-||'},
+                'query': {'pages': {'1': {
+                    'title': 'P',
+                    'categories': [{'title': 'Category:A'}],
+                    'extlinks': [{'*': 'u1'}]
+                }}}
+            },
+            {
+                'batchcomplete': '',
+                'query': {'pages': {'1': {'title': 'P', 'extlinks': [{'*': 'u2'}]}}}
+            },
+        ]
+        lst = List(mock_site, 'extlinks', 'el', titles='P',
+                   prop='categories|extlinks')
+        list(lst)
+        assert lst.property_status('categories').complete is True
+        assert lst.property_status('categories').basis == 'batchcomplete'
+        assert lst.property_status('extlinks').complete is True
+        assert lst.complete is True
+
+    @mock.patch('mwclient.client.Site')
+    def test_incomplete_property_is_reported(self, mock_site):
+        mock_site.api_limit = 500
+        page = mock.MagicMock()
+        page.site = mock_site
+        page.name = 'P'
+        mock_site.get.side_effect = [
+            {
+                'continue': {'elcontinue': 'X', 'continue': '-||'},
+                'query': {'pages': {'1': {
+                    'title': 'P', 'extlinks': [{'*': 'u1'}]
+                }}}
+            },
+        ]
+        lst = PageProperty(page, 'extlinks', 'el', return_values='*')
+        assert next(lst) == 'u1'
+        assert lst.complete is False
+        assert lst.incomplete_properties == ['extlinks']
+        assert lst.property_status('extlinks').continuation == 'X'
+        assert 'X' in lst.args.values()
+
+    @mock.patch('mwclient.client.Site')
+    def test_finished_module_token_is_dropped(self, mock_site):
+        # Once categories stop continuing, its token must not be resent
+        mock_site.api_limit = 500
+        mock_site.get.side_effect = [
+            {
+                'continue': {'clcontinue': 'A', 'elcontinue': 'X', 'continue': '-||'},
+                'query': {'pages': {'1': {
+                    'title': 'P',
+                    'categories': [{'title': 'Category:A'}],
+                    'extlinks': [{'*': 'u1'}]
+                }}}
+            },
+            {
+                'continue': {'elcontinue': 'Y', 'continue': '-||'},
+                'query': {'pages': {'1': {'title': 'P', 'extlinks': [{'*': 'u2'}]}}}
+            },
+            {
+                'batchcomplete': '',
+                'query': {'pages': {'1': {'title': 'P', 'extlinks': [{'*': 'u3'}]}}}
+            },
+        ]
+        lst = List(mock_site, 'extlinks', 'el', titles='P',
+                   prop='categories|extlinks')
+        list(lst)
+        assert 'clcontinue' not in lst.args
+        assert 'elcontinue' not in lst.args
+
+
+class TestGeneratorPageMerging:
+
+    def _run(self, responses, prop='info|categories|extlinks'):
+        site = mock.MagicMock()
+        site.api_limit = 500
+        site.__str__.return_value = 'some wiki'
+        site.get.side_effect = responses
+        gl = GeneratorList(site, 'pages', 'p', prop=prop)
+        return gl, list(gl)
+
+    def test_later_pages_keep_members_from_the_final_chunk(self):
+        # Page B first appears in an intermediate chunk without extlinks; the
+        # final chunk carries its extlinks.  Pending pages must not be
+        # released before the whole chunk that completes the batch is read.
+        responses = [
+            {
+                'continue': {'elcontinue': 'E1', 'continue': '-||'},
+                'query': {'pages': {'1': {
+                    'pageid': 1, 'ns': 0, 'title': 'A',
+                    'categories': [{'title': 'C1'}],
+                    'extlinks': [{'*': 'x1'}]
+                }}}
+            },
+            {
+                'continue': {'elcontinue': 'E2', 'continue': '-||'},
+                'query': {'pages': {
+                    '1': {'pageid': 1, 'ns': 0, 'title': 'A',
+                          'extlinks': [{'*': 'x2'}]},
+                    '2': {'pageid': 2, 'ns': 0, 'title': 'B',
+                          'categories': [{'title': 'C2'}]},
+                }}
+            },
+            {
+                'batchcomplete': '',
+                'query': {'pages': {
+                    '1': {'pageid': 1, 'ns': 0, 'title': 'A',
+                          'extlinks': [{'*': 'x3'}]},
+                    '2': {'pageid': 2, 'ns': 0, 'title': 'B',
+                          'extlinks': [{'*': 'y1'}]},
+                }}
+            },
+        ]
+        _, pages = self._run(responses)
+        by_name = {page.name: page for page in pages}
+        assert by_name['A']._info['extlinks'] == [
+            {'*': 'x1'}, {'*': 'x2'}, {'*': 'x3'}
+        ]
+        assert by_name['B']._info['extlinks'] == [{'*': 'y1'}]
+        assert by_name['B']._info['categories'] == [{'title': 'C2'}]
+
+    def test_pages_hold_back_until_properties_complete(self):
+        # Page A arrives in three pieces while extlinks continues.  It must
+        # be yielded once, after the last piece, with all members merged.
+        responses = [
+            {
+                'continue': {'elcontinue': 'X', 'continue': '-||'},
+                'query': {'pages': {'1': {
+                    'pageid': 1, 'ns': 0, 'title': 'A',
+                    'categories': [{'title': 'C1'}],
+                    'extlinks': [{'*': 'a1'}]
+                }}}
+            },
+            {
+                'continue': {'elcontinue': 'Y', 'continue': '-||'},
+                'query': {'pages': {'1': {
+                    'pageid': 1, 'ns': 0, 'title': 'A',
+                    'extlinks': [{'*': 'a2'}]
+                }}}
+            },
+            {
+                'batchcomplete': '',
+                'query': {'pages': {'1': {
+                    'pageid': 1, 'ns': 0, 'title': 'A',
+                    'extlinks': [{'*': 'a3'}]
+                }}}
+            },
+        ]
+        gl, pages = self._run(responses)
+        assert [page.name for page in pages] == ['A']
+        assert pages[0]._info['categories'] == [{'title': 'C1'}]
+        assert pages[0]._info['extlinks'] == [
+            {'*': 'a1'}, {'*': 'a2'}, {'*': 'a3'}
+        ]
+        assert pages[0].completion_info['complete'] is True
+
+    def test_two_pagination_styles_deliver_same_page(self):
+        # The split style and the single-response style must produce the
+        # same property members and the same set of property names.
+        split = [
+            {
+                'continue': {'elcontinue': 'X', 'continue': '-||'},
+                'query': {'pages': {'1': {
+                    'pageid': 1, 'ns': 0, 'title': 'A',
+                    'categories': [{'title': 'C1'}],
+                    'extlinks': [{'*': 'a1'}]
+                }}}
+            },
+            {
+                'batchcomplete': '',
+                'query': {'pages': {'1': {
+                    'pageid': 1, 'ns': 0, 'title': 'A',
+                    'extlinks': [{'*': 'a2'}, {'*': 'a3'}]
+                }}}
+            },
+        ]
+        whole = [{
+            'batchcomplete': '',
+            'query': {'pages': {'1': {
+                'pageid': 1, 'ns': 0, 'title': 'A',
+                'categories': [{'title': 'C1'}],
+                'extlinks': [{'*': 'a1'}, {'*': 'a2'}, {'*': 'a3'}]
+            }}}
+        }]
+        split_pages = self._run(split)[1]
+        whole_pages = self._run(whole)[1]
+        assert len(split_pages) == len(whole_pages) == 1
+        assert split_pages[0]._info['categories'] == \
+            whole_pages[0]._info['categories']
+        assert split_pages[0]._info['extlinks'] == \
+            whole_pages[0]._info['extlinks']
+        assert set(split_pages[0].completion_info['properties']) == \
+            set(whole_pages[0].completion_info['properties'])
+
+    def test_partial_page_is_not_reported_complete(self):
+        # When the response stream stops while a property still continues,
+        # the page is delivered but explicitly marked incomplete instead of
+        # pretending to be a finished record.
+        responses = [
+            {
+                'continue': {'elcontinue': 'X', 'continue': '-||'},
+                'query': {'pages': {'1': {
+                    'pageid': 1, 'ns': 0, 'title': 'A',
+                    'extlinks': [{'*': 'a1'}]
+                }}}
+            },
+        ]
+        site = mock.MagicMock()
+        site.api_limit = 500
+        site.get.side_effect = list(responses)
+        gl = GeneratorList(site, 'pages', 'p', prop='info|extlinks')
+        pages = list(gl)
+        assert [page.name for page in pages] == ['A']
+        assert pages[0].completion_info['complete'] is False
+        status = pages[0].completion_info['properties']['extlinks']
+        assert status['complete'] is False
+        assert status['continuation'] == 'X'
+
+    def test_empty_property_is_explicit(self):
+        # A property that is known to be empty carries an explicit empty
+        # marker instead of looking the same as one that is merely absent.
+        responses = [{
+            'batchcomplete': '',
+            'query': {'pages': {'1': {
+                'pageid': 1, 'ns': 0, 'title': 'A', 'categories': []
+            }}}
+        }]
+        _, pages = self._run(responses, prop='info|categories')
+        status = pages[0].completion_info['properties']['categories']
+        assert status['complete'] is True
+        assert status['present'] is True
+        assert status['empty'] is True
+
+    def test_retried_chunk_does_not_duplicate_pages(self):
+        # A continuation chunk retried after a transient failure repeats a
+        # page that was already delivered.  It must not appear twice.
+        responses = [
+            {
+                'continue': {'gcmcontinue': 'C1', 'continue': '-||'},
+                'query': {'pages': {'1': {'pageid': 1, 'ns': 0, 'title': 'A'}}}
+            },
+            {
+                'continue': {'gcmcontinue': 'C2', 'continue': '-||'},
+                'query': {'pages': {'1': {'pageid': 1, 'ns': 0, 'title': 'A'}}}
+            },
+            {
+                'batchcomplete': '',
+                'query': {'pages': {'2': {'pageid': 2, 'ns': 0, 'title': 'B'}}}
+            },
+        ]
+        _, pages = self._run(responses, prop='info')
+        assert [page.name for page in pages] == ['A', 'B']
+
+    def test_listing_continuation_does_not_block_pages(self):
+        # A continuation of the branch itself only means more pages follow.
+        # It must not hold earlier pages back or label them partial.
+        responses = [
+            {
+                'continue': {'gcmcontinue': 'C1', 'continue': '-||'},
+                'query': {'pages': {
+                    '1': {'pageid': 1, 'ns': 0, 'title': 'A'},
+                    '2': {'pageid': 2, 'ns': 0, 'title': 'B'},
+                }}
+            },
+            {
+                'continue': {'gcmcontinue': 'C2', 'continue': '-||'},
+                'query': {'pages': {'3': {'pageid': 3, 'ns': 0, 'title': 'C'}}}
+            },
+            {
+                'batchcomplete': '',
+                'query': {'pages': {'4': {'pageid': 4, 'ns': 0, 'title': 'D'}}}
+            },
+        ]
+        _, pages = self._run(responses, prop='info')
+        assert [page.name for page in pages] == ['A', 'B', 'C', 'D']
+        for page in pages:
+            assert page.completion_info['complete'] is True
 
 
 class TestGetListingArgs:

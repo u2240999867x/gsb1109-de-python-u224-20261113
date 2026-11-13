@@ -24,6 +24,38 @@ When the page is retrieved via ``Site.pages`` or a generator,
 it will check automatically which of those three specific types
 should be returned.
 
+Continuation and per-property completeness
+------------------------------------------
+
+A single API request can return several page properties, and each property has
+its own continuation branch.  ``prop=categories|extlinks`` may therefore
+complete the categories while external links still need another request.  The
+listing keeps these branches apart instead of merging every continuation token
+into one bag of request parameters:
+
+* ``List.complete`` is true only once no module still needs a continuation.
+* ``List.incomplete_properties`` names the properties that are still streaming.
+* ``List.property_status(name)`` returns a :class:`PropertyState
+  <mwclient.listing.PropertyState>` with the property's remaining
+  ``continuation`` token, its ``complete`` flag and a ``basis`` explaining why
+  (``batchcomplete``, ``continuation ended``, ...).
+* ``List.completion_state`` summarises the same information for every property.
+
+A property that is genuinely empty is reported with an explicit ``empty``
+marker; a property whose members may still arrive is not.
+
+For page generators, a page can be repeated across continuation chunks while a
+property is paged through, each time carrying only part of that property.
+``GeneratorList`` merges the repeated representations by page identity and
+deduplicates members, including a chunk retried after a transient failure.
+Pages are released once all their requested properties are complete, so both
+pagination styles deliver the same page with the same members.  Every yielded
+page has a ``completion_info`` attribute mirroring the list-level states.  If
+the response stream stops while a property is still incomplete, the page is
+still delivered but ``completion_info['complete']`` is false and the pending
+property keeps its continuation token, so it is not mistaken for a finished
+record.
+
 For convenience, ``Site.images`` and ``Site.categories`` are also provided.
 These do exactly the same as `Site.Pages`, except that they require the page name
 without its namespace prefixed.

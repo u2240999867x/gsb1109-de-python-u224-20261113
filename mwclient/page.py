@@ -92,6 +92,16 @@ class Page:
         self.last_rev_time = None  # type: Optional[time.struct_time]
         self.edit_time = None  # type: Optional[time.struct_time]
 
+        # Pages returned by a generator carry per-property completeness
+        # details from the listing that produced them.  A page constructed
+        # directly is authoritative for its own info, so it is complete.
+        if not hasattr(self, 'completion_info'):
+            self.completion_info = {
+                'complete': True,
+                'basis': 'direct page',
+                'properties': {},
+            }
+
     @property
     def page_title(self) -> str:
         if self.namespace:
