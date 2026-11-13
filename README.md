@@ -42,6 +42,83 @@ You can replace those tables (dropping them before restoring them) using the `--
 ```bash
 sqlite-diffable load restored.db dump/ --replace
 ```
+## Comparing and updating two exports
+
+`diff` compares two dump directories and reports what it takes to turn the
+first into the second:
+
+```bash
+sqlite-diffable diff old-export/ new-export/ -o chairs.patch.json
+```
+
+Rows are compared as a **multiset of stored values**. A table without a
+primary key can hold the same row several times, and that multiplicity is
+what gets compared—four identical chairs in one export and six in the other
+is a difference of two rows, not "no difference". Pairing never uses a rowid
+or a line number, so a row in one export is never matched against an
+unrelated row in the other just because they landed at the same position.
+Row order is irrelevant: reordering an `.ndjson` file changes nothing.
+
+Values are compared by SQLite storage class, so these are all different:
+
+- `NULL`
+- an empty `BLOB` (`{"$sqlite": "blob", "hex": ""}`)
+- an empty string `""`
+- the text `"b''"`
+- the integer `1` and the real `1.0`
+
+Apply a patch to the old directory with `apply`:
+
+```bash
+sqlite-diffable apply old-export/ chairs.patch.json
+```
+
+Applying the same patch twice is safe—the patch records the target
+multiplicity of each changed row, so rows are never duplicated. The short
+form for comparing and applying in one step is `sync`:
+
+```bash
+sqlite-diffable sync old-export/ new-export/
+```
+
+Load the updated directory as usual and every table will have the same
+number of rows, of each kind, as the new export:
+
+```bash
+sqlite-diffable load restored.db old-export/
+```
+
+Use `diff --check` to exit `1` when the directories differ, and
+`diff --apply` (or `sync --dry-run` to preview) for other workflows. The
+same operations are available from Python:
+
+```python
+from sqlite_diffable import diff_dumps, apply_diff, sync_directories
+
+patch = diff_dumps("old-export/", "new-export/")
+apply_diff("old-export/", patch)
+```
+
+## Preserving SQLite storage classes
+
+SQLite stores every value using one of five storage classes: `NULL`,
+`INTEGER`, `REAL`, `TEXT` or `BLOB`. Older versions of this tool serialized
+rows with `json.dumps(..., default=repr)`, which turned a `BLOB` into its
+Python `repr` string. That made an empty `BLOB` (`b''`), an empty `TEXT`
+(`''`) and `NULL` impossible to tell apart in a dump.
+
+Dumps now preserve the storage class of every cell:
+
+- `NULL`, integers, floats and text are stored as their normal JSON values.
+- `BLOB` values are stored as `{"$sqlite": "blob", "hex": "..."}`, including
+  empty BLOBs (`{"$sqlite": "blob", "hex": ""}`).
+
+Because the column order comes from the table metadata and not from the
+dictionary returned for a row, duplicate column names cannot silently drop
+or reorder values. `sqlite-diffable objects` shows the tagged BLOB
+representation; `objects --legacy` prints BLOBs the old way, as `b'...'`
+strings.
+
 ## Converting to JSON objects
 
 Table rows are stored in the `.ndjson` files as newline-delimited JSON arrays, like this:
@@ -99,7 +176,7 @@ Each table is represented as two files. The first, `table_name.metadata.json`, c
 
 It is an object with three keys: `name` is the name of the table, `columns` is an array of column strings and `schema` is the SQL schema text used for tha table.
 
-The second file, `table_name.ndjson`, contains newline-delimited JSON (aka [JSON Lines](https://jsonlines.org/)) for every row in the table. Each row is represented as a JSON array with items corresponding to each of the columns defined in the metadata.
+The second file, `table_name.ndjson`, contains newline-delimited JSON (aka [JSON Lines](https://jsonlines.org/)) for every row in the table. Each row is represented as a JSON array with items corresponding to each of the columns defined in the metadata. A `BLOB` cell is represented by the tagged object described above.
 
 That file for the `redirects_redirect.ndjson` table might look like this:
 
