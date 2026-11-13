@@ -344,3 +344,65 @@ The :mod:`semantic_version.django_fields` module provides django fields to
 store :class:`Version` or :class:`BaseSpec` objects.
 
 More documentation is available in the :doc:`django` section.
+
+
+Planning monthly archives
+-------------------------
+
+The :mod:`semantic_version.archive` module turns dated support declarations
+and a dated release catalog into a reuse calendar.
+
+Each consumer publishes :class:`SupportDeclaration` objects.  Their ``start``
+is inclusive and their ``end`` is exclusive; a declaration without an ``end``
+remains valid until the next declaration for the same consumer starts.  An
+artifact is represented by :class:`Artifact`: it has a publication date, an
+optional withdrawal date, and optionally a format and a stable artifact id.
+Catalog-wide withdrawals are represented by :class:`Withdrawal` objects, which
+may target exact artifact ids, version ranges, or formats.
+
+The calendar is divided into day or month periods.  For each period, the
+planner intersects the artifacts supported by every consumer on every day of
+that period.  A window is emitted only when one *exact* artifact survives the
+whole period; candidates that exist only at the start and end of a period are
+not enough.
+
+.. code-block:: pycon
+
+    >>> from semantic_version.archive import ArchivePlanner
+    >>> planner = ArchivePlanner(
+    ...     start='2026-01-01',
+    ...     end='2026-06-30',
+    ...     artifacts=[
+    ...         {'version': '1.4.0', 'published': '2025-01-01'},
+    ...         {'version': '1.6.0', 'published': '2025-01-01'},
+    ...     ],
+    ...     declarations=[
+    ...         {'consumer': 'legacy', 'spec': '>=1.0.0,<1.5.0',
+    ...          'start': '2025-01-01', 'end': '2026-03-01'},
+    ...         {'consumer': 'legacy', 'spec': '>=1.5.0,<2.0.0',
+    ...          'start': '2026-03-01'},
+    ...     ],
+    ... )
+    >>> plan = planner.plan()
+    >>> [(w.start.isoformat(), w.end.isoformat(), str(w.artifact.version))
+    ...  for w in plan.windows]
+    [('2026-01-01', '2026-02-28', '1.4.0'), ('2026-03-01', '2026-06-30', '1.6.0')]
+    >>> plan.changes
+    1
+
+When no artifact spans a period, :attr:`ArchivePlan.gaps` explains why.  Each
+:class:`Gap` records the first blocked date and the blocker records that
+jointly removed every candidate: expired or pending declarations, catalog
+withdrawals, artifacts that had not been published yet, or missing
+declarations for a consumer.  In month mode, a month whose endpoints each
+have a candidate but whose middle has none is reported as
+``no-spanning-artifact``, with the affected artifacts listed.
+
+The same configuration can be planned from JSON::
+
+    python -m semantic_version.archive --input plan.json --format text
+
+The accepted keys are ``start``/``end`` (or ``month``), ``artifacts``,
+``consumers`` (a mapping of consumer name to declarations), ``declarations``,
+``withdrawals``, and ``granularity`` (``day`` or ``month``).
+

@@ -4,6 +4,14 @@ ChangeLog
 2.10.1 (unreleased)
 -------------------
 
+*New:*
+
+    * Add :mod:`semantic_version.archive`, a calendar planner that combines
+      dated consumer support declarations with artifact publication and
+      withdrawal dates.  It reports maximal exact-artifact reuse windows and
+      explains gaps with the declarations and catalog events that jointly
+      removed every candidate.
+
 *Minor:*
 
     * `112 <https://github.com/rbarrois/python-semanticversion/issues/112>`_:

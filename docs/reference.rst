@@ -726,5 +726,197 @@ Each of those ``Spec`` classes provides a shared set of methods to work with ver
 
 
 
+Archive calendar planning
+-------------------------
+
+.. module:: semantic_version.archive
+
+.. function:: plan_archive(config)
+
+    Plan a calendar from a JSON-compatible mapping.  See
+    :class:`ArchivePlanner` for accepted keys.
+
+    :param dict config: The calendar configuration
+    :rtype: :class:`ArchivePlan`
+
+
+.. class:: ArchivePlanner(start, end, artifacts, declarations=None, withdrawals=None, granularity='day')
+
+    Compute the maximal calendar windows during which one exact artifact can
+    be reused by every consumer.
+
+    ``start`` and ``end`` are inclusive.  A ``YYYY-MM`` value expands to the
+    first/last day of that month as appropriate.  ``granularity`` is either
+    ``'day'`` or ``'month'``.
+
+    ``artifacts`` is an iterable of :class:`Artifact` objects or mappings;
+    ``declarations`` is an iterable of :class:`SupportDeclaration` objects or
+    mappings; ``withdrawals`` is an iterable of :class:`Withdrawal` objects or
+    mappings.
+
+    .. classmethod:: from_config(config)
+
+        Build a planner from a mapping.  Recognized keys are ``start`` and
+        ``end`` (or ``month``), ``artifacts``, ``consumers`` (a mapping from
+        consumer name to declarations), ``declarations``, ``withdrawals``,
+        and ``granularity``.
+
+    .. method:: plan()
+
+        Return an :class:`ArchivePlan`.
+
+        For every period, the planner intersects the candidate artifacts on
+        every day of the period.  This means an artifact that is available at
+        the start and at the end of a period but not throughout it is not
+        selected; the period becomes a :class:`Gap` instead.
+
+        Among candidates that span the period, the planner chooses the one
+        that reaches furthest forward, then the highest version, in order to
+        minimize the number of artifact changes.
+
+
+.. class:: ArchivePlan
+
+    The result of :meth:`ArchivePlanner.plan`.  It is also returned by
+    :func:`plan_archive`.
+
+    .. attribute:: start
+    .. attribute:: end
+    .. attribute:: granularity
+    .. attribute:: windows
+
+        A list of :class:`Window` objects, ordered by date.
+
+    .. attribute:: gaps
+
+        A list of :class:`Gap` objects, ordered by date.
+
+    .. attribute:: changes
+
+        The number of artifact changes between consecutive windows; it
+        excludes transitions that cross a gap.
+
+    .. method:: as_dict()
+
+        Return a JSON-serializable representation.
+
+    .. method:: to_json(**kwargs)
+
+        Serialize :meth:`as_dict` to JSON.
+
+    .. method:: format_text()
+
+        Return a human-readable calendar summary.
+
+
+.. class:: Window
+
+    .. attribute:: start
+    .. attribute:: end
+    .. attribute:: artifact
+
+        The :class:`Artifact` reused throughout this window.
+
+    .. attribute:: days
+
+        The number of calendar days covered by the window.
+
+
+.. class:: Gap
+
+    .. attribute:: date
+
+        The trigger date: the first day at which the spanning candidate set
+        collapses (or the first day of the period when it never had one).
+
+    .. attribute:: period_start
+    .. attribute:: period_end
+
+        The calendar period affected by the gap.
+
+    .. attribute:: reason
+
+        One of ``missing-declaration``, ``declaration-conflict``,
+        ``consumer-unsupported``, ``catalog-withdrawal``,
+        ``catalog-not-published``, ``catalog-unavailable``,
+        ``no-spanning-artifact``, or ``catalog-empty``.
+
+    .. attribute:: blockers
+
+        The declarations, withdrawals, and publication dates that jointly
+        remove every candidate.  ``active_declarations`` separately lists all
+        declarations in force on the trigger date, and ``lost_artifacts``
+        names the artifacts that previously spanned the period.
+
+    .. attribute:: active_declarations
+
+        Every support declaration in force on the trigger date.
+
+    .. attribute:: lost_artifacts
+
+        For ``no-spanning-artifact``, the artifacts that were available
+        earlier in the period but no longer span it.
+
+
+.. class:: SupportDeclaration(consumer, spec='*', syntax='simple', start=None, end=None, formats=None, declaration_id=None)
+
+    One consumer's dated support range.  ``start`` is inclusive and ``end``
+    is exclusive.  An omitted ``end`` means the declaration remains valid
+    until the next declaration for the same consumer starts.  Overlapping
+    declarations from one consumer are treated as a union.
+
+    ``spec`` accepts a range expression in the given ``syntax`` (``'simple'``
+    or ``'npm'``); ``formats`` optionally restricts it to a set of artifact
+    formats.
+
+    .. method:: matches(artifact)
+
+        Whether the declaration's version range and format restrictions
+        accept the artifact.
+
+    .. method:: applies_on(day[, effective_end=None])
+
+        Whether the declaration is active on a date.
+
+
+.. class:: Artifact(version, artifact_id=None, format=None, published=None, withdrawn=None)
+
+    One exact build in the release catalog.
+
+    ``published`` is the first day the artifact is available; ``withdrawn``
+    is the first day it is no longer available.  ``artifact_id`` serves as
+    the stable identity reported in windows.  When omitted, the identity is
+    the version plus format.
+
+    .. attribute:: key
+
+        The stable identity used internally.
+
+    .. attribute:: key_text
+
+        The stable human-readable identity used in reports.
+
+    .. attribute:: display
+
+        A display label combining the artifact id and version when both are
+        available.
+
+
+.. class:: Withdrawal(effective, spec=None, syntax='simple', formats=None, artifact_ids=None, until=None, withdrawal_id=None, reason=None)
+
+    A dated release-catalog withdrawal.  ``effective`` is inclusive and
+    ``until`` is exclusive; an omitted ``until`` makes the withdrawal
+    permanent.  A withdrawal matches an artifact when all supplied filters
+    (ids, formats, and version range) match.
+
+    .. method:: applies_on(day)
+
+        Whether the withdrawal is active on a date.
+
+    .. method:: matches(artifact)
+
+        Whether the withdrawal targets an artifact.
+
+
 .. _SemVer: http://semver.org/
 .. _`compatible release clauses`: https://www.python.org/dev/peps/pep-0440/#compatible-release
