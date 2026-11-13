@@ -5,6 +5,28 @@ List of changes
 
 Unreleased changes (Available on GitHub)
 ----------------------------------------
+- Repeated ``~P`` (Parameter) sections, as produced by successive well
+  handovers (e.g. an opening/spud delivery followed by a completion
+  delivery), are now merged instead of overwriting each other. Every
+  parameter occurrence is kept in source order with provenance
+  (source section, source order, line number, and any batch/segment/depth
+  hints parsed from its description) and exposed through
+  :meth:`lasio.LASFile.parameter_occurrences`,
+  :meth:`lasio.LASFile.parameter_timeline`,
+  :meth:`lasio.LASFile.parameter_changes` and
+  :meth:`lasio.LASFile.parameter_applicable_at`.
+- New :meth:`lasio.SectionItems.find_all` returns every item matching a
+  mnemonic in source order rather than just the first match.
+- Parameter repeats are classified as a real ``parameter_correction`` or an
+  ``equivalent_restatement`` (including ``equivalent_restatement_unit_change``)
+  using an explicit, documented unit-conversion table in
+  :mod:`lasio.parameter_audit`; unknown unit pairs raise
+  :class:`lasio.LASUnknownUnitError` instead of being guessed at.
+- Looking up the parameter applicable to a curve sample depth
+  (:meth:`lasio.LASFile.parameter_applicable_at`) returns the chosen
+  occurrence with a basis string, or raises
+  :class:`lasio.LASParameterHandoffError` stating which handover or segment
+  declaration is missing, instead of silently taking the last value.
 
 Version 0.32 (1 August 2025)
 ----------------------------

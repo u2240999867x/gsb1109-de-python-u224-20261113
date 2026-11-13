@@ -699,6 +699,10 @@ def parse_header_items_section(
     if not mnemonic_case == "preserve":
         section.mnemonic_transforms = True
 
+    # Handover notes are commonly written as comment lines above the
+    # items. Keep the whole section's comment block as shared context.
+    section_comments = []
+
     for i, line in enumerate(file_obj):
         line_no = line_no + 1
         line = line.strip("\n").strip()
@@ -710,6 +714,7 @@ def parse_header_items_section(
                     line_no + 1, line
                 )
             )
+            section_comments.append(line)
         else:
             # We have arrived at a new section so break and return the previous
             # section's object.
@@ -729,6 +734,11 @@ def parse_header_items_section(
                 elif mnemonic_case == "lower":
                     values["name"] = values["name"].lower()
                 item = parser(**values)
+                # One-based line number in the source file and the section's
+                # comment block; transferred onto provenance attributes by
+                # parameter_audit.
+                item._source_line_no = line_no + 1
+                item._section_comments = section_comments
                 logger.debug("Line {}: parsed as {}".format(line_no + 1, item))
                 section.append(item)
         if line_no == line_nos[1]:

@@ -11,6 +11,11 @@ import numpy as np
 
 from . import defaults, exceptions, reader, writer
 from .las_items import CurveItem
+from .parameter_audit import (
+    ParameterRegistry,
+    merge_section_items,
+    stamp_section,
+)
 
 basestring = (str, bytes)
 logger = logging.getLogger(__name__)
@@ -99,6 +104,14 @@ class LASFile(object):
         self._text = ""
         self.index_unit = None
         self.index_initial = None
+        # Provenance bookkeeping for handovers which repeat ~P sections.
+        # parameter_registry keeps every parameter occurrence in source
+        # order; _section_install tracks how many Parameter sections have
+        # been read so that a later one is merged instead of overwriting
+        # the earlier handover.
+        self.parameter_registry = ParameterRegistry()
+        self._section_install = {}
+        self._source_order = 0
         default_items = defaults.get_default_items()
         self.sections = {
             "Version": default_items["Version"],
@@ -198,6 +211,12 @@ class LASFile(object):
         """
         logger.debug("Reading {}...".format(str(file_ref)))
 
+        # Reset provenance so reading a second file into the same object
+        # starts a fresh source-order trail rather than merging into it.
+        self.parameter_registry = ParameterRegistry()
+        self._section_install = {}
+        self._source_order = 0
+
         # Determine which lines to ignore:
         if ignore_comments is None:
             ignore_comments = []
@@ -296,7 +315,16 @@ class LASFile(object):
                     elif (
                         section_title[1] == "P" and "_" not in section_title
                     ) or "~Log_Parameter" in section_title:
-                        self.sections["Parameter"] = sct_items
+                        # Repeated ~P sections represent successive handovers
+                        # (e.g. spud vs completion). Merge them so every
+                        # occurrence survives in source order, instead of
+                        # letting the later section overwrite the earlier one.
+                        self._install_header_section(
+                            sct_items,
+                            "Parameter",
+                            section_title,
+                            record_parameters=True,
+                        )
                     # Set any other LAS3.0  sections
                     elif provisional_version == 3.0 and las3_section:
                         self.sections[section_title[1:]] = sct_items
@@ -550,6 +578,92 @@ class LASFile(object):
 
         if len(self.curves) > 0:
             self.index_initial = self.index.copy()
+
+    def _install_header_section(self, section, section_name, section_title,
+                                record_parameters=False):
+        """Install a parsed section, merging it if the name was seen before.
+
+        A later Parameter section (a successive well handover) is appended
+        item by item to the first one so that no occurrence is lost; every
+        item receives source-order provenance.
+        """
+        seen = self._section_install.get(section_name, 0)
+        registry = self.parameter_registry if record_parameters else None
+        if seen == 0:
+            self._source_order = stamp_section(
+                section,
+                section_name,
+                section_title,
+                section_index=0,
+                start_order=self._source_order,
+                registry=registry,
+            )
+            self.sections[section_name] = section
+        else:
+            self._source_order = merge_section_items(
+                self.sections[section_name],
+                section,
+                section_name,
+                section_title,
+                section_index=seen,
+                start_order=self._source_order,
+                registry=registry,
+            )
+        self._section_install[section_name] = seen + 1
+
+    def parameter_occurrences(self, mnemonic):
+        """Return every occurrence of a parameter mnemonic, source order.
+
+        Arguments:
+            mnemonic (str): parameter mnemonic (case-insensitive)
+
+        Returns:
+            list of :class:`lasio.parameter_audit.ParameterOccurrence`
+        """
+        return self.parameter_registry.for_mnemonic(mnemonic)
+
+    def parameter_timeline(self, mnemonic=None):
+        """Return parameter occurrences in source order, optionally filtered."""
+        return self.parameter_registry.timeline(mnemonic)
+
+    def parameter_changes(self, mnemonic=None):
+        """Classify adjacent repeats as corrections or equivalent restatements.
+
+        Returns a list of dicts, one per adjacent pair of occurrences, each
+        with a ``classification`` of ``parameter_correction``,
+        ``equivalent_restatement`` or ``equivalent_restatement_unit_change``
+        and a human-readable ``basis`` including the unit conversion used.
+        """
+        return self.parameter_registry.diff(mnemonic)
+
+    def parameter_applicable_at(self, mnemonic, depth, depth_unit=None,
+                                fallback="raise"):
+        """Look up the parameter value applicable to a curve sample depth.
+
+        Arguments:
+            mnemonic (str): parameter to look up
+            depth (float): index value (depth/time) of the curve sample
+            depth_unit (str): unit of *depth*, needed when the parameter
+                occurrences declare depth ranges in another unit
+            fallback (str): ``"raise"`` (default) raises
+                :class:`lasio.LASParameterHandoffError` when the applicable
+                handover cannot be proven; ``"last"`` returns the final
+                occurrence instead, marked as an unverified fallback.
+
+        Returns:
+            lasio.parameter_audit.ParameterLookup: the chosen occurrence
+            plus a ``basis`` string explaining the decision, or - when the
+            error is raised - the exception's ``missing`` attribute states
+            exactly which handover/declaration is absent.
+        """
+        if depth_unit is None and self.index_unit is not None:
+            depth_unit = self.index_unit
+        return self.parameter_registry.applicable_at(
+            mnemonic,
+            depth,
+            depth_unit=depth_unit,
+            fallback=fallback,
+        )
 
     def update_start_stop_step(self, STRT=None, STOP=None, STEP=None, fmt="%.5f"):
         """Configure or change STRT, STOP, and STEP values on the LASFile object.

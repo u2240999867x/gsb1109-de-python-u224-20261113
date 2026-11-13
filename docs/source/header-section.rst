@@ -617,3 +617,103 @@ preserve the original formatting if that is what you prefer.
      CurveItem(mnemonic="SfLu", unit="OHMM", value="", descr="8  DEEP RESISTIVITY", original_mnemonic="SfLu", data.shape=(3,))
     ]
 
+Parameters repeated across handovers
+------------------------------------
+
+A well can be delivered more than once - for example an opening/spud LAS
+followed by a completion LAS - and the two deliveries can each contain a
+``~P`` section with the same parameter mnemonics. The later section might
+actually correct a value, or it might only restate the same value after
+changing the display unit (e.g. ``100 PSI`` versus ``689.48 KPA``). Assigning
+the sections into one dictionary would keep only the last value for each
+name, so lasio instead merges repeated ``~P`` sections and keeps every
+occurrence in source order.
+
+.. code-block:: python
+
+    >>> las = lasio.read('tests/examples/handoff_duplicate_params.las')
+    >>> las.params.keys()
+    ['BHT:1', 'PRE:1', 'PRE:2', 'FD:1', 'RMR:1', 'BHT:2', 'PRE:3', 'FD:2', 'RMR:2']
+
+Each item carries provenance attributes (``source_section_index``,
+``source_order``, ``source_line_no``), and every parameter occurrence is
+also available through a dedicated registry. Batch/segment/depth hints are
+parsed from the item description, falling back to the section's comment
+lines (``# ...``) and its title, so a handover note written as a comment
+above the section is not lost:
+
+.. code-block:: python
+
+    >>> for occurrence in las.parameter_occurrences('PRE'):
+    ...     print(occurrence.source_section_index, occurrence.value, occurrence.unit, occurrence.segment)
+    0 100.0 PSI A
+    0 110.0 PSI B
+    1 120.0 PSI None
+
+``SectionItems.find_all`` gives the same list of repeated items directly,
+instead of the first match returned by ordinary item access:
+
+.. code-block:: python
+
+    >>> [item.value for item in las.params.find_all('PRE')]
+    [100.0, 110.0, 120.0]
+
+Correction versus equivalent restatement
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``parameter_changes`` compares adjacent occurrences of each mnemonic. When
+the units differ, the earlier value is converted using the explicit table in
+:mod:`lasio.parameter_audit` (only documented, verifiable conversions are
+used; an unknown unit pair raises :class:`lasio.LASUnknownUnitError`).
+
+.. code-block:: python
+
+    >>> for change in las.parameter_changes('FD'):
+    ...     print(change['classification'], '-', change['basis'])
+    equivalent_restatement_unit_change - value unchanged after verified conversion (K/M3 -> G/CM3, multiply by 0.001 ...)
+
+A value that still differs after conversion is classified as
+``parameter_correction`` rather than a restatement.
+
+Which parameter applies to a curve sample
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Taking "the last value with the same name" is unsafe when two pressure
+settings from one batch have an unrelated, same-named remark line between
+them. ``parameter_applicable_at`` resolves the occurrence applicable at a
+curve sample depth from the batch/segment/depth hints declared on each
+occurrence, and always returns a ``basis`` explaining the choice:
+
+.. code-block:: python
+
+    >>> lookup = las.parameter_applicable_at('PRE', 1050.0)
+    >>> lookup.occurrence.value
+    100.0
+    >>> lookup.basis  # doctest: +SKIP
+    'depth 1050.0 falls inside interval 1000.0-1120.0 M ...'
+
+If no handover or segment declaration can prove which value applies - a
+depth outside every declared interval, or two settings in the same batch
+with nothing distinguishing them - a
+:class:`lasio.LASParameterHandoffError` is raised. Its ``reason`` and
+``missing`` attributes state exactly which handover or declaration is
+absent, rather than guessing. Pass ``fallback="last"`` to explicitly accept
+the final occurrence; the returned lookup is then flagged
+``lookup.fallback == True``.
+
+When the depth intervals are known from another source but not written into
+the LAS descriptions, they can be supplied programmatically on the
+registry, keyed by the batch/handover key:
+
+.. code-block:: python
+
+    >>> las.parameter_registry.batch_intervals = {
+    ...     '1': (1000.0, 1100.0, 'M'),
+    ...     '2': (1100.0, 1250.0, 'M'),
+    ... }
+    >>> lookup = las.parameter_applicable_at('BHT', 1200.0)
+    >>> lookup.basis  # doctest: +SKIP
+    'depth 1200.0 lies in the externally declared interval of handover ...'
+
+
+

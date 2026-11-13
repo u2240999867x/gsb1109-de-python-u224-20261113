@@ -60,6 +60,16 @@ class HeaderItem(OrderedDict):
         self.descr = descr
         self.data = data
 
+        # Provenance for sections assembled from more than one handover.
+        # They stay None for items created directly or read from a single
+        # section, so existing behaviour is unchanged. The reader fills
+        # them in via lasio.parameter_audit when sections are merged.
+        self.source_order = None
+        self.source_section = None
+        self.source_section_title = None
+        self.source_section_index = None
+        self.source_line_no = None
+
     @property
     def useful_mnemonic(self):
         if self.original_mnemonic.strip() == "":
@@ -311,6 +321,33 @@ class SectionItems(list):
             return super(SectionItems, self).__getitem__(key)
         else:
             raise KeyError("%s not in %s" % (key, self.keys()))
+
+    def find_all(self, mnemonic):
+        """Return every item whose mnemonic matches, in source order.
+
+        Arguments:
+            mnemonic (str): the mnemonic to look for. Both the session
+                mnemonic (which may carry ``:1``/``:2`` suffixes) and the
+                original mnemonic are compared.
+
+        Returns:
+            list: matching HeaderItem/CurveItem objects, in the order in
+            which they appeared in the source file(s). An empty list means
+            the mnemonic is not present.
+
+        This is the accessor to use when a handover can repeat a mnemonic:
+        :meth:`__getitem__` returns only the first match and cannot show
+        whether a later handover corrected or merely restated the value.
+        """
+        results = []
+        for item in self:
+            if self.mnemonic_compare(item.mnemonic, mnemonic):
+                if not any(item is existing for existing in results):
+                    results.append(item)
+            elif self.mnemonic_compare(item.original_mnemonic, mnemonic):
+                if not any(item is existing for existing in results):
+                    results.append(item)
+        return results
 
     def get(self, mnemonic, default="", add=False):
         """Get an item, with a default value for the situation when it is missing.

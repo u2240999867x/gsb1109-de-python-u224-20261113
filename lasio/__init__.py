@@ -58,8 +58,18 @@ add_logging_level("TRACE_LASIO", logging.DEBUG - 5, "trace_lasio")
 
 from .las import JSONEncoder, LASFile
 from .las_items import CurveItem, HeaderItem, SectionItems
+from .parameter_audit import (
+    ParameterLookup,
+    ParameterOccurrence,
+    ParameterRegistry,
+    canonical_unit,
+    convert_value,
+    parse_provenance,
+    values_equivalent,
+)
 from .las_version import version
 from .reader import open_file
+from .exceptions import LASParameterHandoffError, LASUnknownUnitError
 
 __version__ = version()
 
