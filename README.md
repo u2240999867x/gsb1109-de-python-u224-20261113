@@ -20,7 +20,8 @@ Given a SQLite database called `fixtures.db` containing a table `facetable`, the
 ```bash
 sqlite-diffable dump fixtures.db dump/ facetable
 ```
-To dump out every table in that database, use `--all`:
+To dump out every table and view in that database, use `--all` (views are
+stored as schema only):
 ```bash
 sqlite-diffable dump fixtures.db dump/ --all
 ```
@@ -36,12 +37,48 @@ To load a previously dumped database, run the following:
 ```bash
 sqlite-diffable load restored.db dump/
 ```
-This will show an error if any of the tables that are being restored already exist in the database file.
+This will show an error if any of the tables that are being restored already exist in the database file. Tables are restored before views, and views are created in dependency order.
 
 You can replace those tables (dropping them before restoring them) using the `--replace` option:
 ```bash
 sqlite-diffable load restored.db dump/ --replace
 ```
+## Views
+
+Views are dumped as their `CREATE VIEW` statement with a metadata file and no
+`.ndjson` file. The statement is the durable input: restored views keep
+recomputing from their base tables instead of serving a frozen snapshot.
+
+```bash
+# Dump a view plus every table/view it transitively depends on
+sqlite-diffable dump-view fixtures.db dump/ my_view
+
+# Inspect the exact dependency closure, in restore order
+sqlite-diffable view-dependencies dump/ my_view
+
+# Restore only that closure into an empty database
+sqlite-diffable load restored.db dump/ --view my_view
+# Equivalent shorthand:
+sqlite-diffable restore-view restored.db dump/ my_view
+```
+
+`dump --all` also includes views (schemas only). `load` creates the required
+tables first, then views in dependency order, so nested views work. View
+dependencies are discovered using SQLite's own name resolution, with dummy
+scratch tables standing in for missing bases: a CTE alias that happens to share
+a real table's name is correctly treated as the CTE, not as a dependency.
+
+If a required base table is absent from the directory, the command fails with
+the actual reference chain, for example:
+
+```
+Missing database object for view dependency chain: top_view -> middle_view -> short_base
+```
+
+Optional maintenance triggers are never part of a view closure. Pass
+`--triggers` to `dump` to record them and `--triggers` to `load` to apply them;
+a plain `--view` restore leaves them out.
+
 ## Converting to JSON objects
 
 Table rows are stored in the `.ndjson` files as newline-delimited JSON arrays, like this:
