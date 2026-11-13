@@ -5,6 +5,8 @@ import sqlite_utils
 import sqlite3
 import sys
 
+from .verify import render_text, verify_restore
+
 
 @click.group()
 @click.version_option()
@@ -167,3 +169,77 @@ def objects(filepath, output, array):
         out.write("\n]\n")
     else:
         out.write("\n")
+
+
+@cli.command()
+@click.argument(
+    "old_directory",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True),
+)
+@click.argument(
+    "new_directory",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True),
+)
+@click.argument("original_table")
+@click.argument("master_table")
+@click.argument("preference_table")
+@click.option(
+    "--key",
+    "join_keys",
+    multiple=True,
+    required=True,
+    help="Join key column shared by master and preference tables (repeatable)",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit the report as JSON")
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(file_okay=True, allow_dash=True, dir_okay=False),
+)
+def verify(
+    old_directory,
+    new_directory,
+    original_table,
+    master_table,
+    preference_table,
+    join_keys,
+    as_json,
+    output,
+):
+    """
+    Reconnect a split master/preference export and audit it against the
+    original flat export.
+
+    OLD_DIRECTORY holds the original table export (created by `dump`),
+    NEW_DIRECTORY holds the master and preference exports. Rows are
+    compared as multisets, so duplicate keys are never assumed unique.
+
+    Usage:
+
+        sqlite-diffable verify old-export/ new-export/ customers customers_master customers_pref --key customer_id
+
+    Exit code is 1 when rows were lost or extra combinations were
+    generated; reordering alone exits 0.
+    """
+    try:
+        report = verify_restore(
+            old_directory,
+            new_directory,
+            original_table,
+            master_table,
+            preference_table,
+            join_keys,
+        )
+    except (FileNotFoundError, ValueError, json.JSONDecodeError) as ex:
+        raise click.ClickException(str(ex))
+    rendered = (
+        json.dumps(report.to_dict(), ensure_ascii=False, indent=2)
+        if as_json
+        else render_text(report)
+    )
+    if output and output != "-":
+        pathlib.Path(output).write_text(rendered, encoding="utf-8")
+    else:
+        click.echo(rendered, nl=False)
+    if report.status == "mismatch":
+        sys.exit(1)
