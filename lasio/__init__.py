@@ -60,6 +60,7 @@ from .las import JSONEncoder, LASFile
 from .las_items import CurveItem, HeaderItem, SectionItems
 from .las_version import version
 from .reader import open_file
+from .relog import Coverage, Provenance, QueryResult, RelogMerge, merge_relog
 
 __version__ = version()
 
