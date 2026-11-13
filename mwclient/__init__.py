@@ -25,6 +25,7 @@
 
 from mwclient.errors import *  # noqa: F401, F403
 from mwclient.client import Site as Site, __version__ as __version__  # noqa: F401
+from mwclient.provenance import AssetManifest as AssetManifest  # noqa: F401
 import logging
 import warnings
 
