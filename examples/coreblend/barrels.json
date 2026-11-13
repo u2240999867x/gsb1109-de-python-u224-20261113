@@ -1,0 +1,7 @@
+{
+  "barrels": [
+    {"name": "B1", "top": 999.5, "base": 1004.0, "concentration": 12.0, "error": 0.3,
+     "recovered_length": 4.0, "lost_intervals": [[1002.0, 1002.5]]},
+    {"name": "B2", "top": 1004.0, "base": 1012.0, "concentration": 18.0, "error": 0.3}
+  ]
+}
