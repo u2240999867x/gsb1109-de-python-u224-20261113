@@ -166,6 +166,56 @@ Price(amount=Decimal('140.600'), currency='$')
 Price(amount=Decimal('140600'), currency='$')
 
 
+Ambiguous quote totals
+----------------------
+
+A number like ``1.250`` is ambiguous: it may mean ``1.25`` or ``1250``, and
+different suppliers on the same quote may use different conventions.
+``resolve_quote`` takes the line quantities, the raw quoted prices and the
+confirmed grand total, and checks *every* combination of plausible readings.
+A line is only reported as determined when the same reading appears in all
+matching combinations:
+
+>>> from decimal import Decimal
+>>> from price_parser import resolve_quote
+>>> result = resolve_quote(
+...     [(1, "1.250"), (2, "2,500")], Decimal("5001.25")
+... )
+>>> result.is_unique
+True
+>>> result.determined_lines
+(0, 1)
+>>> [reading.unit_price for reading in result.solutions[0].readings]
+[Decimal('1.250'), Decimal('2500')]
+
+When the total does not pin every line down, the remaining lines stay
+ambiguous and their genuinely different readings can be listed:
+
+>>> result = resolve_quote(
+...     [(1, "1.250"), (1, "1.250")], Decimal("1251.25")
+... )
+>>> result.is_unique
+False
+>>> result.ambiguous_lines
+(0, 1)
+>>> [reading.unit_price for reading in result.differing_readings(0)]
+[Decimal('1.250'), Decimal('1250')]
+
+If no combination reproduces the confirmed total, the closest achievable
+totals are returned instead of a forced match:
+
+>>> result = resolve_quote([(1, "1.250")], Decimal("100"))
+>>> result.exact
+False
+>>> result.achieved_totals
+(Decimal('1.25'),)
+
+Line totals and the grand total are computed as ``quantity * price`` and
+rounded to the given ``precision`` (a quantum such as ``Decimal("0.01")`` or
+an integer number of decimal places) using the given ``rounding`` mode,
+which defaults to ``decimal.ROUND_HALF_UP``.
+
+
 Contributing
 ============
 

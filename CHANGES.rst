@@ -1,6 +1,16 @@
 Changes
 =======
 
+0.5.2 (unreleased)
+------------------
+
+* Added ``price_parser.resolve_quote``: it reconciles ambiguous quoted
+  numbers such as ``1.250`` (``1.25`` or ``1250``) against a confirmed grand
+  total, enumerating every plausible per-line reading and reporting which
+  lines are uniquely determined, which stay ambiguous and, when no reading
+  matches, the closest achievable totals. Line and grand totals are rounded
+  to a configurable precision.
+
 0.5.1 (2026-03-19)
 ------------------
 
