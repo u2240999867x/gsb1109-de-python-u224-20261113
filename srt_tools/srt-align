@@ -1,0 +1,175 @@
+#!/usr/bin/env python
+
+"""Align two subtitle tracks into a bilingual table."""
+
+import codecs
+import json
+import logging
+
+import srt_align
+import srt_tools.utils
+
+log = logging.getLogger(__name__)
+
+
+def parse_args():
+    examples = {
+        "Align Chinese and English interview subtitles": (
+            "srt align -i chs.srt -i eng.srt -o aligned.tsv"
+        ),
+        "Use manually confirmed pairs as hard boundaries": (
+            "srt align -i chs.srt -i eng.srt -a anchors.tsv -o aligned.tsv"
+        ),
+        "Emit JSON including unresolved candidate spans": (
+            "srt align -i chs.srt -i eng.srt --format json"
+        ),
+    }
+    parser = srt_tools.utils.basic_parser(
+        description=__doc__, examples=examples, multi_input=True
+    )
+    parser.add_argument(
+        "--format",
+        "-f",
+        default="tsv",
+        choices=("tsv", "csv", "json", "markdown", "md", "html"),
+        help="output format (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--anchors",
+        "-a",
+        metavar="FILE",
+        action="append",
+        default=[],
+        help="file(s) containing manually confirmed source/target pairs "
+        "(one pair per line; .json is also accepted)",
+    )
+    parser.add_argument(
+        "--max-gap",
+        metavar="MILLISECONDS",
+        type=int,
+        default=srt_align.DEFAULT_MAX_GAP_MS,
+        help="maximum gap between adjacent subtitles that may still be "
+        "matched (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--max-group",
+        metavar="N",
+        type=int,
+        default=srt_align.DEFAULT_MAX_GROUP,
+        help="maximum number of subtitles grouped with one subtitle on the "
+        "other side (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--ambiguity-tolerance",
+        metavar="SCORE",
+        type=float,
+        default=srt_align.DEFAULT_AMBIGUITY_TOLERANCE,
+        help="score difference at which two local alignments are considered "
+        "equally plausible (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--no-header",
+        action="store_true",
+        help="omit the header row in delimited output",
+    )
+    parser.add_argument(
+        "--source-header",
+        default="source",
+        help="header for the source column (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--translation-header",
+        default="translation",
+        help="header for the translation column (default: %(default)s)",
+    )
+    return parser.parse_args()
+
+
+def _anchor_from_json_item(item):
+    if isinstance(item, dict):
+        source = item.get("source", item.get("chinese"))
+        target = item.get("translation", item.get("english"))
+        if source is None or target is None:
+            raise srt_align.AlignmentError(
+                "Anchor entry needs both sides: {0!r}".format(item)
+            )
+        if isinstance(source, int) and isinstance(target, int):
+            return (("index", source), ("index", target))
+        return (
+            srt_align.parse_reference(str(source)),
+            srt_align.parse_reference(str(target)),
+        )
+
+    if isinstance(item, (list, tuple)) and len(item) == 2:
+        return (
+            srt_align.parse_reference(str(item[0])),
+            srt_align.parse_reference(str(item[1])),
+        )
+
+    raise srt_align.AlignmentError(
+        "Unsupported anchor entry: {0!r}".format(item)
+    )
+
+
+def read_anchors(anchor_files, encoding):
+    anchors = []
+    for anchor_file in anchor_files:
+        if anchor_file.lower().endswith(".json"):
+            with codecs.open(anchor_file, "r", encoding=encoding) as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                data = data.get("anchors", [])
+            if not isinstance(data, (list, tuple)):
+                raise srt_align.AlignmentError(
+                    "{0}: expected a list of anchors".format(anchor_file)
+                )
+            for item in data:
+                anchors.append(_anchor_from_json_item(item))
+        else:
+            anchors.extend(srt_align.load_anchors(anchor_file, encoding))
+    return anchors
+
+
+def main():
+    args = parse_args()
+    logging.basicConfig(level=args.log_level)
+    srt_tools.utils.set_basic_args(args)
+
+    if len(args.input) != 2:
+        raise SystemExit(
+            "Please provide exactly two inputs: the source subtitle and the "
+            "translation subtitle (use -i twice, or use - for stdin)"
+        )
+
+    source_stream, translation_stream = args.input
+    source_subs = list(source_stream)
+    translation_subs = list(translation_stream)
+
+    encoding = args.encoding or "utf-8-sig"
+    anchors = read_anchors(args.anchors, encoding)
+
+    alignment = srt_align.align_subtitles(
+        source_subs,
+        translation_subs,
+        anchors=anchors,
+        max_gap_ms=args.max_gap,
+        max_group=args.max_group,
+        ambiguity_tolerance=args.ambiguity_tolerance,
+    )
+
+    table_format = "markdown" if args.format == "md" else args.format
+    output = alignment.render(
+        format=table_format,
+        header=not args.no_header,
+        source_header=args.source_header,
+        translation_header=args.translation_header,
+    )
+
+    try:
+        args.output.write(output)
+    except (UnicodeEncodeError, TypeError):  # Python 2 fallback
+        args.output.write(output.encode(args.encoding))
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()

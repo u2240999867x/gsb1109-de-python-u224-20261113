@@ -115,3 +115,38 @@ def test_tools_support():
 
     for args in matrix:
         assert_supports_all_io_methods(*args)
+
+
+def test_srt_align_supports_io_methods():
+    """srt-align needs two inputs, so it has its own IO matrix."""
+    cmd = ["srt_tools/srt-align"]
+    in_file = os.path.join(sample_dir, "ascii.srt")
+    second_file = os.path.join(sample_dir, "ascii.srt")
+    fd, out_file = tempfile.mkstemp()
+    os.close(fd)
+
+    try:
+        cmd_string = " ".join(
+            quote(x)
+            for x in [sys.executable] + cmd + ["-i", in_file, "-i", second_file]
+        )
+        direct = run_srt_util(
+            [sys.executable] + cmd + ["-i", in_file, "-i", second_file]
+        )
+        piped = run_srt_util(cmd_string, shell=True)
+        run_srt_util(
+            [sys.executable]
+            + cmd
+            + ["-i", in_file, "-i", second_file, "-o", out_file]
+        )
+        assert direct == piped
+
+        with open(out_file, "r", encoding="utf-8-sig") as f:
+            assert f.read() == direct
+
+        if os.name == "nt":
+            assert "\r\n" in direct
+        else:
+            assert "\r\n" not in direct
+    finally:
+        os.remove(out_file)

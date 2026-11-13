@@ -100,6 +100,26 @@ See the srt_tools/ directory for more information.
 
 .. _hanzidentifier: https://github.com/tsroten/hanzidentifier
 
+Aligning two subtitle tracks
+----------------------------
+
+The ``srt align`` tool and the ``srt_align`` module build a bilingual table
+from tracks that were segmented independently. One subtitle often maps to two
+or more consecutive subtitles on the other side, and rows with no counterpart
+are retained. Alignment happens between manually confirmed pairs, which act as
+hard boundaries, and genuinely tied local layouts are reported as candidates
+rather than silently guessed:
+
+.. code:: python
+
+    >>> import srt, srt_align
+    >>> chs = srt.parse(open("chs.srt").read())
+    >>> eng = srt.parse(open("eng.srt").read())
+    >>> alignment = srt_align.align_subtitles(chs, eng)
+    >>> print(alignment.render("tsv"))
+
+See ``srt_tools/README.rst`` for anchor file syntax and output formats.
+
 Library
 =======
 

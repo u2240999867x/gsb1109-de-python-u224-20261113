@@ -26,6 +26,14 @@ example:
 Utilities
 ---------
 
+- *align* builds a bilingual table from two subtitle tracks. This is useful
+  for interviews and other material where the two languages were segmented
+  independently: one subtitle on one side will often correspond to several
+  consecutive subtitles on the other. Rows with no counterpart are kept, and
+  manually confirmed pairs can be supplied as hard boundaries. If a small span
+  has two equally plausible layouts, it is marked as a candidate for an editor
+  to check while the rest of the table is still produced normally. See
+  `Aligning two subtitle tracks`_ below.
 - *deduplicate* removes subtitles with duplicate content. If you have subtitles
   which mistakenly repeat the same content in different subs at roughly the
   same time, you can run this tool to remove them.
@@ -62,3 +70,51 @@ Utilities
 .. _mux: https://en.wikipedia.org/wiki/Multiplexing
 .. _`SSA/ASS`: https://en.wikipedia.org/wiki/SubStation_Alpha
 .. _hanzidentifier: https://github.com/tsroten/hanzidentifier
+
+
+Aligning two subtitle tracks
+----------------------------
+
+*srt align* takes two SRT files and writes one table. The default TSV has
+``index``, ``start``, ``end``, ``source``, ``translation``, ``status`` and
+``candidates`` columns. ``source`` is the first ``-i`` file and
+``translation`` is the second.
+
+.. code::
+
+    $ srt align -i chs.srt -i eng.srt -o aligned.tsv
+
+A row can contain several subtitles from either side, joined by newlines. A
+row with ``status`` of ``untranslated`` has source text but no translation;
+``no_source`` is the reverse. Both are normal and are preserved rather than
+dropped.
+
+Manually confirmed pairs are hard boundaries. Anything before an anchor is
+aligned only with things before the corresponding anchor on the other side,
+and the anchor pair itself is emitted as one row. Supply them with ``-a``::
+
+    # One pair per line: source reference <TAB> translation reference
+    $ cat anchors.tsv
+    source	translation
+    #1	#1
+    @12	@12
+    01:23:45,000	01:23:46,200
+
+References can be an SRT index (``#12`` or a bare ``12``), a one-based subtitle
+position (``@12``), or a timestamp. ``.json`` anchor files containing a list of
+pairs or ``{"source": ..., "translation": ...}`` objects are also accepted.
+
+When a small span has two layouts that score equally well (for example, whether
+the second English subtitle belongs with the first or second Chinese subtitle),
+the affected rows have ``status`` ``candidate``. The ``candidates`` column
+contains the competing layouts, each with its own rows, so an editor can pick
+one. Alignment on either side of that span is unaffected. JSON output includes
+the same information in structured form:
+
+.. code::
+
+    $ srt align -i chs.srt -i eng.srt -f json
+
+Use ``--max-gap``, ``--max-group`` and ``--ambiguity-tolerance`` to tune how
+readily adjacent subtitles are matched and how close two layouts must be before
+they are handed to an editor.
