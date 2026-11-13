@@ -44,7 +44,15 @@ RGX_PROPRIETARY = r"[^\r\n]*"
 RGX_CONTENT = r".*?"
 RGX_POSSIBLE_CRLF = r"\r?\n"
 
+# The default speaker marker rule. A content line is considered to carry a
+# speaker name when it is shaped like "Name: text" (a half or full width
+# colon is accepted). The name may not itself contain a colon or start with
+# whitespace. Sources with a different marker rule can pass their own
+# compiled pattern to split_speaker_tracks.
+RGX_SPEAKER_PREFIX = r"^([^:\s：][^:：]*?)\s*[:：]\s*(.*)$"
+
 TS_REGEX = re.compile(RGX_TIMESTAMP_PARSEABLE)
+SPEAKER_PREFIX_REGEX = re.compile(RGX_SPEAKER_PREFIX)
 MULTI_WS_REGEX = re.compile(r"\n\n+")
 SRT_REGEX = re.compile(
     r"\s*(?:({idx})\s*{eof})?({ts}) *-[ -] *> *({ts}) ?({proprietary})(?:{eof}|\Z)({content})"
@@ -474,6 +482,292 @@ def compose(
         )
 
     return "".join(subtitle.to_srt(strict=strict, eol=eol) for subtitle in subtitles)
+
+
+def parse_speaker_line(line, marker_regex=SPEAKER_PREFIX_REGEX):
+    """
+    Split a single content line into ``(speaker, text)`` when the line carries
+    a speaker marker, otherwise return ``(None, line)``.
+
+    The default marker rule matches lines shaped like ``"Alice: hello"``
+    (a half or full width colon is accepted). A different rule from the
+    source data can be supplied as a compiled pattern whose first group is
+    the displayed speaker name and whose second group is the spoken text.
+
+    :param str line: One line of subtitle content (no line separator)
+    :param marker_regex: A compiled regex describing the marker rule
+    :returns: ``(speaker name, spoken text)`` or ``(None, original line)``
+    :rtype: tuple
+    """
+    match = marker_regex.match(line)
+    if match is None:
+        return None, line
+    return match.group(1), match.group(2)
+
+
+class SpeakerAliasTable(object):
+    """
+    Map display names that change over time back to a canonical speaker.
+
+    An alias has an optional validity window, expressed in subtitle time. A
+    window is a half-open interval: an alias applies at time ``t`` when
+    ``start <= t < end``. A window edge of ``None`` means unbounded. When
+    several entries match the same name at the same time, the entry added
+    last wins.
+
+    Alias entries are accepted as three-tuples
+    ``(canonical, display_name, window)`` or two-tuples
+    ``(canonical, display_name)`` for an alias that is always valid. The
+    window itself may be a two-tuple ``(start, end)`` of
+    :py:class:`~datetime.timedelta` (either may be ``None``).
+    """
+
+    def __init__(self, aliases=()):
+        # Most recently added entries take precedence, hence reversed order.
+        self._aliases = []
+        for entry in aliases:
+            self.add_alias(*entry)
+
+    @staticmethod
+    def _normalise_window(window):
+        if window is None:
+            return None, None
+        start, end = window
+        if start is not None and end is not None and start > end:
+            raise ValueError(
+                "Alias window start (%r) is after its end (%r)" % (start, end)
+            )
+        return start, end
+
+    def add_alias(self, canonical, display_name, window=None):
+        """
+        Record that ``display_name`` refers to ``canonical`` while ``window``
+        is in effect.
+
+        :param str canonical: The canonical speaker identifier
+        :param str display_name: The name as shown on a subtitle line
+        :param window: ``(start, end)`` timedeltas, either may be ``None``
+        :returns: This table, so calls can be chained
+        :rtype: SpeakerAliasTable
+        """
+        start, end = self._normalise_window(window)
+        self._aliases.append((canonical, display_name, start, end))
+        return self
+
+    def resolve(self, display_name, at):
+        """
+        Return the canonical speaker for ``display_name`` at time ``at``.
+
+        :param str display_name: The name shown on a subtitle line
+        :param datetime.timedelta at: The subtitle time used to pick a window
+        :returns: The canonical name, or the display name itself when no
+                  alias matches
+        :rtype: str
+        """
+        for canonical, alias_name, start, end in reversed(self._aliases):
+            if alias_name != display_name:
+                continue
+            if start is not None and at < start:
+                continue
+            if end is not None and at >= end:
+                continue
+            return canonical
+        return display_name
+
+    def __len__(self):
+        return len(self._aliases)
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, SpeakerAliasTable)
+            and self._aliases == other._aliases
+        )
+
+
+class SpeakerTracks(object):
+    """
+    The independent speaker tracks produced by
+    :py:func:`split_speaker_tracks`.
+
+    ``tracks`` maps each canonical speaker to the
+    :py:class:`Subtitle` objects attributed to that speaker, in the order in
+    which they appeared in the source SRT. ``unattributed`` holds the
+    subtitles which could not be attributed to any speaker, also in source
+    order. Every value is a list, so any moment in time can be rebuilt by
+    filtering on start/end time.
+
+    ``sequence`` records every produced fragment as
+    ``(speaker_or_None, Subtitle)`` pairs in exact source order, including
+    fragments that share a timestamp. It is what :py:meth:`active_at` uses so
+    that interleaved or repeated lines keep their original ordering.
+    """
+
+    def __init__(self, tracks=None, unattributed=None, sequence=None):
+        self.tracks = tracks if tracks is not None else {}
+        self.unattributed = unattributed if unattributed is not None else []
+        self.sequence = sequence if sequence is not None else []
+
+    def speakers(self):
+        """
+        :returns: The canonical speakers that own a track, in first-appearance
+                  order
+        :rtype: list
+        """
+        return list(self.tracks)
+
+    def active_at(self, when):
+        """
+        Rebuild the list of utterances on screen at a given time.
+
+        Both attributed tracks and unattributed fragments are considered.
+        Results stay in source appearance order, matching the order in which
+        the lines occurred in the original SRT, including several speakers
+        sharing one timestamp.
+
+        :param datetime.timedelta when: The time to inspect
+        :returns: ``(speaker, Subtitle)`` pairs active at ``when``; speaker
+                  is ``None`` for unattributed fragments
+        :rtype: list
+        """
+        return [
+            (speaker, subtitle)
+            for speaker, subtitle in self.sequence
+            if subtitle.start <= when < subtitle.end
+        ]
+
+    def compose_track(self, speaker, **compose_kwargs):
+        """
+        Compose one speaker's track back to an SRT string.
+
+        :param str speaker: The canonical speaker whose track is wanted
+        :param compose_kwargs: Passed through to :py:func:`compose`
+        :returns: The track as an SRT string
+        :rtype: str
+        """
+        return compose(list(self.tracks[speaker]), reindex=False, **compose_kwargs)
+
+    def compose_unattributed(self, **compose_kwargs):
+        """
+        Compose the unattributed fragments back to an SRT string.
+
+        :param compose_kwargs: Passed through to :py:func:`compose`
+        :returns: The unattributed fragments as an SRT string
+        :rtype: str
+        """
+        return compose(list(self.unattributed), reindex=False, **compose_kwargs)
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, SpeakerTracks)
+            and self.tracks == other.tracks
+            and self.unattributed == other.unattributed
+            and self.sequence == other.sequence
+        )
+
+    def __repr__(self):
+        return "SpeakerTracks(tracks=%r, unattributed=%r)" % (
+            self.tracks,
+            self.unattributed,
+        )
+
+
+def _fragments_for_subtitle(subtitle, marker_regex, aliases):
+    """
+    Split one subtitle's content into ordered attributed/unattributed
+    fragments. Each fragment is ``(speaker_or_None, content)``. Consecutive
+    unmarked lines are merged into one fragment, preserving every source
+    line as a newline inside the fragment content.
+    """
+    fragments = []
+    current_speaker = None
+    current_lines = []
+
+    def flush():
+        if current_lines:
+            fragments.append((current_speaker, "\n".join(current_lines)))
+            current_lines[:] = []
+
+    for line in subtitle.content.split("\n"):
+        speaker, text = parse_speaker_line(line, marker_regex)
+        if speaker is None:
+            # A continuation line: before any marker it stays unattributed,
+            # afterwards it belongs to the most recently named speaker.
+            current_lines.append(line)
+            continue
+
+        flush()
+        current_speaker = (
+            aliases.resolve(speaker, subtitle.start) if aliases else speaker
+        )
+        current_lines = [text]
+
+    flush()
+    return fragments
+
+
+def split_speaker_tracks(
+    subtitles,
+    aliases=None,
+    marker_regex=SPEAKER_PREFIX_REGEX,
+    reindex=True,
+):
+    r"""
+    Split a mixed SRT into one independent track per speaker.
+
+    Each content line is examined with the source's speaker marker rule.
+    Lines like ``"Alice: hello"`` are attributed to Alice, while plain
+    continuation lines are attached to the most recently named speaker in
+    the same subtitle. A subtitle in which two marked lines name different
+    speakers is split into several subtitles sharing the original timing.
+    Lines that cannot be attributed to anyone are kept, unchanged, in their
+    original position on the ``unattributed`` track.
+
+    Display names that changed over time are mapped back to a canonical
+    speaker with ``aliases`` (see :py:class:`SpeakerAliasTable`).
+
+    The total number of output lines, and their order, match the input:
+    each source line survives exactly once (newlines inside a fragment
+    included), and :py:meth:`SpeakerTracks.active_at` reproduces the
+    original utterance order, including repeated and interleaved lines.
+
+    :param subtitles: :py:class:`Subtitle` objects, typically from
+                      :py:func:`parse`
+    :param SpeakerAliasTable aliases: Time-bounded display name mappings
+    :param marker_regex: Compiled regex for the source's marker rule; its
+                         first group is the name and second group the text
+    :param bool reindex: Whether to renumber each track from 1, preserving
+                         source order within the track
+    :returns: The separated speaker tracks
+    :rtype: SpeakerTracks
+    """
+    tracks = SpeakerTracks()
+    track_indexes = {}
+
+    def store(speaker, fragment):
+        tracks.sequence.append((speaker, fragment))
+        if speaker is None:
+            tracks.unattributed.append(fragment)
+            return
+        track = tracks.tracks.setdefault(speaker, [])
+        if reindex:
+            track_indexes[speaker] = track_indexes.get(speaker, 0) + 1
+            fragment.index = track_indexes[speaker]
+        track.append(fragment)
+
+    for subtitle in subtitles:
+        for speaker, content in _fragments_for_subtitle(
+            subtitle, marker_regex, aliases
+        ):
+            fragment = Subtitle(
+                index=subtitle.index,
+                start=subtitle.start,
+                end=subtitle.end,
+                content=content,
+                proprietary=subtitle.proprietary,
+            )
+            store(speaker, fragment)
+
+    return tracks
 
 
 class SRTParseError(Exception):
