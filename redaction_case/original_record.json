@@ -1,0 +1,18 @@
+{
+  "order_id": "ORD-104282",
+  "customer": {
+    "name": "Alicia Zhang (Hangzhou Brightwell Trading Co.)",
+    "email": "alicia.zhang@brightwell-hz.cn",
+    "tax_id": "91330100MA27XU4E9Q"
+  },
+  "confirm_email": "alicia.zhang@brightwell-hz.cn",
+  "currency": "CNY",
+  "items": [
+    {"sku": "AB1024", "quantity": 3, "unit_price": 499.0},
+    {"sku": "CD2048", "quantity": 2, "unit_price": 1299.5}
+  ],
+  "summary": {
+    "total_quantity": 6,
+    "total_amount": 4096.0
+  }
+}

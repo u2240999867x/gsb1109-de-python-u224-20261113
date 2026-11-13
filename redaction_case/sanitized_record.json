@@ -1,0 +1,18 @@
+{
+  "order_id": "ORD-104282",
+  "customer": {
+    "name": "REDACTED-CUSTOMER",
+    "email": "redacted@example.com",
+    "tax_id": "XX00000000"
+  },
+  "confirm_email": "redacted@example.com",
+  "currency": "CNY",
+  "items": [
+    {"sku": "AB1024", "quantity": 3, "unit_price": 499.0},
+    {"sku": "CD2048", "quantity": 2, "unit_price": 1299.5}
+  ],
+  "summary": {
+    "total_quantity": 6,
+    "total_amount": 4096.0
+  }
+}
