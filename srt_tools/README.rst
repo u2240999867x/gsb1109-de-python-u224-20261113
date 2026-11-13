@@ -58,6 +58,18 @@ Utilities
   ``srt process -m re -f 'lambda sub: re.sub("<[^<]+?>", "", sub)'``. HTML-like
   syntax is especially prevalant in `SSA/ASS`_ subtitles that have been
   directly converted to SRT.
+- *sync-diagnose* compares two explanations for old-print vs. remastered-print
+  subtitle drift from a set of confirmed line-up points (each with a
+  measurement tolerance): one constant play speed over the whole film, or a
+  constant speed interrupted by mid-roll insertions.  Given the archivist's
+  allowed speed range and insertion count it prints every correction range
+  consistent with the points, and when both explanations fit it lists the
+  subtitles that each one would place at a different time.  Anchor files use
+  one ``old remastered tolerance [label]`` line per point; times may be
+  seconds or SRT timestamps, tolerance is in milliseconds::
+
+      $ srt sync-diagnose -a anchors.tsv --speed-low 0.97 --speed-high 1.03 \
+          --max-inserts 2 --min-insert-ms 1000 -s old_print.srt
 
 .. _mux: https://en.wikipedia.org/wiki/Multiplexing
 .. _`SSA/ASS`: https://en.wikipedia.org/wiki/SubStation_Alpha

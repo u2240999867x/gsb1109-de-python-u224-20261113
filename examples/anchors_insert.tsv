@@ -1,0 +1,10 @@
+# Mid-roll insertion: same play speed, an 8000 ms segment inserted after 150 s.
+# Columns: old_time(s)  remastered_time(s)  tolerance(ms)  label
+30   30.00   150   pre-1
+60   60.00   150   pre-2
+90   90.00   150   pre-3
+120  120.00  150  pre-4
+180  188.00  150  post-1
+210  218.00  150  post-2
+240  248.00  150  post-3
+270  278.00  150  post-4

@@ -1,0 +1,282 @@
+#!/usr/bin/env python
+
+"""Diagnose uniform-speed drift vs. mid-roll insertions from line-up points.
+
+Reads confirmed old-print/remastered line-up points (anchor points), each
+with its measurement tolerance, and reports every correction range that is
+consistent with them under two models: a single constant play speed, or a
+constant speed interrupted by one or more inserted segments.  When both
+explanations fit, it reports the subtitles that each one would place at a
+different time.
+"""
+
+from __future__ import division
+
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+
+import srt  # noqa: E402
+import syncfit  # noqa: E402
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--anchors",
+        "-a",
+        required=True,
+        help=(
+            "line-up points file: each line 'old remastered tolerance "
+            "[label]', times in seconds or SRT timestamps, tolerance in ms; "
+            "use - for stdin"
+        ),
+    )
+    parser.add_argument(
+        "--speed-low",
+        type=float,
+        required=True,
+        help="lowest allowed remastered/old play-speed ratio",
+    )
+    parser.add_argument(
+        "--speed-high",
+        type=float,
+        required=True,
+        help="highest allowed remastered/old play-speed ratio",
+    )
+    parser.add_argument(
+        "--max-inserts",
+        "-n",
+        type=int,
+        required=True,
+        help="maximum number of mid-roll insertions the archivist allows",
+    )
+    parser.add_argument(
+        "--min-insert-ms",
+        "-m",
+        type=float,
+        default=0.0,
+        help=(
+            "minimum insertion length in milliseconds that counts as a real "
+            "insertion rather than measurement noise (default: 0)"
+        ),
+    )
+    parser.add_argument(
+        "--subtitles",
+        "-s",
+        help="optional old-print SRT whose diverging lines are listed",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="emit machine-readable JSON instead of a text report",
+    )
+    return parser.parse_args()
+
+
+def read_anchor_file(path):
+    if path == "-":
+        lines = sys.stdin.read().splitlines()
+    else:
+        with open(path, encoding="utf-8-sig") as anchor_file:
+            lines = anchor_file.read().splitlines()
+    return syncfit.parse_anchor_lines(lines)
+
+
+def read_subtitle_points(path):
+    if not path:
+        return None
+    with open(path, encoding="utf-8-sig") as subtitle_file:
+        subtitles = srt.parse(subtitle_file.read())
+    return [
+        (
+            subtitle.start.total_seconds() * 1000.0,
+            "#%d %s" % (subtitle.index, subtitle.content.splitlines()[0]),
+        )
+        for subtitle in subtitles
+    ]
+
+
+def fmt_ms(value):
+    sign = "-" if value < 0 else ""
+    value = abs(value)
+    minutes, remainder = divmod(int(round(value)), 60000)
+    seconds, milliseconds = divmod(remainder, 1000)
+    hours, minutes = divmod(minutes, 60)
+    return "%s%02d:%02d:%02d,%03d" % (
+        sign, hours, minutes, seconds, milliseconds
+    )
+
+
+def fmt_range(bounds):
+    return "%s .. %s" % (fmt_ms(bounds[0]), fmt_ms(bounds[1]))
+
+
+def result_to_dict(result):
+    return {
+        "kind": result.kind,
+        "slope_range": list(result.slope_range),
+        "intercept_range_ms": list(result.intercept_range),
+        "inserts": [
+            {
+                "position_ms": position,
+                "position": fmt_ms(position),
+                "duration_range_ms": list(duration_range),
+                "duration_range": fmt_range(duration_range),
+            }
+            for position, duration_range in result.inserts
+        ],
+        "optional_gaps": [
+            {"position_ms": position, "max_duration_ms": max_duration}
+            for position, max_duration in result.optional_gaps
+        ],
+    }
+
+
+def print_text_report(summary, subtitle_points):
+    linear = summary["linear"]
+    explanations = summary["explanations"]
+    insertion_models = summary["insertion_models"]
+
+    print("Anchor points: %d" % len(linear.anchors))
+    print("Allowed speed ratio: %.6f .. %.6f" % summary["speed_limits"])
+    print("")
+
+    print("== Uniform-speed correction ==")
+    if linear.feasible:
+        print("FEASIBLE")
+        print("  speed ratio (remastered/old): %.6f .. %.6f" % (
+            linear.slope_range
+        ))
+        print("  fixed offset: %s" % fmt_range(linear.intercept_range))
+    else:
+        print("INFEASIBLE: no single speed fits every anchor")
+    print("")
+
+    print("== Insertion-based corrections ==")
+    if not explanations:
+        print("INFEASIBLE within the allowed insert count")
+    for result in explanations:
+        if not result.inserts:
+            print("  [no required insertion - equivalent to speed-only]")
+            continue
+        detail = "; ".join(
+            "jump at %s, added length %s"
+            % (fmt_ms(position), fmt_range(duration_range))
+            for position, duration_range in result.inserts
+        )
+        print("  %s" % detail)
+        print("    speed ratio: %.6f .. %.6f" % result.slope_range)
+    print("")
+
+    if summary["ambiguous"]:
+        print("VERDICT: AMBIGUOUS - both explanations pass the anchors")
+    elif insertion_models:
+        print("VERDICT: INSERTION REQUIRED - a uniform speed cannot fit")
+    elif linear.feasible:
+        print("VERDICT: UNIFORM SPEED - no insertion is needed")
+    else:
+        print("VERDICT: NO MODEL FITS - loosen tolerance or speed range")
+    print("")
+
+    blocks = summary["divergence_blocks"]
+    if not blocks:
+        return
+    print("== Subtitles sent to different positions ==")
+    for model, rows in blocks:
+        sites = ", ".join(
+            "jump at %s (extra %s)"
+            % (fmt_ms(position), fmt_range(duration_range))
+            for position, duration_range in model.inserts
+        )
+        print("If the insertion explanation is real: %s" % sites)
+        print(
+            "  %-28s %-16s %-16s %s"
+            % ("subtitle", "old start", "speed-only", "insertion extra shift")
+        )
+        for label, old_time, linear_interval, piece_interval, extra in rows:
+            speed_only = (
+                fmt_range(linear_interval)
+                if linear_interval is not None
+                else "n/a"
+            )
+            print(
+                "  %-28s %-16s %-16s %s"
+                % (
+                    label[:28],
+                    fmt_ms(old_time),
+                    speed_only,
+                    fmt_range(extra),
+                )
+            )
+        print("")
+
+
+def main():
+    args = parse_args()
+    if args.speed_low <= 0 or args.speed_high < args.speed_low:
+        raise SystemExit("invalid --speed-low/--speed-high range")
+    if args.max_inserts < 0:
+        raise SystemExit("--max-inserts must be non-negative")
+
+    try:
+        anchors = read_anchor_file(args.anchors)
+        subtitle_points = read_subtitle_points(args.subtitles)
+    except (ValueError, OSError) as error:
+        raise SystemExit("could not read inputs: %s" % error)
+    slope_limits = (args.speed_low, args.speed_high)
+
+    summary = syncfit.diagnose(
+        anchors,
+        slope_limits,
+        args.max_inserts,
+        subtitle_points,
+        args.min_insert_ms,
+    )
+    summary["speed_limits"] = slope_limits
+    summary["min_insert_ms"] = args.min_insert_ms
+
+    if args.json:
+        payload = {
+            "n_anchors": len(anchors),
+            "speed_limits": list(slope_limits),
+            "min_insert_ms": args.min_insert_ms,
+            "ambiguous": summary["ambiguous"],
+            "linear": result_to_dict(summary["linear"])
+            if summary["linear"].feasible
+            else None,
+            "explanations": [
+                result_to_dict(result)
+                for result in summary["explanations"]
+                if result.inserts
+            ],
+            "divergence_blocks": [
+                {
+                    "model": result_to_dict(model),
+                    "affected": [
+                        {
+                            "label": label,
+                            "old_time_ms": old_time,
+                            "speed_only_interval_ms": linear_interval,
+                            "insertion_interval_ms": piece_interval,
+                            "extra_shift_ms": list(extra),
+                        }
+                        for label, old_time, linear_interval,
+                        piece_interval, extra in rows
+                    ],
+                }
+                for model, rows in summary["divergence_blocks"]
+            ],
+        }
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print_text_report(summary, subtitle_points)
+
+
+if __name__ == "__main__":
+    main()

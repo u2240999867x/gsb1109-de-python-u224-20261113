@@ -1,0 +1,10 @@
+# Uniform-speed drift: remastered = 1.02 * old, plus a 1500 ms offset.
+# Columns: old_time(s)  remastered_time(s)  tolerance(ms)  label
+60   62.70   200   opening-line
+120  123.90  200   scene-1
+180  185.10  200   scene-2
+240  246.30  200   midpoint
+300  307.50  200   scene-4
+360  368.70  200   scene-5
+420  429.90  200   scene-6
+480  491.10  200   closing-line
