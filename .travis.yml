@@ -1,0 +1,20 @@
+language: python
+python:
+    - "3.5"
+    - "3.6"
+    - "3.7"
+    - "3.8"
+before_install:
+  - pip install -U pip
+  - pip install -U pytest
+install:
+  - pip install --editable ".[all]"
+  - pip install pytest>=3.6 pytest-cov coverage pathlib
+script:
+    - pytest
+notifications:
+  email:
+    recipients:
+      - kinverarity@hotmail.com
+    on_success: change
+    on_failure: change

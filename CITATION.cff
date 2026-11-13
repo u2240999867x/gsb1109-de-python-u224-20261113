@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: Please cite this software using these metadata.
+title: Lasio
+abstract: Read and write Log ASCII Standard files with Python.
+authors:
+  - family-names: Inverarity
+    given-names: Kent
+    orcid: https://orcid.org/0000-0002-5902-2007
+  - name: "Lasio contributors"
+    website: "https://lasio.readthedocs.io/en/latest/contributing.html"
+repository-code: "https://github.com/kinverarity1/lasio"
+version: 0.32
+url: https://github.com/kinverarity1/lasio/releases/tag/v0.31
+commit: 357cec616fbcc7d47b5a77ea4087433b6e52acdc
+date-released: 2023-05-18
+license: MIT
+type: software
+

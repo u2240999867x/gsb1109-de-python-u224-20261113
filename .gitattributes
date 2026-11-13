@@ -1,0 +1,2 @@
+tests/examples/* linguist-vendored
+*.las -linguist-detectable
