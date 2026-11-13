@@ -189,6 +189,16 @@ Standard MIDI Files
 
 .. autofunction:: merge_tracks
 
+.. autofunction:: estimate_voices
+
+.. autoclass:: VoiceEstimate
+   :members:
+   :undoc-members:
+
+.. autoclass:: VoicePeak
+   :members:
+   :undoc-members:
+
 .. module:: mido.midifiles
 
 .. todo: Expose more of the internal API? (meta, tracks, units…)

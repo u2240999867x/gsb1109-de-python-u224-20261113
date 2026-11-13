@@ -16,6 +16,15 @@ This project uses `Semantic Versioning <https://semver.org>`_.
 Release History
 ---------------
 
+Unreleased
+^^^^^^^^^^
+
+* New Midifile: ``estimate_voices()`` streams a MIDI file and estimates
+  the peak number of synthesizer voices needed, honoring channels, the
+  hold pedal and all-notes-off / all-sound-off events.  Per-program
+  voice costs are supplied by the caller, and reachable lower and upper
+  bounds are reported for simultaneous events across tracks.
+
 1.3.3 (2024-10-25)
 ^^^^^^^^^^^^^^^^^^
 
