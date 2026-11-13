@@ -11,5 +11,6 @@ code.
 
    site
    page
+   contrib
    image
    errors
