@@ -108,3 +108,61 @@ That file for the `redirects_redirect.ndjson` table might look like this:
 [2, "feeds.simonwillison.net", "swn-entries", "https://simonwillison.net/atom/entries/", "2017-10-01T21:12:32.478849+00:00"]
 [3, "feeds.simonwillison.net", "swn-links", "https://simonwillison.net/atom/links/", "2017-10-01T21:12:54.820729+00:00"]
 ```
+
+## Checking two dumps for behavioural differences
+
+Two dumps of the same schema can have very different `CREATE` statements while
+behaving identically for the operations the business actually runs. `check`
+compares the two definitions by replaying an allowed operation set in throwaway
+databases, rather than by diffing SQL text.
+
+```bash
+sqlite-diffable check dump-a/ dump-b/ --operations operations.json --json
+```
+
+Both arguments accept a directory of `*.metadata.json` files (a dump
+directory), a `.sql` file, a single `*.metadata.json` file, or inline SQL
+prefixed with `sql:`. A JSON input may also be a list of objects, e.g. the
+concatenated `metadata.json` content from two dumps. Statements are applied in
+dependency order, so metadata files may be supplied in any filename order and
+a table may be created after an index that references it.
+
+Operations are supplied with `--operations` (a JSON array, a JSON
+`{"operations": [...]}` object, or a file with one statement per line) or with
+repeated `--operation` options. Each entry may be a plain SQL string or an
+object:
+
+```json
+[
+  "INSERT INTO entries (id, name, score) VALUES (1, 'Ada', 10)",
+  {"sql": "INSERT INTO entries (id, name, score) VALUES (?, ?, ?)",
+   "params": [2, "Grace", 20]},
+  {"steps": [
+    "BEGIN",
+    "UPDATE entries SET score = score + 1 WHERE id = 1",
+    "COMMIT"
+  ]}
+]
+```
+
+An operation group (`steps`) stops at the first error and is judged as one
+unit.
+
+The result is one of:
+
+- `different`: a shortest sequence of the allowed operations, up to
+  `--max-length` (default 3), produces different results. The report shows the
+  sequence and both outcomes.
+- `equivalent`: both definitions were fully materialised and no sequence up to
+  `--max-length` distinguished them. This is scoped to the supplied operations.
+- `undecided`: no difference was found, but a statement could not be replayed
+  and is listed under `unsupported` (with its reason), so no equivalence is
+  claimed. A demonstrated difference is still reported as `different`.
+
+Cosmetic changes (quote style such as `[name]` versus `"name"`, keyword case,
+whitespace) are treated as equivalent. Changes to collations, unique or partial
+index predicates, trigger `WHEN` clauses, checks and defaults are detected by
+their effect on the replayed operations.
+
+Exit status is `0` when no difference was found (`equivalent` or `undecided`) and
+`1` when a distinguishing sequence exists.

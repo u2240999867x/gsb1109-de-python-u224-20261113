@@ -5,6 +5,8 @@ import sqlite_utils
 import sqlite3
 import sys
 
+from . import schema_check
+
 
 @click.group()
 @click.version_option()
@@ -167,3 +169,161 @@ def objects(filepath, output, array):
         out.write("\n]\n")
     else:
         out.write("\n")
+
+
+def _render_human(report):
+    lines = []
+    verdict = report["verdict"]
+    if verdict == "different":
+        sequence = report["distinguishing_sequence"]
+        lines.append(
+            "DIFFERENT - %d operation(s) distinguish the versions:" % sequence["length"]
+        )
+        for number, step in enumerate(sequence["steps"], 1):
+            params = ""
+            if step["params"]:
+                params = "  params=%s" % json.dumps(step["params"])
+            lines.append("  %d. %s%s" % (number, step["sql"], params))
+        lines.append("  A: %s" % json.dumps(sequence["a"]))
+        lines.append("  B: %s" % json.dumps(sequence["b"]))
+    elif verdict == "equivalent":
+        budget = report["search_budget"]
+        lines.append(
+            "EQUIVALENT - no sequence of up to %d operation(s) from the %d "
+            "allowed operations distinguished the versions."
+            % (budget["max_length"], budget["operations"])
+        )
+        lines.append(
+            "  Scoped to the supplied operation set; operations outside it "
+            "were not attempted."
+        )
+    else:
+        lines.append("UNDECIDED - no verdict can be claimed.")
+        if report.get("search_error"):
+            lines.append("  Search stopped early: %s" % report["search_error"])
+
+    suspect = report.get("distinguishing_sequence")
+    if suspect is not None and not suspect.get("conclusive", True):
+        lines.append("")
+        lines.append(
+            "A sequence looked different but is not conclusive here:"
+        )
+        for number, step in enumerate(suspect["steps"], 1):
+            lines.append("  %d. %s" % (number, step["sql"]))
+        lines.append("  %s" % suspect.get("caveat", ""))
+
+    cosmetic = report["statement_diff"]["cosmetic"]
+    if cosmetic:
+        lines.append("")
+        lines.append("Equivalent spelling differences (ignored): %d" % len(cosmetic))
+        for entry in cosmetic:
+            lines.append("  A: %s" % entry["a"])
+            lines.append("  B: %s" % entry["b"])
+
+    only_a = report["statement_diff"]["only_a"]
+    only_b = report["statement_diff"]["only_b"]
+    if only_a or only_b:
+        lines.append("")
+        lines.append("Statements present in only one version:")
+        for statement in only_a:
+            lines.append("  A only: %s" % statement)
+        for statement in only_b:
+            lines.append("  B only: %s" % statement)
+
+    unsupported = report.get("unsupported") or []
+    if unsupported:
+        lines.append("")
+        lines.append("Outside the checkable range (reported, not judged):")
+        for entry in unsupported:
+            lines.append("  [%s] %s %s" % (
+                entry["side"].upper(), entry["object"], entry["statement"]
+            ))
+            lines.append("      %s: %s" % (entry["reason"], entry["explanation"]))
+    if report.get("blocking"):
+        lines.append("")
+        lines.append("Blocking gaps:")
+        for entry in report["blocking"]:
+            lines.append("  [%s] %s - %s" % (
+                entry["side"].upper(), entry["statement"], entry["detail"]
+            ))
+    return "\n".join(lines)
+
+
+@cli.command("check")
+@click.argument(
+    "definition_a",
+    type=click.Path(exists=False, file_okay=True, dir_okay=True),
+)
+@click.argument(
+    "definition_b",
+    type=click.Path(exists=False, file_okay=True, dir_okay=True),
+)
+@click.option(
+    "--operations",
+    "operations_path",
+    type=click.Path(exists=True, file_okay=True, dir_okay=False),
+    help="JSON or one-statement-per-line list of allowed operations",
+)
+@click.option(
+    "--operation",
+    "inline_operations",
+    multiple=True,
+    help="An allowed operation, repeatable (used when --operations is omitted)",
+)
+@click.option(
+    "--max-length",
+    type=click.IntRange(1, 20),
+    default=3,
+    show_default=True,
+    help="Longest operation sequence to try",
+)
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    help="Emit the full report as JSON",
+)
+def check(
+    definition_a,
+    definition_b,
+    operations_path,
+    inline_operations,
+    max_length,
+    as_json,
+):
+    """
+    Compare two exported SQLite definitions under an allowed operation set
+
+    Each definition may be a directory of sqlite-diffable dump output
+    (*.metadata.json files), a .sql file, a JSON metadata file, or an
+    inline SQL string prefixed with sql:.
+
+    Operations are read from --operations (a JSON array, or a file with
+    one statement per line) or given with repeated --operation options.
+    """
+    try:
+        sql_a = _load_definition_argument(definition_a)
+        sql_b = _load_definition_argument(definition_b)
+        if operations_path:
+            operations = schema_check.load_operations(operations_path)
+        else:
+            operations = list(inline_operations)
+        if not operations:
+            raise click.ClickException(
+                "Pass --operations FILE or at least one --operation"
+            )
+        report = schema_check.check(sql_a, sql_b, operations, max_length=max_length)
+    except (schema_check.DefinitionError, schema_check.OperationError) as error:
+        raise click.ClickException(str(error))
+    if as_json:
+        click.echo(json.dumps(report, indent=2, default=repr))
+    else:
+        click.echo(_render_human(report))
+    if report["verdict"] == "different":
+        raise click.exceptions.Exit(1)
+
+
+def _load_definition_argument(value):
+    if value.startswith("sql:"):
+        return value[len("sql:"):]
+    return schema_check.load_definition(value)
