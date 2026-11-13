@@ -1,6 +1,14 @@
 Changes
 =======
 
+0.6.0 (unreleased)
+------------------
+
+* Added ``price_parser.extract_payments()`` for extracting payment
+  components (deposit, deduction and balance) from promotional pricing
+  strings such as presale offers, with every tenable cash total traced back
+  to its source text.
+
 0.5.1 (2026-03-19)
 ------------------
 

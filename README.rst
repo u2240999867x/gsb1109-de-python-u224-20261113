@@ -166,6 +166,49 @@ Price(amount=Decimal('140.600'), currency='$')
 Price(amount=Decimal('140600'), currency='$')
 
 
+Payment components
+------------------
+
+Promotional pages sometimes describe a payment plan instead of a single
+price, for example a presale offer with a deposit, a deduction and a
+balance. :func:`extract_payments` keeps those components separate instead
+of adding every marketing number together:
+
+>>> from price_parser import extract_payments
+>>> breakdown = extract_payments("定金20抵50，尾款149")
+>>> [(c.kind, c.amount, c.source_text) for c in breakdown.components]
+[('deposit', Decimal('20'), '定金20'), ('deduction', Decimal('50'), '抵50'), ('balance', Decimal('149'), '尾款149')]
+
+The deposit (定金) and balance (尾款) are cash paid, while the deduction
+(抵扣) is a marketing value which is never paid in cash. The balance may be
+stated either after or before the deduction is applied, so when the page
+does not explain it both readings are kept:
+
+>>> [(t.interpretation, t.amount) for t in breakdown.payment_totals]
+[('balance_post_deduction', Decimal('169')), ('balance_pre_deduction', Decimal('119'))]
+
+Every candidate total points back to the source slices it was derived from,
+and an explicit total on the page (e.g. 到手价) disambiguates the reading:
+
+>>> confirmed = extract_payments("定金20抵50，尾款149，到手价169")
+>>> [(t.interpretation, t.amount, t.matches_stated_total) for t in confirmed.payment_totals]
+[('balance_post_deduction', Decimal('169'), True)]
+
+Numbers which are not part of the payment plan are reported separately with
+a reason (a percentage, a reference price such as 原价, or an unassociated
+number), rather than silently summed:
+
+>>> noisy = extract_payments("原价399，定金20抵50，尾款149，立减20%")
+>>> [(i.amount, i.reason) for i in noisy.ignored_amounts]
+[(Decimal('399'), 'reference_price'), (Decimal('20'), 'percent')]
+
+A plain price string without payment keywords returns an empty breakdown;
+use ``Price.fromstring`` for the single amount in that case:
+
+>>> extract_payments("22,90 €").components
+[]
+
+
 Contributing
 ============
 

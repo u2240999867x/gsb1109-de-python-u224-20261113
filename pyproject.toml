@@ -195,6 +195,7 @@ split-on-trailing-comma = false
 [tool.ruff.lint.per-file-ignores]
 # To not introduce annotations potentially not resolvable at the run time
 "price_parser/parser.py" = ["FA100"]
+"price_parser/payment.py" = ["FA100"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "pep257"
