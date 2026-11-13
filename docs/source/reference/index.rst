@@ -12,4 +12,5 @@ code.
    site
    page
    image
+   crawler
    errors

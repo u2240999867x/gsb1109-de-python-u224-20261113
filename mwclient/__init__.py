@@ -25,6 +25,10 @@
 
 from mwclient.errors import *  # noqa: F401, F403
 from mwclient.client import Site as Site, __version__ as __version__  # noqa: F401
+from mwclient.crawler import (  # noqa: F401
+    CategoryCrawler as CategoryCrawler,
+    CrawlResult as CrawlResult,
+)
 import logging
 import warnings
 
