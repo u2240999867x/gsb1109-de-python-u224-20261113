@@ -271,3 +271,42 @@ Current schema version: 0 (database) and 1 (code).
 Executing /home/ubuntu/github/pyulog/pyulog/sql/pyulog.1.sql.
 Migration done.
 ```
+
+### Lazy time-window queries (schema version 6+)
+
+Logs saved with schema version 6 or newer additionally store one row per
+sample in `ULogFieldSample`, which allows reading just the samples inside a
+half-open timestamp window `[start_timestamp, end_timestamp)` instead of a
+whole series. `get_dataset_window` returns a single `WindowedData`, while
+`iter_dataset_window` lazily yields fixed-size batches, so memory usage is
+bounded by the window and the batch size rather than the full log:
+
+```python
+import sqlite3
+from pyulog.db import DatabaseULog
+
+# One external connection can be shared across queries and is never closed
+# by DatabaseULog, so after stopping one stream another topic can be queried.
+connection = sqlite3.connect('pyulog.sqlite3', detect_types=sqlite3.PARSE_DECLTYPES)
+connection.execute('PRAGMA foreign_keys=on')
+dbulog = DatabaseULog(connection, primary_key=primary_key)
+
+# Read all samples of one 5 s window at once. include_context attaches the
+# last sample before the window on .context; it is excluded from .data and
+# therefore not counted in .sample_count.
+window = dbulog.get_dataset_window('sensor_gyro', start_us, start_us + 5_000_000,
+                                   multi_instance=0, include_context=True)
+print(window.sample_count, window.context)
+
+# Stream batches and stop early; the connection stays open afterwards.
+for batch in dbulog.iter_dataset_window('sensor_gyro', start_us, start_us + 5_000_000,
+                                        batch_size=1000):
+    process(batch.data)
+    if done:
+        break
+```
+
+Each topic instance keeps its own time order, including rows that share the
+same timestamp. Logs archived before schema version 6 can opt in by running
+`DatabaseULog.backfill_samples()`, which expands the existing BLOB columns
+into `ULogFieldSample` rows without re-parsing the original `.ulg` file.
