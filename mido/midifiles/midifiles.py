@@ -25,6 +25,7 @@ import time
 from numbers import Integral
 
 from ..messages import SPEC_BY_STATUS, Message
+from .markers import merge_markers
 from .meta import MetaMessage, build_meta_message, encode_variable_int, meta_charset
 from .tracks import MidiTrack, fix_end_of_track, merge_tracks
 from .units import tick2second
@@ -346,6 +347,29 @@ class MidiFile:
         self.tracks.append(track)
         del self.merged_track  # uncache merged track
         return track
+
+    def merge_markers(self, replica_groups=(), tolerance=0):
+        """Merge the marker (``marker`` meta message) tables of the tracks.
+
+        ``replica_groups`` lists track indices whose markers are known
+        copies of each other, for example ``[(0, 1)]`` treats track 1
+        as a replica of track 0. The lowest index in each group is the
+        primary track. ``tolerance`` is the maximum distance in ticks
+        between a replica and a primary marker for them to be merged.
+
+        Copies keep their original positions. When a replica marker
+        matches more than one primary marker every interpretation is
+        retained as an unresolved row, and markers on unrelated tracks
+        are left untouched. Returns a
+        :class:`mido.midifiles.markers.MarkerTable` whose
+        ``resolved_count`` and ``unresolved_count`` expose the
+        settlement counts.
+        """
+        return merge_markers(
+            self.tracks,
+            replica_groups=replica_groups,
+            tolerance=tolerance,
+        )
 
     def _load(self, infile):
         if self.debug:

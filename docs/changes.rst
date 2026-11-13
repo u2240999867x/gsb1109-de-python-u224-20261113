@@ -16,6 +16,14 @@ This project uses `Semantic Versioning <https://semver.org>`_.
 Release History
 ---------------
 
+Unreleased
+^^^^^^^^^^
+
+* New ``MidiFile.merge_markers()`` and ``mido.merge_markers()`` to
+  merge marker tables across tracks declared as replicas, with a time
+  tolerance, original positions preserved, unresolved interpretations
+  retained and resolved/unresolved settlement counts
+
 1.3.3 (2024-10-25)
 ^^^^^^^^^^^^^^^^^^
 

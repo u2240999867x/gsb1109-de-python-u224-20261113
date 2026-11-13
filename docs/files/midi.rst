@@ -174,6 +174,44 @@ For a list of supported meta messages and their attributes, and also
 how to implement new meta messages, see :doc:`../meta_message_types`.
 
 
+Merging Marker Tables
+---------------------
+
+In multi-track files the same ``marker`` meta message is sometimes
+copied onto several tracks, while two markers with the same name can
+also be separate entries written for different scenes.
+:meth:`MidiFile.merge_markers` imports the marker tables of the tracks
+and merges the copies back together.
+
+``replica_groups`` declares which tracks are copies of each other, for
+example ``[(0, 1)]`` treats track 1 as a replica of track 0. The lowest
+index in each group is the primary track. ``tolerance`` is the maximum
+distance in ticks between a replica marker and a primary marker for
+them to count as the same marker::
+
+    table = mid.merge_markers(replica_groups=[(0, 1)], tolerance=10)
+
+The merge never moves a marker: every copy keeps its original
+position. When a replica marker is within the tolerance of two adjacent
+primary markers, both interpretations are retained and the row is
+flagged as unresolved instead of being guessed. Matching is one-to-one
+per pair of tracks, so two markers on the same track can never be
+collapsed into one. Replica markers with no matching primary marker,
+and markers on tracks outside the replica groups, remain rows of their
+own.
+
+The returned :class:`~mido.midifiles.markers.MarkerTable` is iterable
+and exposes the settlement counts::
+
+    table.resolved_count    # rows with one certain interpretation
+    table.unresolved_count  # rows still carrying alternatives
+    table.counts            # (resolved_count, unresolved_count)
+
+Each :class:`~mido.midifiles.markers.MarkerGroup` row holds the primary
+marker, the matching copies at their original positions and, for
+unresolved rows, the alternative primary markers in ``candidates``.
+
+
 About the Time Attribute
 ------------------------
 

@@ -189,6 +189,25 @@ Standard MIDI Files
 
 .. autofunction:: merge_tracks
 
+.. autofunction:: merge_markers
+
+.. module:: mido.midifiles.markers
+
+.. autoclass:: Marker
+   :members:
+   :inherited-members:
+   :undoc-members:
+
+.. autoclass:: MarkerGroup
+   :members:
+   :inherited-members:
+   :undoc-members:
+
+.. autoclass:: MarkerTable
+   :members:
+   :inherited-members:
+   :undoc-members:
+
 .. module:: mido.midifiles
 
 .. todo: Expose more of the internal API? (meta, tracks, units…)
