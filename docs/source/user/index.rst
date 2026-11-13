@@ -14,4 +14,5 @@ classes contained in the package, see the :ref:`reference`.
    connecting
    page-ops
    files
+   wiki-store
    implementation-notes
