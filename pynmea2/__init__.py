@@ -12,6 +12,15 @@ parse = NMEASentence.parse
 
 from .types import *
 
+from .wind import (
+    WindProcessor,
+    WindObservation,
+    StreamSample,
+    VelocitySample,
+    true_wind_from_relative,
+    process_sentences,
+)
+
 from .stream import NMEAStreamReader
 from .nmea_file import NMEAFile
 

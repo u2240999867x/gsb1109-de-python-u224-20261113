@@ -141,6 +141,34 @@ for line in file.readlines():
         continue
 ```
 
+## Wind observations (`MWV`)
+
+An `MWV` sentence reports wind against the vessel's bow (`reference='R'`, relative/apparent wind) or against geographic north (`reference='T'`, true wind). The vessel speed and bow heading arrive on other sentences at their own update rates. `pynmea2.WindProcessor` keeps the latest sample of each stream, records the source sentence of every number used, and resolves each `MWV` to a geographic wind observation.
+
+```python
+import pynmea2
+from pynmea2 import WindProcessor
+
+processor = WindProcessor()
+for line in open('wind.log', encoding='utf-8'):
+    msg = pynmea2.parse(line)
+    observation = processor.update(msg)   # None for non-MWV sentences
+    if observation is None:
+        continue
+    print(observation.wind_direction, observation.wind_speed_knots)
+    print(observation.heading_source, observation.speed_source)
+```
+
+Rules applied by the processor:
+
+- **Heading vs. track.** Only `HDT`, `THS`, the heading field of `OSD` and the true heading of `VHW` are treated as bow headings. `VTG`/`RMC` tracks and the `OSD` course are velocity directions; with leeway they differ from the heading and are never substituted for it.
+- **Leeway-aware velocity.** `RMC`/`VTG` supply speed over ground together with the course made good, and `VBW` longitudinal/transverse components are combined into a velocity vector. A scalar speed with no course (e.g. `VHW` water speed) is applied along the bow and flagged in `notes` as a no-leeway assumption.
+- **Partial data.** With a heading but no speed, only the apparent wind bearing relative to true north is produced; with a speed but no heading only the relative angle/speed remain available. Unavailable quantities stay `None`, and `missing`/`notes` explain what can and cannot be derived.
+- **Native true wind.** An `MWV` with `reference='T'` is passed through unchanged. Vessel motion is never applied a second time to data that is already true wind.
+- **Provenance.** `heading_source`, `speed_source`, `course_source` and `speed_reference` (`ground`/`water`/`osd`) identify the exact sentence behind every derived value.
+
+See `examples/wind_processing.py` for a runnable example.
+
 ## `pySerial` device example
 
 See [examples/read_serial.py](/examples/read_serial.py)
