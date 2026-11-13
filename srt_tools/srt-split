@@ -1,0 +1,30 @@
+#!/usr/bin/env python
+
+"""Split a subtitle corpus into training and verification sets."""
+
+import sys
+import srt_tools.split
+
+
+def main():
+    argv = []
+    args = list(sys.argv[1:])
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in ("-i", "--input"):
+            # Accept the -i/--input spelling used by the other srt tools as an
+            # alias for the positional manifest argument.
+            if index + 1 >= len(args):
+                sys.stderr.write("srt-split: %s needs a value\n" % arg)
+                return 2
+            argv.append(args[index + 1])
+            index += 2
+            continue
+        argv.append(arg)
+        index += 1
+    return srt_tools.split.main(argv)
+
+
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(main())

@@ -58,6 +58,24 @@ Utilities
   ``srt process -m re -f 'lambda sub: re.sub("<[^<]+?>", "", sub)'``. HTML-like
   syntax is especially prevalant in `SSA/ASS`_ subtitles that have been
   directly converted to SRT.
+- *split* partitions a subtitle corpus into training and verification sets by
+  whole interview. Segments sharing an interview or a confirmed source stay
+  together, human locks are honoured, and conflicts are reported as an
+  evidence chain instead of being hidden by dropping short fragments. The
+  command reads a JSON manifest and writes JSON (or ``--text``) results.
+
+  .. code::
+
+      # Balance known speaking time as close as possible to 4:1
+      srt split corpus.json --ratio 4:1 --text
+
+  The manifest describes ``segments`` (with ``interview``/``source`` identity
+  keys and ``speaking_ms``), confirmed ``source_correspondences`` (transitive),
+  explicit ``must_link`` groups, ``independent`` pairs of same-named but
+  distinct programmes, and ``locks`` pinning a segment or group to a set.
+  ``budgets_ms`` adds a duration cap per set. If transitive links collide with
+  two different locks, no split is emitted: ``conflict_chains`` names the
+  shortest evidence path, and every group remains unassigned.
 
 .. _mux: https://en.wikipedia.org/wiki/Multiplexing
 .. _`SSA/ASS`: https://en.wikipedia.org/wiki/SubStation_Alpha

@@ -16,7 +16,7 @@ setup(
     author="Chris Down",
     author_email="chris@chrisdown.name",
     url="https://github.com/cdown/srt",
-    py_modules=["srt", "srt_tools.utils"],
+    py_modules=["srt", "srt_tools.utils", "srt_tools.split"],
     scripts=[
         "srt_tools/srt",
         "srt_tools/srt-deduplicate",
@@ -27,6 +27,7 @@ setup(
         "srt_tools/srt-mux",
         "srt_tools/srt-play",
         "srt_tools/srt-process",
+        "srt_tools/srt-split",
     ],
     license="MIT",
     keywords="srt",

@@ -1,0 +1,66 @@
+{
+  "ratio": [
+    4,
+    1
+  ],
+  "tolerance_ms": 150000,
+  "budgets_ms": {
+    "train": 28800000,
+    "verification": 7200000
+  },
+  "segments": [
+    {
+      "id": "nightline-2024-01-01-full",
+      "interview": "nightline-2024-01-01",
+      "source": "nightline-broadcast",
+      "title": "Nightline",
+      "start": "00:00:10,000",
+      "end": "00:22:00,000",
+      "speaking_ms": 900000
+    },
+    {
+      "id": "nightline-2024-01-01-excerpt",
+      "interview": "nightline-2024-01-01",
+      "source": "nightline-web",
+      "title": "Nightline",
+      "duration_ms": 120000
+    },
+    {
+      "id": "frontline-2024-02-02",
+      "interview": "frontline-2024-02-02",
+      "source": "frontline-broadcast",
+      "title": "Frontline",
+      "duration_ms": 700000
+    },
+    {
+      "id": "60-minutes-au",
+      "source": "au",
+      "title": "60 Minutes",
+      "duration_ms": 300000
+    },
+    {
+      "id": "60-minutes-us",
+      "source": "us",
+      "title": "60 Minutes",
+      "duration_ms": 280000
+    }
+  ],
+  "source_correspondences": [
+    [
+      "nightline-broadcast",
+      "nightline-web"
+    ]
+  ],
+  "independent": [
+    [
+      "60-minutes-au",
+      "60-minutes-us"
+    ]
+  ],
+  "locks": [
+    {
+      "interview": "frontline-2024-02-02",
+      "set": "train"
+    }
+  ]
+}
