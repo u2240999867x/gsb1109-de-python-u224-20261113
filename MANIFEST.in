@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: 2013 Ole Martin Bjorndalen <ombdalen@gmail.com>
+#
+# SPDX-License-Identifier: CC0-1.0
+
+exclude SECURITY.md
+prune docs/_build
+prune logo
+include README.rst LICENSE .readthedocs.yaml .reuse/dep5
+include docs/_static/.gitkeep
+recursive-include docs *.bat
+recursive-include docs *.py
+recursive-include docs *.rst
+recursive-include docs Makefile
+recursive-include docs/images *.svg
+recursive-include docs/images *.license
+recursive-include examples *.py
+recursive-include examples *.py
+recursive-include examples *.sh
+recursive-include extras *.py
+recursive-include extras *.rst
+recursive-include LICENSES *.txt
+recursive-include mido *.py
+recursive-include tests *.py

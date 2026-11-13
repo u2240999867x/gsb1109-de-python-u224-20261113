@@ -1,0 +1,175 @@
+# SPDX-FileCopyrightText: 2023 Ole Martin Bjorndalen <ombdalen@gmail.com>
+# SPDX-FileCopyrightText: 2023 Raphaël Doursenaud <rdoursenaud@gmail.com>
+#
+# SPDX-License-Identifier: CC0-1.0
+
+# PEP 621 (https://peps.python.org/pep-0621/) project metadata
+# Format: https://toml.io/en/
+
+[build-system]
+requires = ["setuptools>=61.0.0", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mido"
+# version is dynamic
+description = "MIDI Objects for Python"
+readme = "README.rst"
+requires-python = "~=3.7"
+license = { text = "MIT" }
+authors = [
+    { name = "Ole Martin Bjorndalen", email = "ombdalen@gmail.com" },
+]
+maintainers = [
+    { name = "Radovan Bast", email = "radovan.bast@gmail.com" },
+    { name = "Raphaël Doursenaud", email = "rdoursenaud@gmail.com" },
+]
+keywords = ["python", "midi", "midifile"]
+classifiers = [
+    'Development Status :: 5 - Production/Stable',
+    'Intended Audience :: Developers',
+    'Natural Language :: English',
+    'License :: OSI Approved :: MIT License',
+    'Programming Language :: Python',
+    'Programming Language :: Python :: 3 :: Only',
+    'Programming Language :: Python :: 3.7',
+    'Programming Language :: Python :: 3.8',
+    'Programming Language :: Python :: 3.9',
+    'Programming Language :: Python :: 3.10',
+    'Programming Language :: Python :: 3.11',
+    'Programming Language :: Python :: 3.12',
+    'Programming Language :: Python :: 3.13',
+    'Topic :: Multimedia :: Sound/Audio :: MIDI',
+    'Topic :: Software Development',
+    'Topic :: Software Development :: Libraries',
+    'Topic :: Software Development :: Libraries :: Python Modules',
+    'Topic :: Utilities',
+]
+
+dependencies = [
+    "importlib_metadata; python_version<'3.8'",  # For version introspection
+    "packaging",  # To provide a nice version_info opbject
+]
+dynamic = ["version"]
+
+[project.urls]
+documentation = "https://mido.readthedocs.io"
+source = "https://github.com/mido/mido"
+
+[project.optional-dependencies]
+# Separated by tasks for automation efficiency
+build-docs = [
+    'sphinx>=5.0',
+    'sphinx-rtd-theme>=1.3',
+]
+check-manifest = ['check-manifest>=0.49',]
+lint-code = ['ruff~=0.1.6',]
+lint-reuse = ['reuse~=1.1.2',]
+ports-pygame = ['PyGame~=2.5',]
+ports-rtmidi = ['python-rtmidi~=1.5.4',]
+ports-rtmidi-python = ['rtmidi-python~=0.2.2',]
+release = ['twine~=4.0.2',]
+test-code = ['pytest~=7.4.0',]
+test-coverage = ['coverage~=7.13.5', 'mido[test-code]']
+
+# Convenience groups for human interaction
+dev = [
+    'mido[check-manifest]',
+    'mido[lint-code]',
+    'mido[test-code]',
+    'mido[test-coverage]',
+    'mido[lint-reuse]',
+    'mido[build-docs]',
+    'mido[release]',
+]
+ports-all = [
+    'mido[ports-pygame]',
+    'mido[ports-rtmidi]',
+    'mido[ports-rtmidi-python]',
+]
+
+[project.scripts]
+mido-play = "mido.scripts.mido_play:main"
+mido-ports = "mido.scripts.mido_ports:main"
+mido-serve = "mido.scripts.mido_serve:main"
+mido-connect = "mido.scripts.mido_connect:main"
+
+[tool.setuptools]
+packages = [
+    "mido",
+    "mido.backends",
+    "mido.messages",
+    "mido.midifiles",
+    "mido.scripts",
+]
+include-package-data = true
+
+[tool.setuptools.package-dir]
+mido = "mido"
+
+[tool.setuptools.package-data]
+mido = [
+    "LICENSE",
+]
+
+[tool.setuptools_scm]
+# Enables setuptools-scm which updates the version file `mido/_version.py`
+# automatically based on git tags.
+# The version information can be retrieved using:
+# ```python
+# importlib_metadata.version('mido')
+# ```
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = "-rs --quiet"
+testpaths = [
+    "tests",
+]
+norecursedirs = [
+    "build",
+    "dist",
+    "examples",
+]
+
+[tool.coverage.run]
+source = ["mido"]
+branch = false
+
+[tool.coverage.report]
+show_missing = true
+
+[tool.ruff]
+ignore = [
+    "F401",  # TODO: Enable
+]
+
+extend-select = [
+    "B",
+    "E",
+    "F",
+    "I",
+    "S",  # security lints
+    "W",
+    "T",
+]
+
+[tool.ruff.per-file-ignores]
+"tests/**" = [
+    "S101",  # allow assertions in tests
+]
+"extras/**" = [
+    "T201",  # print allowed
+]
+"examples/**" = [
+    "B007",  # allow slightly sloppy loop variables in examples
+    "S311",  # allow RNGs that are not cryptographically secure
+    "T201",  # print allowed
+]
+"mido/backends/amidi.py" = [
+    "S603",  # allow subprocesses with possibly untrusted input
+    "S607",  # allow `amidi` as a partial path
+]
+"mido/scripts/**" = [
+    "T201",  # print allowed
+]
