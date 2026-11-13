@@ -5,8 +5,10 @@ Module containing the DatabaseULog class.
 import sqlite3
 import hashlib
 import contextlib
+import datetime
 import numpy as np
 from pyulog import ULog
+from pyulog.exceptions import ULogMergeConflict, ULogMergeEvidenceError
 
 # pylint: disable=too-many-instance-attributes
 class DatabaseULog(ULog):
@@ -25,6 +27,13 @@ class DatabaseULog(ULog):
     This class is currently designed to be write-once only, so you cannot
     update existing database entries. To do so, first call delete() and then
     save() again.
+
+    The one supported way of extending an existing record is save() on a log
+    that is provably part of the same acquisition (same device identity and
+    overlapping time span, e.g. an export that was written before the logger
+    had flushed all topics). See save() for the exact evidence rules. Anything
+    that conflicts with already stored samples is rejected without modifying
+    the existing record.
 
     A weakness of the implementation is that there are some silently failing
     states if you don't call save() immediately after instantiating from a ULog
@@ -49,7 +58,7 @@ class DatabaseULog(ULog):
     contsructor will throw an exception. See the documentation of
     "ulog_migratedb" for more information.
     '''
-    SCHEMA_VERSION = 5
+    SCHEMA_VERSION = 6
 
     @staticmethod
     def get_db_handle(db_path):
@@ -99,6 +108,32 @@ class DatabaseULog(ULog):
                 SELECT Id
                 FROM ULog
                 WHERE SHA256Sum = ?
+                ''', (sha256sum,))
+            row = cur.fetchone()
+            if row:
+                primary_key = row[0]
+            cur.close()
+        return primary_key
+
+    @staticmethod
+    def primary_key_from_supplement_sha256sum(db_handle, sha256sum):
+        '''
+        Return the primary key of the record that already contains the given
+        supplement file, or None if the digest has not been merged yet.
+
+        This is what makes re-submitting the same complete file idempotent:
+        the digest is already recorded as part of the parent record, so no
+        rows are inserted a second time.
+        '''
+        primary_key = None
+        with db_handle() as con:
+            cur = con.cursor()
+            cur.execute('''
+                SELECT ULogId
+                FROM ULogSupplement
+                WHERE SHA256Sum = ? AND Status IN ('merged', 'contained')
+                ORDER BY Id
+                LIMIT 1
                 ''', (sha256sum,))
             row = cur.fetchone()
             if row:
@@ -488,7 +523,863 @@ class DatabaseULog(ULog):
             )
         return dataset
 
-    def save(self, append_json=False):
+    # Keys that identify the physical acquisition device. A supplement is
+    # only considered to belong to an existing record when at least one of
+    # these can be compared positively. Equal start/end timestamps alone are
+    # never sufficient.
+    _IDENTITY_KEYS = ('sys_uuid', 'ver_hw', 'ver_sw', 'sys_name', 'sys_mcu', 'sys_os_name')
+
+    @staticmethod
+    def _as_text(value):
+        '''Normalise an info value loaded from sqlite to a comparable string.'''
+        if isinstance(value, bytes):
+            try:
+                return value.decode('utf-8')
+            except UnicodeDecodeError:
+                return value
+        if isinstance(value, str):
+            return value
+        return str(value)
+
+    @classmethod
+    def _identity_matches(cls, existing_info, new_info):
+        '''
+        Return True if the two info dictionaries carry positive evidence that
+        they were recorded by the same device.
+
+        sys_uuid is the strongest key. Logs without one (older firmware) fall
+        back to a matching hardware/software pair.
+        '''
+        existing = {key: cls._as_text(existing_info[key])
+                    for key in cls._IDENTITY_KEYS if key in existing_info}
+        new = {key: cls._as_text(new_info[key])
+               for key in cls._IDENTITY_KEYS if key in new_info}
+
+        if 'sys_uuid' in existing or 'sys_uuid' in new:
+            return existing.get('sys_uuid') is not None and \
+                   existing.get('sys_uuid') == new.get('sys_uuid')
+        if 'ver_hw' in existing or 'ver_sw' in existing:
+            return existing.get('ver_hw') is not None and \
+                   existing.get('ver_sw') is not None and \
+                   existing.get('ver_hw') == new.get('ver_hw') and \
+                   existing.get('ver_sw') == new.get('ver_sw')
+        # Without any device identity there is no evidence of a common
+        # acquisition, even if the timestamps happen to be identical.
+        return False
+
+    def _dataset_keys(self):
+        '''Return the set of (topic name, multi id) in this log.'''
+        return {(dataset.name, dataset.multi_id) for dataset in self.data_list}
+
+    def _has_common_sample(self, cur, candidate_id, own_datasets):
+        '''
+        Check whether this log and the candidate share enough identical
+        samples in topics that both contain.
+
+        This is the positive evidence that the two files are parts of one
+        acquisition. A matching device identity, an overlapping time range or
+        even identical start/end timestamps are not enough on their own,
+        because a second run on the same hardware can reproduce those.
+
+        A single coincidentally equal sample (for example an unchanged
+        parameter or a constant field) is not enough either: at least two
+        samples at different topic/timestamp pairs have to be identical.
+        '''
+        matches = 0
+        for dataset in self.data_list:
+            key = (dataset.name, dataset.multi_id)
+            if key not in own_datasets:
+                continue
+            cur.execute('''
+                SELECT Id
+                FROM ULogDataset
+                WHERE ULogId = ? AND DatasetName = ? AND MultiId = ?
+                ''', (candidate_id, dataset.name, dataset.multi_id))
+            row = cur.fetchone()
+            if row is None:
+                continue
+            fields, _, old_data, _ = self._load_dataset_rows(cur, row[0])
+            if [field.field_name for field in fields] != \
+                    [field.field_name for field in dataset.field_data]:
+                continue
+            if any(left.type_str != right.type_str for left, right in
+                   zip(fields, dataset.field_data)):
+                continue
+
+            old_by_time = {}
+            for index, timestamp in enumerate(old_data['timestamp'].tolist()):
+                old_by_time.setdefault(int(timestamp), []).append(index)
+            if not old_by_time:
+                continue
+
+            new_timestamps = dataset.data['timestamp']
+            for new_index, timestamp in enumerate(new_timestamps.tolist()):
+                if int(timestamp) == 0:
+                    # Zero timestamps are shared by unrelated logs (initial
+                    # values), so they cannot prove a common acquisition.
+                    continue
+                old_rows = old_by_time.get(int(timestamp))
+                if not old_rows:
+                    continue
+                row = {name: values[new_index]
+                       for name, values in dataset.data.items()}
+                for old_index in old_rows:
+                    old_row = {name: values[old_index]
+                               for name, values in old_data.items()}
+                    if self._rows_equal(row, old_row):
+                        matches += 1
+                        break
+                if matches >= 2:
+                    return True
+        return False
+
+    def _find_merge_target(self, require_common_sample=True):
+        '''
+        Find an existing record that this log is a supplement of.
+
+        The time ranges have to overlap, the device identity has to match, at
+        least one topic instance has to be shared and, if
+        require_common_sample is set, at least one sample in that shared topic
+        has to be identical. Otherwise None is returned and the log is stored
+        as a separate acquisition.
+        '''
+        own_datasets = self._dataset_keys()
+        if not own_datasets:
+            return None
+
+        with self._db() as con:
+            cur = con.cursor()
+            cur.execute('''
+                SELECT Id
+                FROM ULog
+                WHERE StartTimestamp <= ? AND LastTimestamp >= ?
+                ORDER BY Id
+                ''', (self._last_timestamp, self._start_timestamp))
+            candidate_ids = [row[0] for row in cur.fetchall()]
+            if not candidate_ids:
+                cur.close()
+                return None
+
+            own_info = self.msg_info_dict
+            best = None
+            best_shared = 0
+            for candidate_id in candidate_ids:
+                cur.execute('''
+                    SELECT Key, Value
+                    FROM ULogMessageInfo
+                    WHERE ULogId = ?
+                    ''', (candidate_id,))
+                candidate_info = dict(cur.fetchall())
+                if not self._identity_matches(candidate_info, own_info):
+                    continue
+
+                cur.execute('''
+                    SELECT DatasetName, MultiId
+                    FROM ULogDataset
+                    WHERE ULogId = ?
+                    ''', (candidate_id,))
+                candidate_datasets = {(name, multi_id)
+                                      for name, multi_id in cur.fetchall()}
+                shared = len(own_datasets & candidate_datasets)
+                if shared == 0 or shared <= best_shared:
+                    continue
+                if require_common_sample and \
+                        not self._has_common_sample(cur, candidate_id, own_datasets):
+                    continue
+                best = candidate_id
+                best_shared = shared
+            cur.close()
+        return best
+
+    @staticmethod
+    def _scalar_equal(left, right):
+        '''Exact scalar comparison that also treats NaN as equal to NaN.'''
+        if left == right:
+            return True
+        try:
+            return bool(np.isnan(left) and np.isnan(right))
+        except TypeError:
+            return False
+
+    @classmethod
+    def _rows_equal(cls, left, right):
+        '''Compare two sample rows (dicts of field name -> scalar).'''
+        if left.keys() != right.keys():
+            return False
+        return all(cls._scalar_equal(left[name], right[name]) for name in left)
+
+    @staticmethod
+    def _row_matches_any(row, candidates, used):
+        '''Find an unused candidate row equal to row.'''
+        for index, candidate in enumerate(candidates):
+            if used[index]:
+                continue
+            if DatabaseULog._rows_equal(row, candidate):
+                used[index] = True
+                return index
+        return None
+
+    @classmethod
+    def _match_all(cls, rows, candidates):
+        '''
+        Greedily match every row in ``rows`` to an unused equal candidate.
+
+        Returns (all_matched, matched_flags) where matched_flags refers to
+        ``candidates`` and marks the entries that were consumed.
+        '''
+        used = [False] * len(candidates)
+        all_matched = True
+        for row in rows:
+            if cls._row_matches_any(row, candidates, used) is None:
+                all_matched = False
+                break
+        return all_matched, used
+
+    @classmethod
+    def _new_sample_indices(cls, old_data, new_data):
+        '''
+        Validate a supplement topic against the archived samples and return
+        (indices of genuinely new samples, first conflict or None).
+
+        At a timestamp that is not archived yet, every supplied row is new.
+        At a timestamp that already exists the rows are compared as multisets:
+
+        - if the archive holds a single distinct row shape there, every
+          supplied row must equal it. Extra identical rows are new samples,
+          a different row is a contradiction;
+        - if the archive already holds several distinct rows there (event
+          topics), the supplied rows may extend that set; if neither set
+          contains the other, the files disagree;
+        - rows at timestamp 0 are not individually time-stamped (initial
+          values) and are treated as an unordered growing set.
+
+        Topics whose format does not contain a unique timestamp (for example
+        event topics where several rows share one timestamp) are supported:
+        genuinely new rows at an existing timestamp are added to the archive.
+        '''
+        old_timestamps = old_data['timestamp']
+        new_timestamps = new_data['timestamp']
+        new_indices = []
+        conflict = None
+
+        old_by_time = {}
+        for index, timestamp in enumerate(old_timestamps.tolist()):
+            old_by_time.setdefault(int(timestamp), []).append(index)
+
+        new_by_time = {}
+        for index, timestamp in enumerate(new_timestamps.tolist()):
+            new_by_time.setdefault(int(timestamp), []).append(index)
+
+        for timestamp in sorted(new_by_time):
+            new_rows = new_by_time[timestamp]
+            old_rows = old_by_time.get(timestamp)
+            if not old_rows:
+                new_indices.extend(new_rows)
+                continue
+
+            old_rows_data = [
+                {name: values[index] for name, values in old_data.items()}
+                for index in old_rows
+            ]
+            new_rows_data = [
+                {name: values[index] for name, values in new_data.items()}
+                for index in new_rows
+            ]
+
+            if timestamp == 0:
+                all_old_matched, used_in_new = cls._match_all(
+                    old_rows_data, new_rows_data)
+                all_new_matched, used_in_old = cls._match_all(
+                    new_rows_data, old_rows_data)
+                if all_old_matched:
+                    new_indices.extend(
+                        new_rows[index]
+                        for index, matched in enumerate(used_in_new)
+                        if not matched
+                    )
+                elif not all_new_matched:
+                    new_indices.extend(
+                        new_rows[index]
+                        for index, matched in enumerate(used_in_old)
+                        if not matched
+                    )
+                continue
+
+            distinct_old = []
+            for row in old_rows_data:
+                if not any(cls._rows_equal(row, seen) for seen in distinct_old):
+                    distinct_old.append(row)
+
+            if len(distinct_old) == 1:
+                archived_row = distinct_old[0]
+                if not all(cls._rows_equal(row, archived_row) for row in new_rows_data):
+                    if conflict is None or timestamp < conflict:
+                        conflict = timestamp
+                    continue
+                _, used_in_new = cls._match_all(old_rows_data, new_rows_data)
+                new_indices.extend(
+                    new_rows[index]
+                    for index, matched in enumerate(used_in_new)
+                    if not matched
+                )
+                continue
+
+            all_old_matched, used_in_new = cls._match_all(old_rows_data, new_rows_data)
+            all_new_matched, _ = cls._match_all(new_rows_data, old_rows_data)
+
+            if all_old_matched:
+                new_indices.extend(
+                    new_rows[index]
+                    for index, matched in enumerate(used_in_new)
+                    if not matched
+                )
+            elif not all_new_matched:
+                if conflict is None or timestamp < conflict:
+                    conflict = timestamp
+        return new_indices, conflict
+
+    @staticmethod
+    def _merge_arrays(old_data, new_data, new_indices, field_names):
+        '''Return timestamp-sorted arrays containing old plus the new samples.'''
+        if not new_indices:
+            return None
+        old_timestamps = old_data['timestamp']
+        new_timestamps = new_data['timestamp'][new_indices]
+        timestamps = np.concatenate((old_timestamps, new_timestamps))
+        order = np.argsort(timestamps, kind='stable')
+        merged = {'timestamp': timestamps[order]}
+        for name in field_names:
+            if name == 'timestamp':
+                continue
+            values = np.concatenate((old_data[name], new_data[name][new_indices]))
+            merged[name] = values[order]
+        return merged
+
+    @staticmethod
+    def _values_json(data, field_name):
+        '''Build the optional JSON representation used by save(append_json=True).'''
+        timestamp_list = [str(s) for s in data['timestamp'].tolist()]
+        values = data[field_name]
+        return str(dict(zip(timestamp_list, values.tolist()))) \
+            .replace('nan', 'null').replace('inf', 'null').replace("'", '"')
+
+    def _load_dataset_rows(self, cur, dataset_id):
+        '''Load a dataset's field metadata and BLOBs from the database.'''
+        cur.execute('''
+            SELECT Id, TopicName, DataType, ValueArray, ValueJson
+            FROM ULogField
+            WHERE DatasetId = ?
+            ORDER BY Id
+            ''', (dataset_id,))
+        rows = cur.fetchall()
+        fields = []
+        field_ids = []
+        data = {}
+        has_json = False
+        for field_id, field_name, data_type, value_bytes, value_json in rows:
+            fields.append(DatabaseULog._FieldData(field_name=field_name, type_str=data_type))
+            field_ids.append(field_id)
+            dtype = DatabaseULog._UNPACK_TYPES[data_type][2]
+            data[field_name] = np.frombuffer(value_bytes, dtype=dtype)
+            has_json = has_json or value_json is not None
+        return fields, field_ids, data, has_json
+
+    def _validate_and_plan_merge(self, con, target_pk):
+        '''
+        Compare this log with the archived record without changing anything.
+
+        Returns a plan describing new datasets and missing samples, or raises
+        ULogMergeConflict with the first (in time) conflicting topic.
+
+        Comparisons are made per topic instance: the stored format must be
+        identical (same fields, types, order and timestamp column), and the
+        overlapping samples must not contradict the archive. A topic that is
+        not in the archive at all is simply new; its samples are not compared
+        against other topics.
+        '''
+        cur = con.cursor()
+        cur.execute('''
+            SELECT Id, DatasetName, MultiId, MessageId, TimestampIndex
+            FROM ULogDataset
+            WHERE ULogId = ?
+            ''', (target_pk,))
+        existing_datasets = {}
+        for dataset_id, name, multi_id, msg_id, timestamp_idx in cur.fetchall():
+            fields, field_ids, data, has_json = self._load_dataset_rows(cur, dataset_id)
+            existing_datasets[(name, multi_id)] = {
+                'id': dataset_id,
+                'msg_id': msg_id,
+                'timestamp_idx': timestamp_idx,
+                'fields': fields,
+                'field_ids': field_ids,
+                'data': data,
+                'has_json': has_json,
+            }
+
+        conflicts = []
+        new_datasets = []
+        missing_samples = {}
+        for dataset in self.data_list:
+            key = (dataset.name, dataset.multi_id)
+            existing = existing_datasets.get(key)
+            if existing is None:
+                new_datasets.append(dataset)
+                continue
+
+            existing_field_names = [field.field_name for field in existing['fields']]
+            new_field_names = [field.field_name for field in dataset.field_data]
+            format_ok = (
+                existing['timestamp_idx'] == dataset.timestamp_idx and
+                existing_field_names == new_field_names and
+                all(left.type_str == right.type_str for left, right in
+                    zip(existing['fields'], dataset.field_data))
+            )
+            if not format_ok:
+                existing_timestamps = existing['data'].get('timestamp', [])
+                new_timestamps = dataset.data.get('timestamp', [])
+                if len(existing_timestamps) and len(new_timestamps):
+                    # The format conflict is observable at the first moment
+                    # at which both files claim samples for this topic.
+                    timestamp = int(max(min(existing_timestamps), min(new_timestamps)))
+                elif len(new_timestamps):
+                    timestamp = int(min(new_timestamps))
+                elif len(existing_timestamps):
+                    timestamp = int(min(existing_timestamps))
+                else:
+                    timestamp = int(self._start_timestamp)
+                conflicts.append((timestamp, dataset.name, dataset.multi_id,
+                                  'stored and supplied topic formats differ'))
+                continue
+
+            new_indices, conflict = self._new_sample_indices(
+                existing['data'], dataset.data)
+            if conflict is not None:
+                conflicts.append((conflict, dataset.name, dataset.multi_id,
+                                  'stored and supplied samples differ'))
+            missing_samples[key] = (existing, dataset, new_indices)
+
+        if conflicts:
+            timestamp, topic, multi_id, reason = min(
+                conflicts, key=lambda item: (item[0], item[1], item[2]))
+            raise ULogMergeConflict(topic, timestamp, multi_id=multi_id, reason=reason)
+        cur.close()
+        return existing_datasets, new_datasets, missing_samples
+
+    def _merge_into(self, target_pk, append_json=False):
+        '''
+        Merge this log into an existing record as a supplement.
+
+        All validation happens before the first write; the write itself is a
+        single transaction, so a conflict leaves the archived record exactly
+        as it was.
+        '''
+        with self._db() as con:
+            cur = con.cursor()
+            existing_datasets, new_datasets, missing_samples = \
+                self._validate_and_plan_merge(con, target_pk)
+
+            added_datasets = []
+            updated_datasets = []
+            added_samples = 0
+
+            for dataset in new_datasets:
+                cur.execute('''
+                    INSERT INTO ULogDataset
+                    (DatasetName, MultiId, MessageId, TimestampIndex, ULogId)
+                    VALUES
+                    (?, ?, ?, ?, ?)
+                    ''', (
+                        dataset.name,
+                        dataset.multi_id,
+                        dataset.msg_id,
+                        dataset.timestamp_idx,
+                        target_pk,
+                    ))
+                dataset_id = cur.lastrowid
+                for field in dataset.field_data:
+                    values = dataset.data[field.field_name]
+                    values_bytes = values.tobytes()
+                    values_json = None
+                    json_placeholder = '?'
+                    if append_json:
+                        values_json = self._values_json(dataset.data, field.field_name)
+                        json_placeholder = 'json(?)'
+                    cur.execute(f'''
+                        INSERT INTO ULogField
+                        (TopicName, DataType, ValueArray, ValueJson, DatasetId)
+                        VALUES
+                        (?, ?, ?, {json_placeholder}, ?)
+                        ''', (
+                            field.field_name,
+                            field.type_str,
+                            values_bytes,
+                            values_json,
+                            dataset_id,
+                        ))
+                added_datasets.append((dataset.name, dataset.multi_id))
+                added_samples += len(dataset.data.get('timestamp', []))
+
+            for key, (existing, dataset, new_indices) in missing_samples.items():
+                if not new_indices:
+                    continue
+                field_names = [field.field_name for field in existing['fields']]
+                merged = self._merge_arrays(
+                    existing['data'], dataset.data, new_indices, field_names)
+                for field, field_id in zip(existing['fields'], existing['field_ids']):
+                    values = merged[field.field_name]
+                    values_bytes = values.tobytes()
+                    if append_json or existing['has_json']:
+                        values_json = self._values_json(merged, field.field_name)
+                        json_placeholder = 'json(?)'
+                    else:
+                        values_json = None
+                        json_placeholder = '?'
+                    # Update by the stored field Id: the field name alone is
+                    # not unique when nested types flatten to the same name.
+                    cur.execute(f'''
+                        UPDATE ULogField
+                        SET ValueArray = ?, ValueJson = {json_placeholder}
+                        WHERE DatasetId = ? AND Id = ?
+                        ''', (
+                            values_bytes,
+                            values_json,
+                            existing['id'],
+                            field_id,
+                        ))
+                updated_datasets.append(key)
+                added_samples += len(new_indices)
+
+            # Timestamp-independent metadata is added only where the archived
+            # record has no value yet. Existing values are never overwritten.
+            cur.execute('SELECT Key FROM ULogMessageInfo WHERE ULogId = ?', (target_pk,))
+            existing_info_keys = {row[0] for row in cur.fetchall()}
+            cur.executemany('''
+                INSERT INTO ULogMessageInfo
+                (Key, Value, Typename, ULogId)
+                VALUES
+                (?, ?, ?, ?)
+                ''', [(
+                    key,
+                    value,
+                    self._msg_info_dict_types[key],
+                    target_pk,
+                ) for key, value in self.msg_info_dict.items()
+                    if key not in existing_info_keys])
+
+            cur.execute('SELECT Key FROM ULogInitialParameter WHERE ULogId = ?', (target_pk,))
+            existing_param_keys = {row[0] for row in cur.fetchall()}
+            cur.executemany('''
+                INSERT INTO ULogInitialParameter
+                (Key, Value, ULogId)
+                VALUES
+                (?, ?, ?)
+                ''', [(
+                    key,
+                    value,
+                    target_pk,
+                ) for key, value in self.initial_parameters.items()
+                    if key not in existing_param_keys])
+
+            cur.execute('''
+                SELECT DefaultType, Key
+                FROM ULogDefaultParameter
+                WHERE ULogId = ?
+                ''', (target_pk,))
+            existing_defaults = {(default_type, key) for default_type, key in cur.fetchall()}
+            cur.executemany('''
+                INSERT INTO ULogDefaultParameter
+                (DefaultType, Key, Value, ULogId)
+                VALUES
+                (?, ?, ?, ?)
+                ''', [(
+                    default_type,
+                    key,
+                    value,
+                    target_pk,
+                ) for default_type, parameters in self._default_parameters.items()
+                    for key, value in parameters.items()
+                    if (default_type, key) not in existing_defaults])
+
+            cur.execute('''
+                SELECT Timestamp, Key, Value
+                FROM ULogChangedParameter
+                WHERE ULogId = ?
+                ''', (target_pk,))
+            existing_changes = {(timestamp, key, value) for timestamp, key, value
+                                in cur.fetchall()}
+            cur.executemany('''
+                INSERT INTO ULogChangedParameter
+                (Timestamp, Key, Value, ULogId)
+                VALUES
+                (?, ?, ?, ?)
+                ''', [(
+                    timestamp,
+                    key,
+                    value,
+                    target_pk,
+                ) for timestamp, key, value in self.changed_parameters
+                    if (timestamp, key, value) not in existing_changes])
+
+            cur.execute('''
+                SELECT LogLevel, Timestamp, Message
+                FROM ULogMessageLogging
+                WHERE ULogId = ?
+                ''', (target_pk,))
+            existing_messages = {}
+            for row in cur.fetchall():
+                existing_messages[row] = existing_messages.get(row, 0) + 1
+            new_messages = []
+            for message in self.logged_messages:
+                row = (message.log_level, message.timestamp, message.message)
+                if existing_messages.get(row, 0) > 0:
+                    existing_messages[row] -= 1
+                else:
+                    new_messages.append(row)
+            cur.executemany('''
+                INSERT INTO ULogMessageLogging
+                (LogLevel, Timestamp, Message, ULogId)
+                VALUES
+                (?, ?, ?, ?)
+                ''', [(level, timestamp, message, target_pk)
+                      for level, timestamp, message in new_messages])
+
+            cur.execute('''
+                SELECT LogLevel, Timestamp, Tag, Message
+                FROM ULogMessageLoggingTagged
+                WHERE ULogId = ?
+                ''', (target_pk,))
+            existing_tagged = {}
+            for row in cur.fetchall():
+                existing_tagged[row] = existing_tagged.get(row, 0) + 1
+            tagged_rows = []
+            for tag, messages in self._logged_messages_tagged.items():
+                for message in messages:
+                    row = (message.log_level, message.timestamp, tag, message.message)
+                    if existing_tagged.get(row, 0) > 0:
+                        existing_tagged[row] -= 1
+                    else:
+                        tagged_rows.append(row)
+            cur.executemany('''
+                INSERT INTO ULogMessageLoggingTagged
+                (LogLevel, Timestamp, Tag, Message, ULogId)
+                VALUES
+                (?, ?, ?, ?, ?)
+                ''', [(level, timestamp, tag, message, target_pk)
+                      for level, timestamp, tag, message in tagged_rows])
+
+            cur.execute('''
+                SELECT Timestamp, Duration
+                FROM ULogMessageDropout
+                WHERE ULogId = ?
+                ''', (target_pk,))
+            existing_dropouts = {}
+            for row in cur.fetchall():
+                existing_dropouts[row] = existing_dropouts.get(row, 0) + 1
+            new_dropouts = []
+            for dropout in self.dropouts:
+                row = (dropout.timestamp, dropout.duration)
+                if existing_dropouts.get(row, 0) > 0:
+                    existing_dropouts[row] -= 1
+                else:
+                    new_dropouts.append(row)
+            cur.executemany('''
+                INSERT INTO ULogMessageDropout
+                (Timestamp, Duration, ULogId)
+                VALUES
+                (?, ?, ?)
+                ''', [(timestamp, duration, target_pk)
+                      for timestamp, duration in new_dropouts])
+
+            cur.execute('SELECT Name FROM ULogMessageFormat WHERE ULogId = ?', (target_pk,))
+            existing_formats = {row[0] for row in cur.fetchall()}
+            for name, message_format in self._message_formats.items():
+                if name in existing_formats:
+                    continue
+                cur.execute('''
+                    INSERT INTO ULogMessageFormat
+                    (Name, ULogId)
+                    VALUES
+                    (?, ?)
+                    ''', (name, target_pk))
+                format_id = cur.lastrowid
+                cur.executemany('''
+                    INSERT INTO ULogMessageFormatField
+                    (FieldType, ArraySize, Name, MessageId)
+                    VALUES
+                    (?, ?, ?, ?)
+                    ''', [(*field, format_id) for field in message_format.fields])
+
+            cur.execute('''
+                SELECT Key
+                FROM ULogMessageInfoMultiple
+                WHERE ULogId = ?
+                ''', (target_pk,))
+            existing_multiple = {row[0] for row in cur.fetchall()}
+            for key, lists in self.msg_info_multiple_dict.items():
+                if key in existing_multiple:
+                    continue
+                cur.execute('''
+                    INSERT INTO ULogMessageInfoMultiple
+                    (Key, Typename, ULogId)
+                    VALUES
+                    (?, ?, ?)
+                    ''', (key, self._msg_info_multiple_dict_types[key], target_pk))
+                message_id = cur.lastrowid
+                for list_index, message_list in enumerate(lists):
+                    cur.execute('''
+                        INSERT INTO ULogMessageInfoMultipleList
+                        (SeriesIndex, MessageId)
+                        VALUES
+                        (?, ?)
+                        ''', (list_index, message_id))
+                    list_id = cur.lastrowid
+                    cur.executemany('''
+                        INSERT INTO ULogMessageInfoMultipleListElement
+                        (SeriesIndex, Value, ListId)
+                        VALUES
+                        (?, ?, ?)
+                        ''', [(
+                            series_index,
+                            value,
+                            list_id,
+                        ) for series_index, value in enumerate(message_list)])
+
+            cur.execute('''
+                SELECT StartTimestamp, LastTimestamp, SyncCount, HasSync
+                FROM ULog
+                WHERE Id = ?
+                ''', (target_pk,))
+            (stored_start, stored_last, stored_sync_count, stored_has_sync) = cur.fetchone()
+            start_timestamp = min(stored_start, self._start_timestamp)
+            last_timestamp = max(stored_last, self._last_timestamp)
+            # Sync counters describe the file envelope, not the samples. Keep
+            # them consistent with the stored bytes instead of silently
+            # replacing the archived record's values.
+            sync_count = max(stored_sync_count or 0, self._sync_seq_cnt)
+            has_sync = bool(stored_has_sync) or bool(self._has_sync)
+            cur.execute('''
+                UPDATE ULog
+                SET StartTimestamp = ?, LastTimestamp = ?, SyncCount = ?, HasSync = ?
+                WHERE Id = ?
+                ''', (start_timestamp, last_timestamp, sync_count, has_sync, target_pk))
+
+            status = 'merged' if (added_datasets or added_samples) else 'contained'
+            cur.execute('''
+                INSERT OR REPLACE INTO ULogSupplement
+                (ULogId, SHA256Sum, StartTimestamp, LastTimestamp, Status, Reason,
+                 ConflictTopic, ConflictMultiId, ConflictTimestamp,
+                 AddedDatasetCount, AddedSampleCount, MergedAt)
+                VALUES
+                (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?)
+                ''', (
+                    target_pk,
+                    self._sha256sum,
+                    self._start_timestamp,
+                    self._last_timestamp,
+                    status,
+                    len(added_datasets),
+                    added_samples,
+                    datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                ))
+            cur.close()
+
+        self._start_timestamp = start_timestamp
+        self._last_timestamp = last_timestamp
+        self._sync_seq_cnt = sync_count
+        self._has_sync = has_sync
+        self._last_merge_report = {
+            'status': status,
+            'primary_key': target_pk,
+            'added_datasets': added_datasets,
+            'updated_datasets': updated_datasets,
+            'added_samples': added_samples,
+            'sha256sum': self._sha256sum,
+        }
+
+    @property
+    def last_merge_report(self):
+        '''Details of the most recent save() that was treated as a supplement.'''
+        return getattr(self, '_last_merge_report', None)
+
+    def _merge_evidence(self, cur, target_pk):
+        '''
+        Check the evidence that links this log to an existing record.
+
+        Returns (shared_topic_count, reason). A reason of None means the
+        evidence is sufficient; otherwise it explains what is missing.
+        '''
+        cur.execute('''
+            SELECT StartTimestamp, LastTimestamp
+            FROM ULog
+            WHERE Id = ?
+            ''', (target_pk,))
+        row = cur.fetchone()
+        if row is None:
+            return 0, f'no ULog with Id={target_pk}'
+        stored_start, stored_last = row
+        if stored_start > self._last_timestamp or stored_last < self._start_timestamp:
+            return 0, 'the time ranges do not overlap'
+
+        cur.execute('''
+            SELECT Key, Value
+            FROM ULogMessageInfo
+            WHERE ULogId = ?
+            ''', (target_pk,))
+        if not self._identity_matches(dict(cur.fetchall()), self.msg_info_dict):
+            return 0, 'the device identity does not match'
+
+        own_datasets = self._dataset_keys()
+        cur.execute('''
+            SELECT DatasetName, MultiId
+            FROM ULogDataset
+            WHERE ULogId = ?
+            ''', (target_pk,))
+        stored_datasets = {(name, multi_id) for name, multi_id in cur.fetchall()}
+        shared = len(own_datasets & stored_datasets)
+        if shared == 0:
+            return 0, 'the files have no topic instance in common'
+        if not self._has_common_sample(cur, target_pk, own_datasets):
+            return shared, 'the files share no identical sample, so they are not the same acquisition'
+        return shared, None
+
+    def merge_into(self, primary_key, append_json=False, require_evidence=True):
+        '''
+        Merge this log into an existing database record as a supplement.
+
+        Use this when the target record is known explicitly. With
+        require_evidence=True (the default) the same positive checks as save()
+        apply: overlapping time range, matching device identity, a shared
+        topic and at least two identical samples in different topics. Without
+        such evidence ULogMergeEvidenceError is raised and nothing is written.
+
+        A contradictory supplement raises ULogMergeConflict identifying the
+        first conflicting topic and timestamp; the stored record is left
+        exactly as it was.
+        '''
+        if self._pk is not None:
+            raise KeyError('Cannot merge a log that is already in the database')
+        already = DatabaseULog.primary_key_from_sha256sum(self._db, self._sha256sum)
+        if already is not None:
+            raise KeyError(f'Hash {self._sha256sum} already in database with Id={already}')
+        already = DatabaseULog.primary_key_from_supplement_sha256sum(
+            self._db, self._sha256sum)
+        if already is not None:
+            self._pk = already
+            return
+        with self._db() as con:
+            cur = con.cursor()
+            if require_evidence:
+                shared, reason = self._merge_evidence(cur, primary_key)
+                if reason is not None:
+                    cur.close()
+                    raise ULogMergeEvidenceError(
+                        f'Cannot merge into Id={primary_key}: {reason}')
+                del shared
+            cur.close()
+        self._merge_into(primary_key, append_json=append_json)
+        self._pk = primary_key
+
+    def save(self, append_json=False, merge=True):
         '''
         Save the DatabaseULog to the database. Throws a KeyError if the primary
         key is already in the database.
@@ -497,8 +1388,20 @@ class DatabaseULog(ULog):
         append_json=True, then datasets are additionally stored in a JSON
         field. This allows them to be directly queried using the sqlite
         function json_each, but increases the writing time and database size.
-        '''
 
+        If a file with a new digest can be shown to belong to the same
+        acquisition as an existing record, it is treated as a supplement: only
+        datasets and samples that are genuinely missing are inserted, and
+        everything else already in the database is kept byte-for-byte. The
+        evidence is an overlapping time range, a matching device identity, a
+        shared topic instance and at least one identical sample. Identical
+        start/end timestamps alone are explicitly not enough, so a different
+        run with the same envelope becomes its own record. A supplement that
+        contradicts an archived sample raises ULogMergeConflict and leaves the
+        record untouched. Re-submitting a file that was already merged is a
+        no-op and returns the original record. Pass merge=False to force the
+        old behaviour of always inserting a new row.
+        '''
         if self._pk is not None:
             raise KeyError('Cannot save logs that are already in the database')
 
@@ -506,6 +1409,22 @@ class DatabaseULog(ULog):
         if pk_from_hash is not None:
             self._pk = pk_from_hash
             raise KeyError(f'Hash {self._sha256sum} already in database with Id={pk_from_hash}')
+
+        # A file that was already merged before is idempotent: re-submitting
+        # the complete export must not create another row or another copy of
+        # its samples.
+        pk_from_supplement = DatabaseULog.primary_key_from_supplement_sha256sum(
+            self._db, self._sha256sum)
+        if pk_from_supplement is not None:
+            self._pk = pk_from_supplement
+            return
+
+        if merge:
+            merge_target = self._find_merge_target()
+            if merge_target is not None:
+                self._merge_into(merge_target, append_json=append_json)
+                self._pk = merge_target
+                return
 
         with self._db() as con:
             cur = con.cursor()

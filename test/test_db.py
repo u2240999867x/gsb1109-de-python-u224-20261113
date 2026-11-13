@@ -11,6 +11,7 @@ from ddt import ddt, data
 
 from pyulog import ULog
 from pyulog.db import DatabaseULog
+from pyulog.exceptions import ULogMergeConflict
 from pyulog.migrate_db import migrate_db
 
 TEST_PATH = os.path.dirname(os.path.abspath(__file__))
@@ -274,3 +275,213 @@ class TestDatabaseULog(unittest.TestCase):
         loaded_dbulog._appended_offsets = []  # pylint: disable=protected-access
         loaded_dbulog._incompat_flags[0] &= 0xFE  # pylint: disable=protected-access
         assert copied == loaded_dbulog
+
+
+class TestDatabaseULogSupplements(unittest.TestCase):
+    '''
+    Test importing a readable export first and completing it later from a
+    full export of the same acquisition.
+    '''
+
+    def setUp(self):
+        self.db_path = os.path.join(TEST_PATH, 'pyulog_supplement_test.sqlite3')
+        self.db_handle = DatabaseULog.get_db_handle(self.db_path)
+        migrate_db(self.db_path)
+
+    def tearDown(self):
+        if os.path.exists(self.db_path):
+            os.remove(self.db_path)
+
+    @staticmethod
+    def _write_prefix(source_path, target_path, fraction):
+        with open(source_path, 'rb') as source:
+            data = source.read()
+        with open(target_path, 'wb') as target:
+            target.write(data[:int(len(data) * fraction)])
+        return target_path
+
+    def test_partial_then_full_matches_original(self):
+        '''
+        A readable export that lacks samples is completed by the full ULog;
+        the result must equal the original log exactly.
+        '''
+        source = os.path.join(TEST_PATH, 'sample_log_small.ulg')
+        with tempfile.TemporaryDirectory() as tmpdir:
+            partial_path = self._write_prefix(
+                source, os.path.join(tmpdir, 'partial.ulg'), 0.25)
+            partial = DatabaseULog(self.db_handle, log_file=partial_path)
+            partial.save()
+            full_path = os.path.join(TEST_PATH, 'sample_log_small.ulg')
+            full = DatabaseULog(self.db_handle, log_file=full_path)
+            full.save()
+
+            self.assertEqual(full.primary_key, partial.primary_key)
+            report = full.last_merge_report
+            self.assertEqual(report['status'], 'merged')
+            self.assertGreater(report['added_samples'], 0)
+
+            loaded = DatabaseULog(self.db_handle,
+                                  primary_key=partial.primary_key,
+                                  lazy=False)
+            self.assertEqual(ULog(full_path), loaded)
+
+    def test_all_samples_merge_back_to_original(self):
+        '''
+        Complete every bundled sample from a readable prefix and compare.
+        This covers topics that legitimately repeat timestamps and logs with
+        appended data.
+        '''
+        for base_name in ('sample',
+                          'sample_log_small',
+                          'sample_appended',
+                          'sample_appended_multiple',
+                          'sample_logging_tagged_and_default_params',
+                          'sample_px4_events'):
+            self.setUp()
+            source = os.path.join(TEST_PATH, base_name + '.ulg')
+            with tempfile.TemporaryDirectory() as tmpdir:
+                partial_path = self._write_prefix(
+                    source, os.path.join(tmpdir, 'partial.ulg'), 0.3)
+                partial = DatabaseULog(self.db_handle, log_file=partial_path)
+                partial.save()
+                full = DatabaseULog(self.db_handle, log_file=source)
+                full.save()
+                loaded = DatabaseULog(self.db_handle,
+                                      primary_key=partial.primary_key,
+                                      lazy=False)
+                self.assertEqual(ULog(source), loaded, base_name)
+            self.tearDown()
+
+    def test_resubmitting_full_file_is_idempotent(self):
+        '''
+        Re-submitting an already merged complete file must not add rows,
+        datasets or samples.
+        '''
+        source = os.path.join(TEST_PATH, 'sample_log_small.ulg')
+        with tempfile.TemporaryDirectory() as tmpdir:
+            partial_path = self._write_prefix(
+                source, os.path.join(tmpdir, 'partial.ulg'), 0.25)
+            first = DatabaseULog(self.db_handle, log_file=partial_path)
+            first.save()
+            DatabaseULog(self.db_handle, log_file=source).save()
+
+            def counts():
+                with self.db_handle() as con:
+                    cur = con.cursor()
+                    result = []
+                    for table in ('ULog', 'ULogDataset', 'ULogField',
+                                  'ULogSupplement'):
+                        cur.execute('''
+                            SELECT COUNT(*) FROM {}
+                            '''.format(table))
+                        result.append(cur.fetchone()[0])
+                    cur.close()
+                return result
+
+            before = counts()
+            again = DatabaseULog(self.db_handle, log_file=source)
+            again.save()
+            self.assertEqual(again.primary_key, first.primary_key)
+            self.assertEqual(counts(), before)
+
+    def test_conflict_keeps_archive_and_reports_first_topic(self):
+        '''
+        A complete file that contradicts stored samples may not change the
+        archive; the error names the first conflicting topic and timestamp.
+        '''
+        source = os.path.join(TEST_PATH, 'sample_log_small.ulg')
+        with tempfile.TemporaryDirectory() as tmpdir:
+            partial_path = self._write_prefix(
+                source, os.path.join(tmpdir, 'partial.ulg'), 0.25)
+            partial = DatabaseULog(self.db_handle, log_file=partial_path)
+            partial.save()
+
+            modified = ULog(source)
+            dataset = next(d for d in modified.data_list
+                           if d.name == 'actuator_armed')
+            field_name = next(name for name in dataset.data
+                              if name != 'timestamp')
+            dataset.data[field_name] = dataset.data[field_name].copy()
+            dataset.data[field_name][0] = dataset.data[field_name][0] + 1
+            modified_path = os.path.join(tmpdir, 'modified.ulg')
+            modified.write_ulog(modified_path)
+
+            with self.db_handle() as con:
+                cur = con.cursor()
+                cur.execute('''
+                    SELECT COUNT(*), SUM(LENGTH(ValueArray))
+                    FROM ULogField f JOIN ULogDataset d ON f.DatasetId = d.Id
+                    WHERE d.ULogId = ?
+                    ''', (partial.primary_key,))
+                before = cur.fetchone()
+                cur.close()
+
+            conflicting = DatabaseULog(self.db_handle, log_file=modified_path)
+            with self.assertRaises(ULogMergeConflict) as raised:
+                conflicting.save()
+            error = raised.exception
+            self.assertEqual(error.conflict_topic, 'actuator_armed')
+            self.assertEqual(error.conflict_multi_id, 0)
+            self.assertEqual(
+                error.conflict_timestamp,
+                int(dataset.data['timestamp'][0]))
+
+            with self.db_handle() as con:
+                cur = con.cursor()
+                cur.execute('''
+                    SELECT COUNT(*), SUM(LENGTH(ValueArray))
+                    FROM ULogField f JOIN ULogDataset d ON f.DatasetId = d.Id
+                    WHERE d.ULogId = ?
+                    ''', (partial.primary_key,))
+                self.assertEqual(cur.fetchone(), before)
+                cur.execute('SELECT COUNT(*) FROM ULog WHERE Id = ?',
+                            (partial.primary_key,))
+                self.assertEqual(cur.fetchone()[0], 1)
+                cur.close()
+
+    def test_identical_time_range_from_other_run_is_separate(self):
+        '''
+        Two different acquisitions with exactly the same start/end time must
+        not be attached to the same record.
+        '''
+        stored = os.path.join(TEST_PATH, 'sample_appended.ulg')
+        other = os.path.join(TEST_PATH, 'sample_log_small.ulg')
+        stored_log = ULog(stored)
+        other_log = ULog(other)
+        for key in ('sys_uuid', 'ver_hw', 'ver_sw', 'sys_name'):
+            if key in stored_log.msg_info_dict:
+                other_log._msg_info_dict[key] = stored_log.msg_info_dict[key]
+                other_log._msg_info_dict_types[key] = \
+                    stored_log._msg_info_dict_types[key]
+        other_log._start_timestamp = stored_log.start_timestamp
+        other_log._last_timestamp = stored_log.last_timestamp
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            other_path = os.path.join(tmpdir, 'other.ulg')
+            other_log.write_ulog(other_path)
+            stored_db = DatabaseULog(self.db_handle, log_file=stored)
+            stored_db.save()
+            other_db = DatabaseULog(self.db_handle, log_file=other_path)
+            other_db.save()
+
+            self.assertNotEqual(stored_db.primary_key, other_db.primary_key)
+            self.assertIsNone(other_db.last_merge_report)
+
+    def test_contained_partial_is_not_duplicated(self):
+        '''
+        Importing the full export first and the readable prefix afterwards
+        must not duplicate anything.
+        '''
+        source = os.path.join(TEST_PATH, 'sample_log_small.ulg')
+        with tempfile.TemporaryDirectory() as tmpdir:
+            partial_path = self._write_prefix(
+                source, os.path.join(tmpdir, 'partial.ulg'), 0.35)
+            full = DatabaseULog(self.db_handle, log_file=source)
+            full.save()
+            partial = DatabaseULog(self.db_handle, log_file=partial_path)
+            partial.save()
+
+            self.assertEqual(partial.primary_key, full.primary_key)
+            self.assertEqual(partial.last_merge_report['status'], 'contained')
+            self.assertEqual(partial.last_merge_report['added_samples'], 0)
+            self.assertEqual(partial.last_merge_report['added_datasets'], [])

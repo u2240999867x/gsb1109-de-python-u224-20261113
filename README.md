@@ -238,6 +238,32 @@ options:
   -v, --verbose         Print extra debugging information
 ```
 
+### Supplements in DatabaseULog
+
+Field stations often hand over a readable export first and the complete ULog the
+next day. `DatabaseULog.save()` accepts such a later file as a supplement when
+there is positive evidence that both belong to the same acquisition:
+
+- the time ranges overlap,
+- the device identity matches (`sys_uuid`, otherwise `ver_hw` + `ver_sw`),
+- at least one topic instance is shared, and
+- at least two identical non-zero samples are shared.
+
+Only missing datasets and missing samples are written; existing rows are kept
+unchanged. Identical `StartTimestamp`/`LastTimestamp` alone do not qualify: two
+different runs with the same envelope become separate `ULog` records. If a
+supplied sample contradicts an archived one, `ULogMergeConflict` is raised with
+`.conflict_topic`, `.conflict_multi_id` and `.conflict_timestamp` naming the
+first conflict, and the archive is left untouched. Re-submitting a complete file
+that was already merged is a no-op and returns the original `primary_key`.
+
+To merge into a known record explicitly, use
+`DatabaseULog(...).merge_into(primary_key)`. Pass `merge=False` to `save()` to
+bypass the supplement logic and always create a new record.
+
+Each accepted supplement is recorded in `ULogSupplement` (status `merged` when
+it added data, `contained` when everything was already present).
+
 ### Migrate/setup the database for use with the DatabaseULog class (ulog_migratedb)
 
 > **Warning** This command must be run whenever the schema changes, otherwise DatabaseULog won't function.
