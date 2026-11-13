@@ -36,6 +36,7 @@ classifiers = [
 ]
 
 [project.scripts]
+ulog_calibration = "pyulog.calibration:main"
 ulog_extract_gps_dump = "pyulog.extract_gps_dump:main"
 ulog_info = "pyulog.info:main"
 ulog_messages = "pyulog.messages:main"

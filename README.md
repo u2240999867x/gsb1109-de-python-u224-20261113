@@ -8,6 +8,8 @@ The provided [command line scripts](#scripts) are:
 - `ulog_info`: display information from an ULog file.
 - `ulog_messages`: display logged messages from an ULog file.
 - `ulog_params`: extract parameters from an ULog file.
+- `ulog_calibration`: annotate the samples of a topic with the calibration
+  parameters in effect at each sample.
 - `ulog2csv`: convert ULog to CSV files.
 - `ulog2kml`: convert ULog to KML files.
 - `ulog2ros2bag`: convert ULog to ROS2 bag files.
