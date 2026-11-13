@@ -4,6 +4,7 @@
 """A tiny library for parsing, modifying, and composing SRT files."""
 
 from __future__ import unicode_literals
+import difflib
 import functools
 import re
 from datetime import timedelta
@@ -12,6 +13,19 @@ import io
 
 
 LOG = logging.getLogger(__name__)
+
+# A speaker marker is a content line consisting solely of a (possibly
+# whitespace-prefixed) name followed by ":" or "：", for example "ALICE:" or
+# "张三：". These lines delimit spoken paragraphs and must stay locatable when
+# paragraph breaks are restored.
+SPEAKER_MARKER_REGEX = re.compile(r"^\s*[^\s:：][^:：]{0,30}[:：]\s*$")
+
+# Manifest format version, bumped if the on-disk record shape changes.
+MANIFEST_VERSION = 1
+
+# Minimum difflib line similarity at which an edited anchor is considered the
+# same line edited in place rather than a removed boundary.
+ANCHOR_SIMILARITY_THRESHOLD = 0.5
 
 # "." is not technically valid as a delimiter, but many editors create SRT
 # files with this delimiter for whatever reason. Many editors and players
@@ -92,6 +106,11 @@ try:
     FILE_TYPES = (file, io.IOBase)  # pytype: disable=name-error
 except NameError:  # `file` doesn't exist in Python 3
     FILE_TYPES = (io.IOBase,)
+
+try:  # Python 2
+    TEXT_TYPES = (str, unicode)  # noqa: F821  pytype: disable=name-error
+except NameError:  # Python 3
+    TEXT_TYPES = (str,)
 
 
 @functools.total_ordering
@@ -205,6 +224,397 @@ def make_legal_content(content):
     legal_content = MULTI_WS_REGEX.sub("\n", content.strip("\n"))
     LOG.info("Legalised content %r to %r", content, legal_content)
     return legal_content
+
+
+def _gap_record(blank_line_count):
+    """
+    Build the manifest entry describing how two adjacent anchor lines were
+    joined in the original content. ``blank_line_count`` is the number of
+    empty lines found between the two anchors.
+    """
+    if blank_line_count:
+        # One newline to terminate the anchor, plus one per blank line.
+        return {"type": "blank", "eol": "\n" * (blank_line_count + 1)}
+    return {"type": "newline", "eol": "\n"}
+
+
+def make_legal_content_with_record(content):
+    r"""
+    Legalise content for strict SRT output while recording everything that was
+    removed, so that the original paragraph structure can be reconstructed
+    later from an edited copy of the strict output.
+
+    The returned manifest record stores:
+
+    * ``anchors``: every non-empty physical line kept by strict legalisation,
+      in order. Whitespace-only lines and speaker marker lines (such as
+      ``"ALICE:"``) are kept verbatim here, since strict mode does not remove
+      them.
+    * ``separators``: one entry per gap between two adjacent anchors, holding
+      the exact newline run that joined them. ``blank`` entries mark paragraph
+      boundaries collapsed by strict mode.
+    * ``leading``/``trailing``: the exact newline runs stripped from the start
+      and the end of the content.
+
+    .. doctest::
+
+        >>> legal, record = make_legal_content_with_record(
+        ...     'ALICE:\nHello.\n\nBOB:\n   \nHi.\n'
+        ... )
+        >>> legal
+        'ALICE:\nHello.\nBOB:\n   \nHi.'
+        >>> record["anchors"]
+        ['ALICE:', 'Hello.', 'BOB:', '   ', 'Hi.']
+        >>> record["speaker_anchors"]
+        [0, 2]
+        >>> record["separators"][1]
+        {'type': 'blank', 'eol': '\n\n'}
+        >>> record["trailing"]
+        '\n'
+
+    :param str content: The content to make legal
+    :returns: A tuple of the legalised content and a manifest record (or
+              ``None`` when strict legalisation changed nothing)
+    :rtype: tuple(str, dict or None)
+    """
+    if content and content[0] != "\n" and "\n\n" not in content:
+        return content, None
+
+    legal_content = make_legal_content(content)
+
+    # Content made only of newlines has no anchors at all. Keep the exact
+    # original text as the leading run so it can be put back verbatim.
+    if not legal_content:
+        return legal_content, {
+            "anchors": [],
+            "speaker_anchors": [],
+            "whitespace_anchors": [],
+            "leading": content,
+            "trailing": "",
+            "separators": [],
+        }
+
+    lines = content.split("\n")
+
+    leading_count = 0
+    while lines and lines[0] == "":
+        leading_count += 1
+        lines.pop(0)
+
+    trailing_count = 0
+    while lines and lines[-1] == "":
+        trailing_count += 1
+        lines.pop()
+
+    anchors = []
+    separators = []
+    speaker_anchors = []
+    whitespace_anchors = []
+    blank_line_count = 0
+
+    for line in lines:
+        if line == "":
+            blank_line_count += 1
+            continue
+
+        if anchors:
+            separators.append(_gap_record(blank_line_count))
+        blank_line_count = 0
+
+        anchor_index = len(anchors)
+        anchors.append(line)
+        if line.isspace():
+            whitespace_anchors.append(anchor_index)
+        if SPEAKER_MARKER_REGEX.match(line):
+            speaker_anchors.append(anchor_index)
+
+    return legal_content, {
+        "anchors": anchors,
+        "speaker_anchors": speaker_anchors,
+        "whitespace_anchors": whitespace_anchors,
+        "leading": "\n" * leading_count,
+        "trailing": "\n" * trailing_count,
+        "separators": separators,
+    }
+
+
+def compose_strict_with_manifest(
+    subtitles, reindex=True, start_index=1, eol=None, in_place=False
+):
+    r"""
+    Compose subtitles into strict SRT output and a manifest describing the
+    paragraph breaks that strict legalisation removed.
+
+    The manifest is the rewrite record needed by :func:`restore_paragraphs`.
+    It only contains entries for subtitles whose content was actually changed
+    by legalisation. Manifest indexes always match the indexes rendered in the
+    returned SRT output.
+
+    .. doctest::
+
+        >>> from datetime import timedelta
+        >>> sub = Subtitle(
+        ...     index=1,
+        ...     start=timedelta(seconds=1),
+        ...     end=timedelta(seconds=2),
+        ...     content='ALICE:\nHi.\n\nBOB:\nHello.\n',
+        ... )
+        >>> strict_srt, manifest = compose_strict_with_manifest([sub])
+        >>> '\\n\\nBOB' not in strict_srt
+        True
+        >>> manifest["records"][0]["index"]
+        1
+        >>> manifest["records"][0]["anchors"][0]
+        'ALICE:'
+
+    :param subtitles: :py:class:`Subtitle` objects in any order
+    :param bool reindex: Whether to reindex subtitles based on start time
+    :param int start_index: If reindexing, the index to start reindexing from
+    :param str eol: The end of line string to use in the SRT output
+    :param bool in_place: Whether to reindex subs in-place for performance
+    :returns: A tuple of the strict SRT string and the manifest dict
+    :rtype: tuple(str, dict)
+    """
+    if reindex:
+        subtitles = sort_and_reindex(
+            subtitles, start_index=start_index, in_place=in_place
+        )
+
+    records = []
+    blocks = []
+
+    for subtitle in subtitles:
+        legal_content, record = make_legal_content_with_record(subtitle.content)
+        if record is not None:
+            record = dict(record)
+            record["index"] = subtitle.index or 0
+            records.append(record)
+
+        legal_subtitle = Subtitle(
+            index=subtitle.index,
+            start=subtitle.start,
+            end=subtitle.end,
+            content=legal_content,
+            proprietary=subtitle.proprietary,
+        )
+        blocks.append(legal_subtitle.to_srt(strict=True, eol=eol))
+
+    manifest = {"version": MANIFEST_VERSION, "records": records}
+    return "".join(blocks), manifest
+
+
+def _locate_anchors(edited_lines, record):
+    """
+    Find each recorded anchor line in the (possibly edited) strict content,
+    preserving line order.
+
+    Exact matches are preferred so unrelated edits are never confused with a
+    boundary change. If an anchor cannot be found exactly, a fuzzy line match
+    above :data:`ANCHOR_SIMILARITY_THRESHOLD` is accepted as an in-place edit
+    of the boundary line. Matching is scoped to this subtitle's lines only, so
+    a break can never be inserted into a different subtitle.
+
+    :raises ParagraphRestoreError: If an anchor cannot be located confidently
+    """
+    positions = []
+    search_from = 0
+    speaker_anchors = set(record.get("speaker_anchors", []))
+
+    for anchor_index, anchor in enumerate(record["anchors"]):
+        try:
+            position = edited_lines.index(anchor, search_from)
+        except ValueError:
+            candidates = [
+                (
+                    difflib.SequenceMatcher(
+                        None, anchor, edited_lines[candidate]
+                    ).ratio(),
+                    candidate,
+                )
+                for candidate in range(search_from, len(edited_lines))
+            ]
+
+            if not candidates:
+                raise ParagraphRestoreError(
+                    record.get("index"),
+                    anchor,
+                    anchor_index,
+                    anchor_index in speaker_anchors,
+                    "no lines remain in this subtitle after the anchor",
+                )
+
+            best_ratio, best_position = max(candidates)
+            if best_ratio < ANCHOR_SIMILARITY_THRESHOLD:
+                raise ParagraphRestoreError(
+                    record.get("index"),
+                    anchor,
+                    anchor_index,
+                    anchor_index in speaker_anchors,
+                    "no remaining line matches the original boundary "
+                    "(best similarity %.2f)" % best_ratio,
+                )
+            position = best_position
+            LOG.info(
+                "Matched edited anchor %r to %r (similarity %.2f)",
+                anchor,
+                edited_lines[position],
+                best_ratio,
+            )
+
+        positions.append(position)
+        search_from = position + 1
+
+    return positions
+
+
+def _restore_one_subtitle(subtitle, record):
+    """
+    Rebuild the original paragraph structure inside one subtitle while keeping
+    any edits made to non-boundary text.
+    """
+    anchors = record["anchors"]
+
+    if not anchors:
+        if subtitle.content:
+            raise ParagraphRestoreError(
+                record.get("index"),
+                "",
+                0,
+                False,
+                "subtitle originally contained only blank lines but now "
+                "has text content",
+            )
+        return record.get("leading", "") + record.get("trailing", "")
+
+    edited_lines = subtitle.content.split("\n")
+    positions = _locate_anchors(edited_lines, record)
+
+    parts = [record.get("leading", "")]
+    cursor = 0
+
+    for anchor_index, position in enumerate(positions):
+        # Keep lines an editor inserted before this anchor, joined normally.
+        while cursor < position:
+            parts.append(edited_lines[cursor])
+            parts.append("\n")
+            cursor += 1
+
+        # Use the edited line text verbatim so unrelated edits are preserved.
+        parts.append(edited_lines[position])
+        cursor = position + 1
+
+        if anchor_index < len(positions) - 1:
+            parts.append(record["separators"][anchor_index]["eol"])
+
+    # Trailing lines added by an editor are kept before the original suffix.
+    while cursor < len(edited_lines):
+        parts.append("\n")
+        parts.append(edited_lines[cursor])
+        cursor += 1
+
+    parts.append(record.get("trailing", ""))
+    return "".join(parts)
+
+
+def restore_paragraphs(srt_content, manifest, on_conflict="raise", eol=None):
+    r"""
+    Restore paragraph breaks removed by strict legalisation into an edited
+    strict SRT document, using the manifest produced by
+    :func:`compose_strict_with_manifest`.
+
+    Each manifest record is matched to a subtitle by its rendered index, and
+    only inside that subtitle's own lines. Edits made away from the original
+    paragraph boundaries are preserved. If an original boundary line can no
+    longer be located, a :class:`ParagraphRestoreError` is raised (or collected
+    when ``on_conflict`` is ``"skip"``) instead of guessing — the blank line is
+    never inserted into another subtitle, including one with the same index or
+    speaker marker.
+
+    .. doctest::
+
+        >>> from datetime import timedelta
+        >>> original = Subtitle(
+        ...     index=1,
+        ...     start=timedelta(seconds=1),
+        ...     end=timedelta(seconds=2),
+        ...     content='ALICE:\nHi.\n\nBOB:\nHello.\n',
+        ... )
+        >>> strict_srt, manifest = compose_strict_with_manifest([original])
+        >>> edited = strict_srt.replace('Hello.', 'Hello there.')
+        >>> restored, conflicts = restore_paragraphs(
+        ...     edited, manifest, on_conflict='skip'
+        ... )
+        >>> conflicts
+        []
+        >>> list(parse(restored))[0].content
+        'ALICE:\nHi.\n\nBOB:\nHello there.\n'
+
+    :param srt_content: Edited strict SRT text, or an iterable of
+                        :py:class:`Subtitle` objects
+    :param dict manifest: The manifest produced at strict export time
+    :param str on_conflict: ``"raise"`` (default) to raise on the first
+                            unlocatable boundary, or ``"skip"`` to leave that
+                            subtitle untouched and collect the conflict
+    :param str eol: The end of line string to use in the restored output
+    :returns: The restored SRT string. With ``on_conflict="skip"``, a tuple of
+              the SRT string and a list of :class:`ParagraphRestoreError`
+    :rtype: str or tuple(str, list)
+    :raises ParagraphRestoreError: If a paragraph boundary cannot be located
+                                   and ``on_conflict`` is ``"raise"``
+    :raises ValueError: If the manifest version is unsupported
+    """
+    if on_conflict not in ("raise", "skip"):
+        raise ValueError("on_conflict must be 'raise' or 'skip'")
+
+    if manifest.get("version") != MANIFEST_VERSION:
+        raise ValueError(
+            "Unsupported manifest version %r, expected %d"
+            % (manifest.get("version"), MANIFEST_VERSION)
+        )
+
+    if isinstance(srt_content, TEXT_TYPES):
+        subtitles = list(parse(srt_content))
+    else:
+        subtitles = [Subtitle(**vars(subtitle)) for subtitle in srt_content]
+
+    subtitles_by_index = {}
+    duplicate_indexes = set()
+    for subtitle in subtitles:
+        if subtitle.index in subtitles_by_index:
+            duplicate_indexes.add(subtitle.index)
+        subtitles_by_index[subtitle.index] = subtitle
+
+    conflicts = []
+
+    for record in manifest["records"]:
+        index = record.get("index")
+        conflict = None
+
+        if index in duplicate_indexes:
+            conflict = ParagraphRestoreError(
+                index, "", 0, False, "duplicate subtitle index in edited SRT"
+            )
+        elif index not in subtitles_by_index:
+            conflict = ParagraphRestoreError(
+                index, "", 0, False, "subtitle index missing from edited SRT"
+            )
+        else:
+            subtitle = subtitles_by_index[index]
+            try:
+                subtitle.content = _restore_one_subtitle(subtitle, record)
+            except ParagraphRestoreError as thrown:
+                conflict = thrown
+
+        if conflict is not None:
+            if on_conflict == "raise":
+                raise conflict
+            conflicts.append(conflict)
+
+    output = compose(subtitles, reindex=False, strict=False, eol=eol)
+
+    if on_conflict == "skip":
+        return output, conflicts
+    return output
 
 
 def timedelta_to_srt_timestamp(timedelta_timestamp):
@@ -503,6 +913,46 @@ class TimestampParseError(ValueError):
     """
     Raised when an SRT timestamp could not be parsed.
     """
+
+
+class ParagraphRestoreError(Exception):
+    """
+    Raised when an original paragraph boundary recorded in a manifest cannot
+    be located in the edited strict SRT document.
+
+    The conflicting subtitle is left untouched, and no separator is inserted
+    into any other subtitle — even one with the same index or the same speaker
+    marker — so paragraph retrieval for later subtitles stays reliable.
+
+    :param int index: The index of the subtitle whose boundary could not be
+                      located (``None`` if the manifest record had none)
+    :param str anchor: The original anchor line that could not be found
+    :param int anchor_index: The position of ``anchor`` within the manifest's
+                             anchor list
+    :param bool speaker_anchor: Whether the missing anchor was a speaker
+                                marker line
+    :param str reason: A human readable explanation of the conflict
+    """
+
+    def __init__(self, index, anchor, anchor_index, speaker_anchor, reason):
+        self.index = index
+        self.anchor = anchor
+        self.anchor_index = anchor_index
+        self.speaker_anchor = speaker_anchor
+        self.reason = reason
+
+        message = (
+            "Cannot restore paragraph boundary in subtitle index %r at "
+            "anchor %r (anchor #%d%s): %s"
+            % (
+                index,
+                anchor,
+                anchor_index,
+                ", speaker marker" if speaker_anchor else "",
+                reason,
+            )
+        )
+        super(ParagraphRestoreError, self).__init__(message)
 
 
 class _ShouldSkipException(Exception):

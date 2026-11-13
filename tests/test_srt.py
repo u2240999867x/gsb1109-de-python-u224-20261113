@@ -771,3 +771,242 @@ def test_parse_file_with_missing_index(input_subs):  # cf. issue #51
 
     # ...and sort the same.
     assert srt.compose(subs_no_index) == srt.compose(subs_zero_index)
+
+
+def paragraph_sub(index, content):
+    return srt.Subtitle(
+        index=index,
+        start=timedelta(seconds=index),
+        end=timedelta(seconds=index + 1),
+        content=content,
+    )
+
+
+PARAGRAPHED_CONTENT = "ALICE:\n你好。\n\nBOB:\n\n  \n我很好。\n"
+PARAGRAPHED_LEGAL = "ALICE:\n你好。\nBOB:\n  \n我很好。"
+
+
+def test_make_legal_content_with_record_records_blank_boundaries():
+    legal, record = srt.make_legal_content_with_record(PARAGRAPHED_CONTENT)
+
+    assert legal == PARAGRAPHED_LEGAL
+    assert record["anchors"] == ["ALICE:", "你好。", "BOB:", "  ", "我很好。"]
+    assert record["speaker_anchors"] == [0, 2]
+    assert record["whitespace_anchors"] == [3]
+    assert record["leading"] == ""
+    assert record["trailing"] == "\n"
+    assert record["separators"] == [
+        {"type": "newline", "eol": "\n"},
+        {"type": "blank", "eol": "\n\n"},
+        {"type": "blank", "eol": "\n\n"},
+        {"type": "newline", "eol": "\n"},
+    ]
+
+
+def test_make_legal_content_with_record_none_when_unchanged():
+    legal = "line one\nline two"
+    assert srt.make_legal_content_with_record(legal) == (legal, None)
+
+
+def test_make_legal_content_with_record_leading_and_trailing():
+    legal, record = srt.make_legal_content_with_record("\n\nfoo\nbar\n\n")
+
+    assert legal == "foo\nbar"
+    assert record["anchors"] == ["foo", "bar"]
+    assert record["leading"] == "\n\n"
+    assert record["trailing"] == "\n\n"
+
+
+def test_make_legal_content_with_record_only_blank_lines():
+    legal, record = srt.make_legal_content_with_record("\n\n\n")
+
+    assert legal == ""
+    assert record["anchors"] == []
+    assert record["leading"] == "\n\n\n"
+    assert record["trailing"] == ""
+
+
+def test_make_legal_content_with_record_fullwidth_speaker_marker():
+    legal, record = srt.make_legal_content_with_record(
+        "张三：\n你好\n\n李四：\n再见"
+    )
+
+    assert legal == "张三：\n你好\n李四：\n再见"
+    assert record["speaker_anchors"] == [0, 2]
+
+
+def test_compose_strict_with_manifest_only_records_changed_subs():
+    unchanged = paragraph_sub(1, "plain\nlines")
+    changed = paragraph_sub(2, "first\n\nsecond")
+
+    strict_srt, manifest = srt.compose_strict_with_manifest([unchanged, changed])
+
+    assert all("\n\n" not in sub.content for sub in srt.parse(strict_srt))
+    assert [record["index"] for record in manifest["records"]] == [2]
+    assert manifest["version"] == srt.MANIFEST_VERSION
+
+
+def test_compose_strict_with_manifest_indexes_match_rendered_output():
+    sub = paragraph_sub(42, "first\n\nsecond")
+
+    strict_srt, manifest = srt.compose_strict_with_manifest([sub])
+
+    assert [rendered.index for rendered in srt.parse(strict_srt)] == [1]
+    assert manifest["records"][0]["index"] == 1
+
+
+def test_restore_roundtrip_preserves_blank_whitespace_and_speaker_lines():
+    subs = [
+        paragraph_sub(1, PARAGRAPHED_CONTENT),
+        paragraph_sub(2, "ALICE:\n再见。\n\n慢走。"),
+        paragraph_sub(3, "no paragraph breaks here"),
+    ]
+
+    strict_srt, manifest = srt.compose_strict_with_manifest(subs)
+    restored = srt.restore_paragraphs(strict_srt, manifest)
+
+    subs_eq(srt.parse(restored), subs)
+
+
+def test_restore_keeps_edits_made_away_from_boundaries():
+    sub = paragraph_sub(1, PARAGRAPHED_CONTENT)
+    strict_srt, manifest = srt.compose_strict_with_manifest([sub])
+
+    edited = strict_srt.replace("你好。", "你好啊。")
+    restored, conflicts = srt.restore_paragraphs(edited, manifest, on_conflict="skip")
+
+    assert conflicts == []
+    restored_sub = list(srt.parse(restored))[0]
+    assert restored_sub.content == PARAGRAPHED_CONTENT.replace(
+        "你好。", "你好啊。"
+    )
+
+
+def test_restore_raises_when_boundary_anchor_destroyed():
+    sub = paragraph_sub(1, "ALICE:\n问\n\nBOB:\n答")
+    strict_srt, manifest = srt.compose_strict_with_manifest([sub])
+    broken = strict_srt.replace("BOB:", "完全不同的一行")
+
+    with pytest.raises(srt.ParagraphRestoreError) as exc_info:
+        srt.restore_paragraphs(broken, manifest)
+
+    assert exc_info.value.index == 1
+    assert exc_info.value.anchor == "BOB:"
+    assert exc_info.value.speaker_anchor is True
+
+
+def test_restore_skip_leaves_conflicting_subtitle_strict():
+    sub = paragraph_sub(1, "ALICE:\n问\n\nBOB:\n答")
+    strict_srt, manifest = srt.compose_strict_with_manifest([sub])
+    broken = strict_srt.replace("BOB:", "完全不同的一行")
+
+    restored, conflicts = srt.restore_paragraphs(broken, manifest, on_conflict="skip")
+
+    assert len(conflicts) == 1
+    restored_sub = list(srt.parse(restored))[0]
+    assert "\n\n" not in restored_sub.content
+
+
+def test_restore_never_inserts_break_into_next_same_speaker_subtitle():
+    subs = [
+        paragraph_sub(1, "ALICE:\n问\n\nBOB:\n答"),
+        paragraph_sub(2, "ALICE:\n另一条\n\nBOB:\n再答"),
+    ]
+    strict_srt, manifest = srt.compose_strict_with_manifest(subs)
+    broken = strict_srt.replace("BOB:", "分界被毁", 1)
+
+    restored, conflicts = srt.restore_paragraphs(broken, manifest, on_conflict="skip")
+
+    assert [conflict.index for conflict in conflicts] == [1]
+    restored_subs = list(srt.parse(restored))
+    assert "\n\n" not in restored_subs[0].content
+    assert restored_subs[1].content == "ALICE:\n另一条\n\nBOB:\n再答"
+
+
+def test_restore_reports_missing_and_duplicate_indexes():
+    sub = paragraph_sub(1, "first\n\nsecond")
+    _, manifest = srt.compose_strict_with_manifest([sub])
+
+    _, missing_conflicts = srt.restore_paragraphs(
+        [paragraph_sub(2, "first\nsecond")], manifest, on_conflict="skip"
+    )
+    assert missing_conflicts[0].index == 1
+    assert "missing" in missing_conflicts[0].reason
+
+    duplicate_subs = [
+        paragraph_sub(1, "first\nsecond"),
+        paragraph_sub(1, "other\nlines"),
+    ]
+    _, duplicate_conflicts = srt.restore_paragraphs(
+        duplicate_subs, manifest, on_conflict="skip"
+    )
+    assert duplicate_conflicts[0].index == 1
+    assert "duplicate" in duplicate_conflicts[0].reason
+
+
+def test_restore_fuzzy_matches_edited_boundary_line():
+    sub = paragraph_sub(1, "ALICE:\n问\n\nBOB:\n答")
+    strict_srt, manifest = srt.compose_strict_with_manifest([sub])
+    edited = strict_srt.replace("BOB:", "BOB（老板）:")
+
+    restored, conflicts = srt.restore_paragraphs(edited, manifest, on_conflict="skip")
+
+    assert conflicts == []
+    restored_sub = list(srt.parse(restored))[0]
+    assert restored_sub.content == "ALICE:\n问\n\nBOB（老板）:\n答"
+
+
+def test_restore_respects_custom_eol():
+    sub = paragraph_sub(1, "ALICE:\n问\n\nBOB:\n答")
+    strict_srt, manifest = srt.compose_strict_with_manifest([sub], eol="\r\n")
+
+    restored = srt.restore_paragraphs(strict_srt, manifest, eol="\r\n")
+
+    assert "\r\n\r\n" in restored
+    assert list(srt.parse(restored))[0].content == "ALICE:\n问\n\nBOB:\n答"
+
+
+def test_restore_rejects_unknown_manifest_version_and_policy():
+    sub = paragraph_sub(1, "first\n\nsecond")
+    strict_srt, _ = srt.compose_strict_with_manifest([sub])
+
+    with pytest.raises(ValueError):
+        srt.restore_paragraphs(strict_srt, {"version": 99, "records": []})
+
+    with pytest.raises(ValueError):
+        srt.restore_paragraphs(
+            strict_srt, {"version": 1, "records": []}, on_conflict="explode"
+        )
+
+
+def test_restore_accepts_subtitle_iterable():
+    subs = [paragraph_sub(1, PARAGRAPHED_CONTENT)]
+    strict_srt, manifest = srt.compose_strict_with_manifest(subs)
+    strict_subs = list(srt.parse(strict_srt))
+
+    restored, conflicts = srt.restore_paragraphs(
+        strict_subs, manifest, on_conflict="skip"
+    )
+
+    assert conflicts == []
+    subs_eq(srt.parse(restored), subs)
+
+
+@given(
+    st.text(
+        alphabet=st.characters(blacklist_characters="\r"),
+        min_size=1,
+    ).filter(lambda content: content.strip())
+)
+def test_manifest_roundtrip_rebuilds_any_original_content(content):
+    legal, record = srt.make_legal_content_with_record(content)
+
+    if record is None:
+        assert legal == content
+        return
+
+    assert legal == srt.make_legal_content(content)
+    strict_sub = paragraph_sub(1, legal)
+    rebuilt = srt._restore_one_subtitle(strict_sub, record)
+
+    assert rebuilt == content

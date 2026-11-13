@@ -48,6 +48,14 @@ Utilities
 - *normalise* standardises and cleans up SRT files. For example, it removes
   spurious newlines, normalises timestamps, and fixes subtitle indexing to a
   format that all media players should accept, with no noncompliant data.
+- *paragraphed* bridges strict players and paragraph-based retrieval. The
+  ``export`` mode writes a strict SRT (no blank lines inside subtitles) plus a
+  JSON manifest that records the removed blank lines, whitespace-only lines,
+  and speaker markers. The ``restore`` mode rebuilds the original paragraph
+  structure into an edited copy of the strict SRT, keeping edits made away from
+  the original boundaries. If a boundary line itself can no longer be located,
+  the conflict is reported and that subtitle is left untouched, rather than
+  inserting a break into a different subtitle.
 - *play* plays subtitles in the terminal at the time they are scheduled to
   display (note: it does not clear them from the screen afterwards). If you
   need to fast-forward to some point, you can combine it with
