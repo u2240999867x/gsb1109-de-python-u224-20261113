@@ -51,6 +51,12 @@ __all__ = [
     "SchemaForbiddenKeyError",
     "SchemaUnexpectedTypeError",
     "SchemaOnlyOneAllowedError",
+    "CandidateOutcome",
+    "ReconciledResult",
+    "RowReconciliation",
+    "find_conflicts",
+    "reconcile_row",
+    "reconcile_rows",
 ]
 
 
@@ -986,3 +992,13 @@ def _callable_str(callable_: Callable[..., Any]) -> str:
 
 def _plural_s(sized: Sized) -> str:
     return "s" if len(sized) > 1 else ""
+
+
+from .reconcile import (  # noqa: E402
+    CandidateOutcome,
+    ReconciledResult,
+    RowReconciliation,
+    find_conflicts,
+    reconcile_row,
+    reconcile_rows,
+)

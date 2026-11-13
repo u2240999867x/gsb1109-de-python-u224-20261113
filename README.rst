@@ -480,6 +480,46 @@ won't affect any recursive invoke of the ``self.__class__.validate`` for the
 child schemas (e.g., the call to ``Schema("capacity").validate("capacity")``).
 
 
+Reconciling ``Or`` candidate rules
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``Or`` returns the first candidate that validates. When several candidates
+match the same row but clean it differently (one keeps degrees Celsius,
+another converts to degrees Fahrenheit), the disagreement is hidden. The
+``schema.reconcile`` helpers evaluate *every* candidate and keep each distinct
+cleaned result together with the candidate rule and validation basis that
+produced it.
+
+.. code:: python
+
+    from schema import Or, Use, find_conflicts, reconcile_row
+
+    def to_celsius(row):
+        if row["unit"] != "C":
+            raise ValueError("not a Celsius row")
+        return {"degrees_c": float(row["value"]), "unit": "C"}
+
+    def to_fahrenheit(row):
+        return {"degrees_f": float(row["value"]) * 9 / 5 + 32, "unit": "F"}
+
+    rule = Or(Use(to_celsius), Use(to_fahrenheit))
+    row = {"value": 10, "unit": "C"}
+
+    report = reconcile_row(rule, row)
+    report.conflict          # True: two passing rules, two distinct results
+    for group in report.reconciled:
+        group.result         # each distinct cleaned result
+        group.outcomes       # CandidateOutcome list with rule and .basis
+
+    find_conflicts(rule, [row, {"value": 10, "unit": "F"}])  # conflicting rows only
+
+Candidates whose mappings only differ in key order are equivalent and never
+count as a conflict. Every candidate runs against its own deep copy of the
+row, so a ``Use`` transformation that mutates its input cannot make a later
+candidate fail, and ``report.row`` always holds the untouched original, which
+can be passed back to ``reconcile_row`` to replay the row on its own.
+
+
 User-friendly error reporting
 -------------------------------------------------------------------------------
 
