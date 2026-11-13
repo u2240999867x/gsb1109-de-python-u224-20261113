@@ -1,6 +1,16 @@
 Changes
 =======
 
+0.5.2 (unreleased)
+------------------
+
+* Added a receipt tax reconciliation module (``price_parser.receipt``). It
+  computes per-item, per-line and per-tax-bracket tax totals from raw price
+  strings, using a configurable smallest currency unit and rounding mode
+  (half-up or half-even), keeps the sign of refund lines, and exposes
+  ``minimal_discriminator`` to find the fewest lines that separate the three
+  rounding conventions.
+
 0.5.1 (2026-03-19)
 ------------------
 

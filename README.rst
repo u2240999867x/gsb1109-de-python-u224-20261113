@@ -166,6 +166,37 @@ Price(amount=Decimal('140.600'), currency='$')
 Price(amount=Decimal('140600'), currency='$')
 
 
+Receipt tax reconciliation
+--------------------------
+
+A receipt shows each line's unit price, quantity and tax rate and a single
+total tax, but not whether the tax is rounded per item, per line or per tax
+bracket. :mod:`price_parser.receipt` recomputes all three conventions directly
+from the raw strings using ``Decimal`` and a configurable smallest currency
+unit and rounding mode:
+
+>>> from decimal import Decimal
+>>> from price_parser import ReceiptLine, RoundingPolicy, reconcile_tax
+>>> policy = RoundingPolicy(Decimal("0.01"))
+>>> lines = [
+...     ReceiptLine.from_strings("8,30 €", "3", "19 %"),
+...     ReceiptLine.from_strings("5,50 €", "1", "19 %"),
+...     ReceiptLine.from_strings("12,70 €", "2", "19 %"),
+... ]
+>>> result = reconcile_tax(lines, Decimal("10.60"), policy)
+>>> result.taxes
+{'per_item': Decimal('10.61'), 'per_line': Decimal('10.61'), 'per_bracket': Decimal('10.60')}
+>>> result.matching_methods
+['per_bracket']
+
+Refund lines keep their sign (``"-8,30 €"`` or ``"(8,30 €)"``) and are rounded
+with the same policy; pass ``mode="half_even"`` for banker's rounding, and use
+a different unit (e.g. ``Decimal("1")`` for the yen, ``Decimal("0.05")`` for
+the Swiss franc) as needed. ``minimal_discriminator`` returns the fewest lines
+whose three totals differ, which is useful when two conventions tie and a
+single datum is needed to rule out the third.
+
+
 Contributing
 ============
 
