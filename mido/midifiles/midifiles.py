@@ -26,8 +26,8 @@ from numbers import Integral
 
 from ..messages import SPEC_BY_STATUS, Message
 from .meta import MetaMessage, build_meta_message, encode_variable_int, meta_charset
+from .timeline import Timeline
 from .tracks import MidiTrack, fix_end_of_track, merge_tracks
-from .units import tick2second
 
 # The default tempo is 120 BPM.
 # (500000 microseconds per beat (quarter note).)
@@ -306,6 +306,8 @@ class MidiFile:
 
         self.tracks = []
         self._merged_track = None
+        self._timeline = None
+        self._timeline_signature = None
 
         if type not in range(3):
             raise ValueError(
@@ -334,6 +336,112 @@ class MidiFile:
     def merged_track(self):
         self._merged_track = None
 
+    @property
+    def timeline(self):
+        """Queryable absolute-time view of the file.
+
+        Tempo changes from all tracks are combined for type 0 and type 1
+        files.  Type 2 files have one independent tempo map per track.
+        """
+        signature = self._timeline_state()
+        if self._timeline is None or signature != self._timeline_signature:
+            self._timeline = Timeline(self)
+            self._timeline_signature = signature
+        return self._timeline
+
+    def _timeline_state(self):
+        # Structural fingerprint.  Messages are immutable, so a message's
+        # identity changes whenever it is replaced; comparing identities
+        # keeps the cached timeline correct after in-place list edits
+        # (append, remove, item assignment) without rebuilding it eagerly.
+        state = [self.type, self.ticks_per_beat]
+        for track in self.tracks:
+            state.append(id(track))
+            state.extend(id(message) for message in track)
+        return tuple(state)
+
+    @timeline.deleter
+    def timeline(self):
+        self._timeline = None
+        self._timeline_signature = None
+
+    def get_timeline(self):
+        """Return the queryable absolute-time view of the file."""
+        return self.timeline
+
+    def timeline_for_track(self, track):
+        """Return the timeline for one track.
+
+        For synchronous files the map is shared, so tempo changes on a
+        conductor track still apply.  For asynchronous files each track has
+        its own map.
+        """
+        return self.timeline.track(track)
+
+    @property
+    def tempo_map(self):
+        """The shared tempo map for a type 0 or type 1 file.
+
+        For a type 2 file use ``timeline.track(i).tempo_map`` instead.
+        """
+        return self.timeline.tempo_map
+
+    def get_tempo_map(self, track=None):
+        """Return the tempo map, or one track's map for a type 2 file."""
+        if track is None:
+            return self.timeline.tempo_map
+        return self.timeline.track(track).tempo_map
+
+    @property
+    def first_uncertainty(self):
+        """The earliest ambiguous tempo segment, if any."""
+        return self.timeline.first_uncertainty
+
+    @property
+    def conflicts(self):
+        """All ambiguous tempo segments."""
+        return self.timeline.conflicts
+
+    @property
+    def uncertain_from_tick(self):
+        """First tick after which absolute times are not unique."""
+        return self.timeline.uncertain_from_tick
+
+    @property
+    def uncertain_from_seconds(self):
+        """First second after which absolute times are not unique."""
+        return self.timeline.uncertain_from_seconds
+
+    @property
+    def track_lengths(self):
+        """Per-track playback times in seconds."""
+        return self.timeline.track_lengths
+
+    @property
+    def length_bounds(self):
+        """``(minimum, maximum)`` playback length under tempo conflicts."""
+        return self.timeline.length_bounds
+
+    def seconds_at_tick(self, tick, track=None, strict=False):
+        """Return the absolute time of ``tick`` in seconds."""
+        return self.timeline.seconds_at_tick(tick, track=track, strict=strict)
+
+    def tick_at_seconds(self, seconds, track=None, strict=False):
+        """Return the nearest tick at absolute time ``seconds``."""
+        return self.timeline.tick_at_seconds(seconds, track=track,
+                                             strict=strict)
+
+    def tempo_at_tick(self, tick, track=None):
+        """Return the tempo in effect at ``tick``."""
+        return self.timeline.tempo_at_tick(tick, track=track)
+
+    def export_event_table(self, track=None):
+        """Return event records with absolute ticks and seconds."""
+        return self.timeline.as_table(track=track)
+
+    def event_table(self, track=None):
+        return self.export_event_table(track=track)
+
     def add_track(self, name=None):
         """Add a new track to the file.
 
@@ -345,6 +453,7 @@ class MidiFile:
             track.name = name
         self.tracks.append(track)
         del self.merged_track  # uncache merged track
+        del self.timeline  # uncache timeline
         return track
 
     def _load(self, infile):
@@ -377,29 +486,34 @@ class MidiFile:
     def length(self):
         """Playback time in seconds.
 
-        This will be computed by going through every message in every
-        track and adding up delta times.
+        This uses the shared tempo map, so tempo changes on any track
+        affect the result.  For a type 2 (asynchronous) file this raises
+        ``ValueError``; use ``timeline.track_lengths`` instead.
         """
         if self.type == 2:
             raise ValueError('impossible to compute length'
                              ' for type 2 (asynchronous) file')
 
-        return sum(msg.time for msg in self)
+        return self.timeline.length
 
     def __iter__(self):
-        tempo = DEFAULT_TEMPO
+        if self.type == 2:
+            raise TypeError("can't merge tracks in type 2 (asynchronous) file")
+
+        tempo_map = self.timeline.tempo_map
+        tick = 0
+        seconds = 0.0
+
         for msg in self.merged_track:
-            # Convert message time from absolute time
-            # in ticks to relative time in seconds.
-            if msg.time > 0:
-                delta = tick2second(msg.time, self.ticks_per_beat, tempo)
-            else:
-                delta = 0
+            tick += msg.time
+            # Convert message time from absolute time in ticks to relative
+            # time in seconds using the shared tempo map.  This includes
+            # tempo changes stored in other tracks.
+            next_seconds = tempo_map.seconds_at_tick(tick)
+            delta = next_seconds - seconds if msg.time > 0 else 0.0
+            seconds = next_seconds
 
             yield msg.copy(skip_checks=True, time=delta)
-
-            if msg.type == 'set_tempo':
-                tempo = msg.tempo
 
     def play(self, meta_messages=False, now=time.time):
         """Play back all tracks.

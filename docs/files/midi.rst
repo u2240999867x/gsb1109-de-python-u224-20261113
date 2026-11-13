@@ -146,6 +146,68 @@ a type 2 file will raise ``ValueError``, since it is impossible to
 compute the playback time of an asynchronous file.
 
 
+Tempo Maps and Timelines
+------------------------
+
+Iterating over a file or asking for its length always uses the tempo
+changes from *all* tracks in a synchronous file. This matters when tempo
+messages live on a dedicated conductor track: a note in another track must
+still be timed with the conductor's tempo changes.
+
+For repeated or range queries, use the :py:attr:`MidiFile.timeline`
+property. It builds one shared tempo map for type 0 and type 1 files and one
+independent tempo map per track for type 2 (asynchronous) files::
+
+    from mido import MetaMessage, MidiFile, MidiTrack
+
+    mid = MidiFile(ticks_per_beat=480)
+    mid.tracks.append(MidiTrack([
+        MetaMessage('set_tempo', tempo=500000, time=0),
+        MetaMessage('set_tempo', tempo=250000, time=480),
+    ]))
+
+    timeline = mid.timeline
+    timeline.seconds_at_tick(960)   # 0.75
+    timeline.tick_at_seconds(0.6)   # 720
+    timeline.tempo_at_tick(960)     # 250000
+
+Every message is exposed as a :py:class:`TimelineEvent` with absolute
+``tick`` and ``seconds`` values, plus track-relative deltas. Export an
+event table (a list of dictionaries, one per message)::
+
+    for row in timeline.event_table
+        print(row['track'], row['tick'], row['seconds'], row['type'])
+
+Each record also contains the message fields (``note``, ``velocity``, …),
+the track index and the original ``message`` object. ``delta_tick`` and
+``delta_seconds`` are relative to the previous message in the same track;
+``timeline.merged_table()`` returns whole-file deltas instead.
+
+For asynchronous files, name a track when querying::
+
+    timeline.tracks[0].seconds_at_tick(960)
+    timeline.seconds_at_tick(960, track=0)
+    timeline.event_table(track=0)
+    timeline.tracks[0].event_table
+
+Because each track starts at its own time zero, ticks from different tracks
+in a type 2 file must not be compared. ``timeline.track_lengths`` gives each
+track's playback time; ``MidiFile.length`` still raises ``ValueError``.
+
+When two tempo declarations occur at the same tick, the exact time after
+that tick is not defined. The earliest such point is available as
+``timeline.first_uncertainty``::
+
+    conflict = timeline.first_uncertainty
+    conflict.start_tick, conflict.start_seconds   # (480, 0.5)
+    conflict.tempos                               # (300000, 400000)
+
+``seconds_at_tick_bounds()`` returns the minimum and maximum possible time
+for a tick. By default the later declaration wins, matching sequential
+playback; pass ``strict=True`` to ``seconds_at_tick()`` to raise
+:py:class:`TempoConflictError` instead of silently choosing.
+
+
 Meta Messages
 -------------
 

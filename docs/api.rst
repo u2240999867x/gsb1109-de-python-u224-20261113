@@ -189,6 +189,47 @@ Standard MIDI Files
 
 .. autofunction:: merge_tracks
 
+.. autoclass:: Timeline
+   :members:
+   :inherited-members:
+   :undoc-members:
+
+.. autoclass:: TimelineEvent
+   :members:
+   :inherited-members:
+   :undoc-members:
+
+.. autoclass:: TrackTimeline
+   :members:
+   :inherited-members:
+   :undoc-members:
+
+.. autoclass:: TempoMap
+   :members:
+   :inherited-members:
+   :undoc-members:
+
+.. autoclass:: TempoChange
+   :members:
+   :inherited-members:
+   :undoc-members:
+
+.. autoclass:: TempoSegment
+   :members:
+   :inherited-members:
+   :undoc-members:
+
+.. autoclass:: TempoConflict
+   :members:
+   :inherited-members:
+   :undoc-members:
+
+.. autofunction:: export_event_table
+
+.. autofunction:: build_tempo_map
+
+.. autofunction:: build_timeline
+
 .. module:: mido.midifiles
 
 .. todo: Expose more of the internal API? (meta, tracks, units…)
