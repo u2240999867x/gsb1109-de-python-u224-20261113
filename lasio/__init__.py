@@ -59,6 +59,16 @@ add_logging_level("TRACE_LASIO", logging.DEBUG - 5, "trace_lasio")
 from .las import JSONEncoder, LASFile
 from .las_items import CurveItem, HeaderItem, SectionItems
 from .las_version import version
+from .passes import (
+    DepthHistory,
+    Pass,
+    PassSegmentation,
+    UnresolvedSegment,
+    depth_history,
+    detect_passes,
+    find_passes,
+    split_passes,
+)
 from .reader import open_file
 
 __version__ = version()

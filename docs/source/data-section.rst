@@ -334,3 +334,49 @@ We can fix it by using an explicit NULL policy.
 See ``tests/test_null_policy.py`` (`link
 <https://github.com/kinverarity1/lasio/blob/main/tests/test_null_policy.py>`__)
 for some examples.
+
+Measurement passes and repeated depths
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+LAS data is stored in the order it was acquired. A logging tool is normally
+run into the well and then pulled back out, so the depth index can contain a
+down pass followed by an up pass. Sorting the file by depth would interleave
+those passes, which is not what the measurements represent.
+:meth:`lasio.LASFile.detect_passes` finds the passes without sorting or
+removing samples. Use :meth:`lasio.LASFile.split_passes` to obtain one
+:class:`lasio.LASFile` per pass, and :meth:`lasio.LASFile.depth_history` to
+look up all readings at one depth.
+
+Small movements against the current direction are treated as wobble. A
+reversal is only confirmed once the tool has moved more than ``min_reversal``
+away from the furthest depth reached in the current direction; until then the
+samples stay in their original order. This matters near the bottom of a run,
+where a short backward movement may be tool motion rather than a new
+measurement pass.
+
+    >>> import lasio.examples
+    >>> las = lasio.examples.open("depth_passes.las")
+    >>> passes = las.detect_passes(min_reversal=0.2)
+    >>> passes.directions
+    ['down', 'up']
+    >>> [(p.start, p.stop, p.direction) for p in passes]
+    [(95.0, 100.0, 'down'), (99.0, 95.0, 'up')]
+
+A depth can be visited in both passes, and it can also be sampled more than
+once within a pass. Both are reported separately:
+
+    >>> history = las.depth_history(97, min_reversal=0.2)
+    >>> [(group.direction, group.depths.tolist()) for group in history.passes]
+    [('down', [97.0, 97.0]), ('up', [97.0])]
+
+If the data ends with a retreat that is too small to confirm a new direction,
+that tail is reported as an unresolved segment. Its readings remain available,
+but it is not labelled as a pass:
+
+    >>> history = las.depth_history(95.03, min_reversal=0.2)
+    >>> history.passes
+    ()
+    >>> history.unresolved[0].previous_direction
+    'up'
+    >>> history.unresolved[0].candidate_direction
+    'down'

@@ -1064,6 +1064,137 @@ class LASFile(object):
         indices = [keys.index(i) for i in channels]
         return self.data[:, indices]
 
+    def detect_passes(
+        self,
+        min_reversal=None,
+        *,
+        reversal_threshold=None,
+        min_reversal_distance=None,
+        min_reversal_depth=None,
+        reversal_distance=None,
+        reversal=None,
+        threshold=None,
+        index=None,
+    ):
+        """Detect measurement passes in the depth index.
+
+        Passes are contiguous samples acquired in one direction.  A reversal
+        is only accepted once the index retreats more than *min_reversal* from
+        the furthest point reached in the current direction; smaller
+        movements remain in the pass in sampling order.
+
+        Arguments:
+            min_reversal (float): reversal distance.  ``0`` (the default)
+                accepts the first movement against the current direction.
+
+        Keyword Arguments:
+            reversal_threshold, min_reversal_distance, reversal, threshold
+                (float): aliases for ``min_reversal``.
+            index (array-like): override the LAS index.
+
+        Returns:
+            :class:`lasio.passes.PassSegmentation`
+        """
+        from .passes import detect_passes
+
+        depths = self.index if index is None else index
+        return detect_passes(
+            depths,
+            min_reversal,
+            reversal_threshold=reversal_threshold,
+            min_reversal_distance=min_reversal_distance,
+            min_reversal_depth=min_reversal_depth,
+            reversal_distance=reversal_distance,
+            reversal=reversal,
+            threshold=threshold,
+            data=self.data[:, 1:],
+            mnemonics=self.keys()[1:],
+        )
+
+    def find_passes(self, *args, **kwargs):
+        """Alias for :meth:`LASFile.detect_passes`."""
+        return self.detect_passes(*args, **kwargs)
+
+    @property
+    def passes(self):
+        """Measurement passes in the depth index.
+
+        This is a pre-computed :class:`lasio.passes.PassSegmentation` using
+        the default reversal distance.  It is also callable, e.g.
+        ``las.passes(min_reversal=0.5)``.
+        """
+        return self.detect_passes()
+
+    @property
+    def measurement_passes(self):
+        """Alias for :attr:`LASFile.passes`."""
+        return self.passes
+
+    @property
+    def logging_passes(self):
+        """Alias for :attr:`LASFile.passes`."""
+        return self.passes
+
+    def history(self, depth, tolerance=0.0, min_reversal=None, **kwargs):
+        """Alias for :meth:`LASFile.depth_history`."""
+        return self.depth_history(
+            depth, tolerance=tolerance, min_reversal=min_reversal, **kwargs
+        )
+
+    def depth_readings(self, depth, tolerance=0.0, min_reversal=None, **kwargs):
+        """Alias for :meth:`LASFile.depth_history`."""
+        return self.depth_history(
+            depth, tolerance=tolerance, min_reversal=min_reversal, **kwargs
+        )
+
+    def split_passes(
+        self,
+        min_reversal=None,
+        *,
+        include_unresolved=False,
+        **kwargs,
+    ):
+        """Return one :class:`lasio.LASFile` per detected pass.
+
+        Keyword Arguments:
+            include_unresolved (bool): also return the trailing unresolved
+                reversal segment, if any.
+        """
+        segmentation = self.detect_passes(min_reversal, **kwargs)
+        return segmentation.split(self, include_unresolved=include_unresolved)
+
+    def depth_history(self, depth, tolerance=0.0, min_reversal=None, atol=None, **kwargs):
+        """Return all readings at *depth*, separated by measurement pass.
+
+        Arguments:
+            depth (float): depth to look up.
+            tolerance (float or None): absolute depth tolerance; ``None``
+                returns the nearest sample(s).
+            min_reversal (float): reversal distance, see :meth:`detect_passes`.
+            atol (float): alias for *tolerance*.
+        """
+        from .passes import depth_history
+
+        if atol is not None:
+            if tolerance not in (None, 0.0) and tolerance != atol:
+                raise ValueError("tolerance and atol disagree")
+            tolerance = atol
+        segmentation = self.detect_passes(min_reversal, **kwargs)
+        return depth_history(
+            self.index,
+            depth,
+            tolerance=tolerance,
+            traversal=segmentation,
+            data=self.data[:, 1:],
+            mnemonics=self.keys()[1:],
+        )
+
+    def history_at_depth(self, depth, tolerance=0.0, min_reversal=None, **kwargs):
+        """Alias for :meth:`LASFile.depth_history`."""
+        return self.depth_history(
+            depth, tolerance=tolerance, min_reversal=min_reversal, **kwargs
+        )
+
     @property
     def index(self):
         """Return data from the first column of the LAS file data (depth/time)."""

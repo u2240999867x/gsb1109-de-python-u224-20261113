@@ -42,6 +42,23 @@ Reading data
 .. autoattribute:: lasio.LASFile.data
 .. automethod:: lasio.LASFile.stack_curves
 
+Measurement passes
+------------------
+.. automethod:: lasio.LASFile.detect_passes
+.. automethod:: lasio.LASFile.find_passes
+.. automethod:: lasio.LASFile.split_passes
+.. automethod:: lasio.LASFile.depth_history
+.. automethod:: lasio.LASFile.history_at_depth
+.. autofunction:: lasio.passes.detect_passes
+.. autofunction:: lasio.passes.depth_history
+.. autoclass:: lasio.passes.PassSegmentation
+.. autoclass:: lasio.passes.Pass
+.. autoclass:: lasio.passes.UnresolvedSegment
+.. autoclass:: lasio.passes.DepthHistory
+.. autoclass:: lasio.passes.Reading
+.. autoclass:: lasio.passes.PassReadings
+.. autoclass:: lasio.passes.UnresolvedReadings
+
 Reading and modifying header data
 ---------------------------------
 .. autoclass:: lasio.SectionItems
