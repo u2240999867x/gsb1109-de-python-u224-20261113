@@ -107,6 +107,7 @@ def test_tools_support():
         ),
         (["srt-lines-matching", "-f", "lambda x: True"], False),
         (["srt-process", "-f", "lambda x: x"], False),
+        (["srt-reconstruct"], False),
         (["srt-mux"], False, True),
         (["srt-mux", "-t"], False, True),
         # Need to sort out time/thread issues

@@ -58,6 +58,14 @@ Utilities
   ``srt process -m re -f 'lambda sub: re.sub("<[^<]+?>", "", sub)'``. HTML-like
   syntax is especially prevalant in `SSA/ASS`_ subtitles that have been
   directly converted to SRT.
+- *reconstruct* turns rolling (scrolling) captions into spoken increments.
+  Live caption platforms often emit "下午", "下午三点", "下午三点发车" as three
+  separate subtitles, so a naive word count sees "下午" three times. This tool
+  merges snapshots only when their times are continuous *and* the text shows
+  carry-over evidence, keeping a revision ledger of additions, retractions,
+  and corrections. Identical sentences spoken in sequence stay separate, and
+  the final utterance is marked provisional because another snapshot may
+  still change it.
 
 .. _mux: https://en.wikipedia.org/wiki/Multiplexing
 .. _`SSA/ASS`: https://en.wikipedia.org/wiki/SubStation_Alpha

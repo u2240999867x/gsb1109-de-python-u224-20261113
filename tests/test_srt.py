@@ -771,3 +771,278 @@ def test_parse_file_with_missing_index(input_subs):  # cf. issue #51
 
     # ...and sort the same.
     assert srt.compose(subs_no_index) == srt.compose(subs_zero_index)
+
+
+def rolling_snapshot(index, start_ms, end_ms, text):
+    return srt.Subtitle(
+        index=index,
+        start=timedelta(milliseconds=start_ms),
+        end=timedelta(milliseconds=end_ms),
+        content=text,
+    )
+
+
+def test_reconstruct_growing_rolling_caption_is_one_increment():
+    """
+    "下午", "下午三点", "下午三点发车" is one growing on-screen caption, not
+    three spoken increments.
+    """
+    snapshots = [
+        rolling_snapshot(1, 0, 1000, "下午"),
+        rolling_snapshot(2, 1000, 2000, "下午三点"),
+        rolling_snapshot(3, 2000, 3000, "下午三点发车"),
+    ]
+
+    result = srt.reconstruct_increments(snapshots)
+
+    assert len(result) == 1
+    assert result[0].content == "下午三点发车"
+    assert result[0].start == timedelta(0)
+    assert result[0].end == timedelta(seconds=3)
+
+
+def test_reconstruct_revision_ledger_records_each_growth():
+    snapshots = [
+        rolling_snapshot(1, 0, 1000, "下午"),
+        rolling_snapshot(2, 1000, 2000, "下午三点"),
+        rolling_snapshot(3, 2000, 3000, "下午三点发车"),
+    ]
+
+    result = srt.reconstruct_increments(snapshots)
+    revisions = result[0].revisions
+
+    assert len(revisions) == 3
+    assert [revision.kind for revision in revisions] == [
+        "append",
+        "append",
+        "append",
+    ]
+    assert [revision.added for revision in revisions] == ["下午", "三点", "发车"]
+    assert all(not revision.removed for revision in revisions)
+    assert revisions[-1].before == "下午三点"
+    assert revisions[-1].after == "下午三点发车"
+
+
+def test_reconstruct_retains_retracted_words():
+    """A word taken back stays visible in the ledger."""
+    snapshots = [
+        rolling_snapshot(1, 0, 1000, "下午三点发车"),
+        rolling_snapshot(2, 1000, 2000, "下午三点"),
+    ]
+
+    result = srt.reconstruct_increments(snapshots)
+
+    assert len(result) == 1
+    assert result[0].content == "下午三点"
+    assert result[0].revisions[-1].kind == "retract"
+    assert result[0].revisions[-1].removed == "发车"
+
+
+def test_reconstruct_records_corrected_words():
+    snapshots = [
+        rolling_snapshot(1, 0, 1000, "下午三点发车"),
+        rolling_snapshot(2, 1000, 2000, "下午四点发车"),
+    ]
+
+    result = srt.reconstruct_increments(snapshots)
+    revision = result[0].revisions[-1]
+
+    assert revision.kind == "replace"
+    assert revision.removed == "三"
+    assert revision.added == "四"
+    assert revision.before == "下午三点发车"
+    assert revision.after == "下午四点发车"
+
+
+def test_reconstruct_identical_sentences_remain_two():
+    """Two people saying the same words are two utterances."""
+    for gap_ms in (0, 1000, 5000):
+        snapshots = [
+            rolling_snapshot(1, 0, 1000, "下午三点"),
+            rolling_snapshot(2, 1000 + gap_ms, 2000 + gap_ms, "下午三点"),
+        ]
+
+        result = srt.reconstruct_increments(snapshots)
+
+        assert len(result) == 2
+        assert [utterance.content for utterance in result] == [
+            "下午三点",
+            "下午三点",
+        ]
+
+
+def test_reconstruct_refresh_of_on_screen_caption_is_one():
+    """An overlapping identical snapshot is a refresh, not a second speaker."""
+    snapshots = [
+        rolling_snapshot(1, 0, 2000, "下午三点"),
+        rolling_snapshot(2, 1000, 3000, "下午三点"),
+    ]
+
+    result = srt.reconstruct_increments(snapshots)
+
+    assert len(result) == 1
+    assert result[0].content == "下午三点"
+    assert result[0].revisions[-1].kind == "stable"
+
+
+def test_reconstruct_does_not_merge_across_time_gap():
+    snapshots = [
+        rolling_snapshot(1, 0, 1000, "下午"),
+        rolling_snapshot(2, 10000, 11000, "下午三点"),
+    ]
+
+    result = srt.reconstruct_increments(snapshots)
+
+    assert [utterance.content for utterance in result] == ["下午", "下午三点"]
+
+
+def test_reconstruct_does_not_merge_without_text_evidence():
+    snapshots = [
+        rolling_snapshot(1, 0, 1000, "下午三点发车"),
+        rolling_snapshot(2, 1000, 2000, "明天要去开会"),
+    ]
+
+    result = srt.reconstruct_increments(snapshots)
+
+    assert [utterance.content for utterance in result] == [
+        "下午三点发车",
+        "明天要去开会",
+    ]
+
+
+def test_reconstruct_does_not_merge_shared_prefix_of_different_lines():
+    """Sharing "下午三点" is not enough to fuse two different statements."""
+    snapshots = [
+        rolling_snapshot(1, 0, 1000, "下午三点发车"),
+        rolling_snapshot(2, 1000, 2000, "下午三点回家"),
+    ]
+
+    result = srt.reconstruct_increments(snapshots)
+
+    assert [utterance.content for utterance in result] == [
+        "下午三点发车",
+        "下午三点回家",
+    ]
+
+
+def test_reconstruct_retains_scrolled_off_words():
+    """Words dropped off the top of a rolling window were still spoken."""
+    snapshots = [
+        rolling_snapshot(1, 0, 2000, "今天下午，三点发车。"),
+        rolling_snapshot(2, 2000, 4000, "下午三点发车，快点。"),
+        rolling_snapshot(3, 4000, 6000, "三点发车，快点回家。"),
+    ]
+
+    result = srt.reconstruct_increments(snapshots)
+
+    assert len(result) == 1
+    assert result[0].content == "今天下午，三点发车。快点。回家。"
+
+
+def test_reconstruct_last_utterance_is_provisional():
+    snapshots = [
+        rolling_snapshot(1, 0, 1000, "下午"),
+        rolling_snapshot(2, 1000, 2000, "下午三点"),
+        rolling_snapshot(3, 5000, 6000, "明天见"),
+    ]
+
+    result = srt.reconstruct_increments(snapshots)
+
+    assert [utterance.final for utterance in result] == [True, False]
+    assert result.unfinalized == [result[-1]]
+
+
+def test_reconstruct_can_mark_last_utterance_final():
+    snapshots = [rolling_snapshot(1, 0, 1000, "下午三点")]
+
+    result = srt.reconstruct_increments(snapshots, finalize_last=True)
+
+    assert result[0].final
+
+
+def test_reconstruct_is_incremental():
+    reconstructor = srt.RollingCaptionReconstructor()
+
+    reconstructor.feed(rolling_snapshot(1, 0, 1000, "下午"))
+    assert reconstructor.current.content == "下午"
+    assert not reconstructor.current.final
+
+    reconstructor.feed(rolling_snapshot(2, 1000, 2000, "下午三点"))
+    assert reconstructor.current.content == "下午三点"
+
+    reconstructor.feed(rolling_snapshot(3, 5000, 6000, "明天见"))
+    assert [utterance.content for utterance in reconstructor.utterances] == [
+        "下午三点",
+        "明天见",
+    ]
+    assert reconstructor.utterances[0].final
+    assert not reconstructor.current.final
+
+    assert len(reconstructor.finish()) == 2
+
+
+def test_reconstruct_sorts_snapshots_before_merging():
+    snapshots = [
+        rolling_snapshot(3, 2000, 3000, "下午三点发车"),
+        rolling_snapshot(1, 0, 1000, "下午"),
+        rolling_snapshot(2, 1000, 2000, "下午三点"),
+    ]
+
+    result = srt.reconstruct_increments(snapshots)
+
+    assert len(result) == 1
+    assert result[0].content == "下午三点发车"
+    assert [revision.snapshot for revision in result[0].revisions] == [1, 2, 3]
+
+
+def test_reconstruct_ledger_serialises_removals():
+    snapshots = [
+        rolling_snapshot(1, 0, 1000, "下午三点发车"),
+        rolling_snapshot(2, 1000, 2000, "下午三点"),
+    ]
+
+    ledger = srt.reconstruct_increments(snapshots).ledger
+    changes = ledger[0]["revisions"][-1]["changes"]
+
+    assert ledger[0]["final"] is False
+    assert changes == [{"kind": "retract", "removed": "发车", "added": ""}]
+
+
+def test_reconstruct_provisional_marker_in_srt():
+    snapshots = [
+        rolling_snapshot(1, 0, 1000, "下午"),
+        rolling_snapshot(2, 1000, 2000, "下午三点"),
+    ]
+
+    rendered = srt.reconstruct_increments(snapshots).to_srt(
+        provisional_marker=srt.PROVISIONAL_MARKER
+    )
+
+    assert "下午三点 〔未定稿〕" in rendered
+
+    parsed = list(srt.parse(rendered))
+    assert parsed[0].content.endswith("未定稿〕")
+
+    plain = srt.reconstruct_increments(snapshots).to_srt()
+    assert "未定稿" not in plain
+
+
+def test_reconstruct_utterances_compose_as_subtitles():
+    snapshots = [
+        rolling_snapshot(1, 0, 1000, "下午"),
+        rolling_snapshot(2, 1000, 2000, "下午三点"),
+        rolling_snapshot(3, 5000, 6000, "明天见"),
+    ]
+
+    result = srt.reconstruct_increments(snapshots)
+    composed = srt.compose(result)
+
+    assert "下午三点" in composed
+    assert "明天见" in composed
+
+
+def test_reconstruct_empty_input():
+    result = srt.reconstruct_increments([])
+
+    assert result == []
+    assert result.ledger == []
