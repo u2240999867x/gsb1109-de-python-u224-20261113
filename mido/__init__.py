@@ -120,6 +120,21 @@ from .midifiles import (
     tick2second,
 )
 from .parser import Parser, parse, parse_all
+from .performance import (
+    AmbiguityReport,
+    KeystrokeAmbiguity,
+    Performance,
+    PerformanceSelection,
+    RhythmTemplate,
+    extract_performances,
+    find_complete_performances,
+    find_maximal_performances,
+    find_optimal_performances,
+    find_performances,
+    segment_performances,
+    segment_practice,
+    select_performances,
+)
 from .syx import read_syx_file, write_syx_file
 from .version import version_info
 
@@ -137,8 +152,18 @@ __all__ = [
     "MidiFile",
     "MidiTrack",
     "Parser",
+    "AmbiguityReport",
+    "KeystrokeAmbiguity",
+    "Performance",
+    "PerformanceSelection",
+    "RhythmTemplate",
     "UnknownMetaMessage",
     "bpm2tempo",
+    "extract_performances",
+    "find_complete_performances",
+    "find_maximal_performances",
+    "find_optimal_performances",
+    "find_performances",
     "format_as_string",
     "merge_tracks",
     "parse",
@@ -148,6 +173,9 @@ __all__ = [
     "ports",
     "read_syx_file",
     "second2tick",
+    "segment_performances",
+    "segment_practice",
+    "select_performances",
     "sockets",
     "tempo2bpm",
     "tick2second",

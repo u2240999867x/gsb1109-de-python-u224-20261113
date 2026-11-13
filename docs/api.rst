@@ -202,3 +202,40 @@ SYX
 .. autofunction:: read_syx_file
 
 .. autofunction:: write_syx_file
+
+
+Practice recordings
+^^^^^^^^^^^^^^^^^^^
+
+.. module:: mido.performance
+
+.. autofunction:: find_performances
+
+.. autofunction:: find_maximal_performances
+
+.. autofunction:: segment_performances
+
+.. autoclass:: Performance
+   :members:
+   :inherited-members:
+   :undoc-members:
+
+.. autoclass:: RhythmTemplate
+   :members:
+   :inherited-members:
+   :undoc-members:
+
+.. autoclass:: PerformanceSelection
+   :members:
+   :inherited-members:
+   :undoc-members:
+
+.. autoclass:: AmbiguityReport
+   :members:
+   :inherited-members:
+   :undoc-members:
+
+.. autoclass:: KeystrokeAmbiguity
+   :members:
+   :inherited-members:
+   :undoc-members:
