@@ -1,0 +1,13 @@
+*.pyc
+build
+dist
+.cache
+*~
+*.egg
+*.egg-info
+.eggs
+.tox
+.idea/*
+.venv/
+.coverage
+coverage.lcov
