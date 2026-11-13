@@ -4,6 +4,7 @@
 
 
 from .base import compare, match, validate, SimpleSpec, NpmSpec, Spec, SpecItem, Version
+from .index import ArtifactRecord, PackageIndex, PackageRelease, Selection
 
 
 __author__ = "Raphaël Barrois <raphael.barrois+semver@polytechnique.org>"

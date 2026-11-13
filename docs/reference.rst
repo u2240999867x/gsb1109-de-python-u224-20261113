@@ -728,3 +728,154 @@ Each of those ``Spec`` classes provides a shared set of methods to work with ver
 
 .. _SemVer: http://semver.org/
 .. _`compatible release clauses`: https://www.python.org/dev/peps/pep-0440/#compatible-release
+
+
+Artifact indexing (the PackageIndex family)
+-------------------------------------------
+
+These classes live in the :mod:`semantic_version.index` module and are also
+exported from the top-level :mod:`semantic_version` package.
+
+They separate *version precedence* (used to select the newest compatible
+release, with build metadata ignored) from *artifact identity* (the exact
+version/digest pairs and the mirrors they were observed on).
+
+.. class:: ArtifactRecord(version, digest, source=None)
+
+    A single observation that a content ``digest`` of ``version`` was seen on
+    the ``source`` mirror.
+
+    :param version: A :class:`Version` or a version string such as
+        ``'2.4.0+cn'``
+    :param str digest: A non-empty content digest (hash)
+    :param source: An optional mirror identifier; records without a source are
+        still accepted
+    :raises: :exc:`ValueError` if ``digest`` is not a non-empty string,
+        :exc:`TypeError` if ``source`` is neither a string nor :data:`None`
+
+    .. rubric:: Attributes
+
+    .. attribute:: version
+
+        The observed :class:`Version`.
+
+    .. attribute:: digest
+
+        ``str``, the content digest of the artifact.
+
+    .. attribute:: source
+
+        The mirror the artifact was observed on, or :data:`None`.
+
+
+.. class:: PackageRelease(version, digest_sources=None)
+
+    Every artifact known for one exact :class:`Version`.
+    Use :meth:`PackageIndex.get` to retrieve such an object; the constructor
+    is mainly useful for testing.
+
+    .. rubric:: Attributes
+
+    .. attribute:: version
+
+        The :class:`Version` this release describes.
+
+    .. attribute:: digests
+
+        ``frozenset`` of every distinct content digest observed for the
+        version. The same digest seen on several mirrors appears only once.
+
+    .. attribute:: sources
+
+        ``frozenset`` of every mirror any digest was observed on.
+
+    .. attribute:: has_divergent_digests
+
+        ``bool``, true when the same version was published with at least two
+        different digests. Every digest remains reachable through
+        :attr:`digests`.
+
+    .. attribute:: artifacts
+
+        Tuple of :class:`ArtifactRecord`, one per observed
+        ``(digest, source)`` pair, deterministically ordered.
+
+    .. rubric:: Methods
+
+    .. method:: sources_for(self, digest)
+
+        Return the frozenset of mirrors the given ``digest`` was observed on,
+        or an empty frozenset if the digest is unknown.
+
+
+.. class:: Selection(candidates=())
+
+    The result of :meth:`PackageIndex.select`.
+
+    .. rubric:: Attributes
+
+    .. attribute:: candidates
+
+        Tuple of :class:`PackageRelease` sharing the highest matching
+        precedence, deterministically ordered and never chosen by insertion
+        order.
+
+    .. attribute:: chosen
+
+        The sole candidate when there is no tie, :data:`None` otherwise.
+
+    .. attribute:: is_tie
+
+        ``bool``, whether several releases share the highest precedence.
+
+    .. attribute:: digests
+
+        ``frozenset`` of every digest offered by the candidates.
+
+    .. attribute:: content_differs
+
+        ``bool``, whether the candidates expose more than one distinct digest.
+
+    A selection is iterable over :attr:`candidates`, has a length, and is
+    falsy when no release matched.
+
+
+.. class:: PackageIndex(artifacts=())
+
+    In-memory index of package artifacts.
+
+    :param artifacts: Optional iterable of :class:`ArtifactRecord` to ingest.
+
+    .. rubric:: Methods
+
+    .. method:: add(self, version, digest, source=None)
+
+        Record a ``(version, digest[, source])`` observation; returns the
+        index for chaining. Observations with the same digest merge their
+        sources, while distinct digests for the same version are all retained.
+
+    .. method:: add_record(self, artifact)
+
+        Merge an :class:`ArtifactRecord` into the index; returns the index.
+
+    .. method:: get(self, version)
+
+        Return the :class:`PackageRelease` for a :class:`Version`/version
+        string, or :data:`None` when unknown.
+
+    .. method:: select(self, spec)
+
+        Return a :class:`Selection` of the newest releases matching ``spec``
+        (a :class:`BaseSpec` or a simple-syntax string). Releases are ranked by
+        SemVer precedence ignoring build metadata; every release tied at the
+        top precedence is returned with its content differences, and download
+        (insertion) order is never used to break a tie.
+
+    .. attribute:: releases
+
+        Tuple of every indexed :class:`PackageRelease`, ordered by version
+        precedence.
+
+    The index also supports ``version in index``, ``len(index)`` and
+    iteration over :attr:`releases`.
+

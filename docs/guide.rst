@@ -337,6 +337,67 @@ https://github.com/npm/node-semver#ranges):
     >>> semver.Version('2.3.4') in semver.NpmSpec('>=0.1.1 <0.1.3 || 2.x')
     True
 
+
+Artifact indexing
+-----------------
+
+A package repository often serves the same release through several mirrors,
+and two build variants may share an identical precedence -- for instance
+``2.4.0+cn`` and ``2.4.0+eu`` compare equal for version selection even though
+their field contracts differ.
+
+The :class:`PackageIndex` keeps those two concerns separate:
+
+- *selection order* relies on SemVer precedence only, so build metadata never
+  ranks one variant above another;
+- *artifact identity* retains, for every exact version, each observed content
+  digest and the mirrors it was seen on.
+
+Records are added through :meth:`PackageIndex.add` or
+:class:`ArtifactRecord` objects:
+
+.. code-block:: pycon
+
+    >>> index = semver.PackageIndex()
+    >>> index.add("2.4.0+cn", "sha256:cn", source="mirror-a")
+    PackageIndex(...)
+    >>> index.add("2.4.0+cn", "sha256:cn", source="mirror-b")
+    PackageIndex(...)
+    >>> index.add("2.4.0+eu", "sha256:eu1", source="mirror-eu")
+    PackageIndex(...)
+
+The same digest observed from several mirrors is merged into one entry with
+both sources, while two different digests for a single version are both kept:
+
+.. code-block:: pycon
+
+    >>> index.add("2.4.0+eu", "sha256:eu2", source="mirror-eu")
+    PackageIndex(...)
+    >>> release = index.get("2.4.0+eu")
+    >>> release.has_divergent_digests
+    True
+    >>> sorted(release.digests)
+    ['sha256:eu1', 'sha256:eu2']
+
+Querying the newest compatible release returns a :class:`Selection`.
+When precedence is tied, no arbitrary winner is chosen -- every candidate is
+returned, together with the content difference, regardless of insertion order:
+
+.. code-block:: pycon
+
+    >>> selection = index.select(">=2.4.0")
+    >>> selection.is_tie
+    True
+    >>> selection.chosen is None
+    True
+    >>> [str(release.version) for release in selection.candidates]
+    ['2.4.0+cn', '2.4.0+eu']
+    >>> selection.content_differs
+    True
+    >>> sorted(selection.digests)
+    ['sha256:cn', 'sha256:eu1', 'sha256:eu2']
+
+
 Using with Django
 -----------------
 

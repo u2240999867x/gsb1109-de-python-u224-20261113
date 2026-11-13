@@ -4,6 +4,16 @@ ChangeLog
 2.10.1 (unreleased)
 -------------------
 
+*New:*
+
+    * Add an artifact index in ``semantic_version.index`` (``ArtifactRecord``,
+      ``PackageRelease``, ``PackageIndex`` and ``Selection``). It keeps
+      version-selection precedence separate from artifact identity:
+      observations sharing a digest merge their mirror sources, distinct
+      digests for the same version remain visible, and selecting the newest
+      compatible release returns every precedence-tied candidate together
+      with its content differences rather than relying on download order.
+
 *Minor:*
 
     * `112 <https://github.com/rbarrois/python-semanticversion/issues/112>`_:
