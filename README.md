@@ -108,3 +108,44 @@ That file for the `redirects_redirect.ndjson` table might look like this:
 [2, "feeds.simonwillison.net", "swn-entries", "https://simonwillison.net/atom/entries/", "2017-10-01T21:12:32.478849+00:00"]
 [3, "feeds.simonwillison.net", "swn-links", "https://simonwillison.net/atom/links/", "2017-10-01T21:12:54.820729+00:00"]
 ```
+
+## Reconstructing one table across versions
+
+Rows are stored **by position**, so a dump keeps meaning even when a column is renamed, split, or when an old name is re-used for a different field. The `lineage` commands rebuild a single historical table from several versioned dump directories (one directory per version, passed oldest first):
+
+```bash
+sqlite-diffable lineage reconstruct archive/2021 archive/2022 archive/2023 \
+  --changes changes.json -o unified.json
+```
+
+The changes file is a JSON list of *proven* schema changes. Only two types are accepted, each naming the version where it takes effect:
+
+```json
+[
+  {"type": "rename", "effective_version": "2022", "from": "code", "to": "customer_no"},
+  {"type": "split",  "effective_version": "2023", "from": "name",
+   "into": ["first_name", "last_name"]}
+]
+```
+
+`effective_version` may be a directory name (its label), a directory basename, or a full path. For a split, add `"sources": [2, 3]` to pin the destination columns by positional index instead of by name.
+
+Identity rules, deliberately conservative:
+
+- Columns are anchored to their **positional index** in each archive, never to their values. Cell contents are never used to guess ownership.
+- Cross-version links come only from the supplied `rename`/`split` changes, plus unambiguous same-name continuation. There is no implicit merge, so an empty column with no evidence is never attached to another field.
+- A name that is removed and later re-added (two different business fields both called `code`) stays **two separate fields**. Fields absent from a row's version are emitted as `null`, not inferred.
+
+Each reconstructed row carries `_version` and `_source_directory` provenance (drop them with `--no-provenance`), and every unified field is always present so rows have identical column order.
+
+### Tracing a reused column name
+
+`lineage history` returns the full provenance of *every* field that ever used a name — one entry per distinct field, each tracing back to its original directory, positional column order, and the change notes that link its versions:
+
+```bash
+sqlite-diffable lineage history archive/2021 archive/2022 archive/2023 \
+  --changes changes.json --name code
+```
+
+Use `lineage describe` for the full map: each version's physical columns, the unified field occupying each position (`effective_columns`), the validated changes, and every field with its positions and rename/split events.
+

@@ -5,6 +5,8 @@ import sqlite_utils
 import sqlite3
 import sys
 
+from .lineage import Lineage, LineageError
+
 
 @click.group()
 @click.version_option()
@@ -167,3 +169,88 @@ def objects(filepath, output, array):
         out.write("\n]\n")
     else:
         out.write("\n")
+
+
+@cli.group()
+def lineage():
+    "Reconstruct one unified table across versioned positional dumps"
+    pass
+
+
+def _load_changes(path):
+    if path is None:
+        return []
+    text = pathlib.Path(path).read_text(encoding="utf-8")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as ex:
+        raise click.ClickException("Invalid JSON in {}: {}".format(path, ex))
+    if not isinstance(data, list):
+        raise click.ClickException("Changes file must contain a JSON list")
+    return data
+
+
+def _build_lineage(versions, changes):
+    try:
+        return Lineage.from_paths(versions, changes)
+    except LineageError as ex:
+        raise click.ClickException(str(ex))
+
+
+def _emit(payload, output):
+    text = json.dumps(payload, indent=2, ensure_ascii=False, default=repr)
+    if output is None:
+        click.echo(text)
+    else:
+        pathlib.Path(output).write_text(text + "\n", encoding="utf-8")
+
+
+@lineage.command("describe")
+@click.argument("versions", nargs=-1, required=True, type=click.Path(exists=True))
+@click.option(
+    "-c", "--changes", "changes_path", type=click.Path(exists=True), default=None,
+    help="JSON file of proven rename/split changes",
+)
+@click.option("-o", "--output", type=click.Path(dir_okay=False), default=None)
+def lineage_describe(versions, changes_path, output):
+    """Show versions, proven changes and field lineage as JSON."""
+    lineage_obj = _build_lineage(versions, _load_changes(changes_path))
+    _emit(lineage_obj.describe(), output)
+
+
+@lineage.command("reconstruct")
+@click.argument("versions", nargs=-1, required=True, type=click.Path(exists=True))
+@click.option(
+    "-c", "--changes", "changes_path", type=click.Path(exists=True), default=None,
+    help="JSON file of proven rename/split changes",
+)
+@click.option(
+    "--version", "only_version", default=None,
+    help="Restrict output to one version (label or path)",
+)
+@click.option(
+    "--no-provenance", is_flag=True,
+    help="Omit _version/_source_directory from each row",
+)
+@click.option("-o", "--output", type=click.Path(dir_okay=False), default=None)
+def lineage_reconstruct(versions, changes_path, only_version, no_provenance, output):
+    """Write the unified historical table as a JSON array of row objects."""
+    lineage_obj = _build_lineage(versions, _load_changes(changes_path))
+    rows = lineage_obj.reconstruct(
+        version=only_version, provenance=not no_provenance
+    )
+    _emit(rows, output)
+
+
+@lineage.command("history")
+@click.argument("versions", nargs=-1, required=True, type=click.Path(exists=True))
+@click.option(
+    "-c", "--changes", "changes_path", type=click.Path(exists=True), default=None,
+    help="JSON file of proven rename/split changes",
+)
+@click.option("--name", required=True, help="Column name to trace")
+@click.option("-o", "--output", type=click.Path(dir_okay=False), default=None)
+def lineage_history(versions, changes_path, name, output):
+    """Trace every field that ever used a name (reused names stay separate)."""
+    lineage_obj = _build_lineage(versions, _load_changes(changes_path))
+    _emit(lineage_obj.history(name), output)
