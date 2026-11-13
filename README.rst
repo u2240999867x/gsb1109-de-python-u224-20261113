@@ -166,6 +166,72 @@ Price(amount=Decimal('140.600'), currency='$')
 Price(amount=Decimal('140600'), currency='$')
 
 
+Multi-packs, free units and minimum order quantities
+----------------------------------------------------
+
+Shelf descriptions often mix pack capacity, free units and order rules, for
+example ``"12×250 mL 加赠 2 瓶"`` and ``"两箱起购"``.  ``parse_pack`` keeps
+these values separate, so a minimum order quantity is never mistaken for the
+capacity of one box:
+
+>>> from decimal import Decimal
+>>> from price_parser import parse_pack
+>>> pack = parse_pack("两箱起购 12×250 mL 加赠 2 瓶")
+>>> pack.count, pack.size, pack.unit
+(12, Decimal('250'), 'mL')
+>>> pack.total_size            # paid quantity in one box
+Decimal('3000')
+>>> pack.min_order_boxes       # order multiple, not pack capacity
+2
+>>> pack.gift_count
+2
+
+``parse_quote`` combines a price with a pack description.  Unit prices are
+calculated for a target amount; free units are opt-in because their size is
+not always stated:
+
+>>> from price_parser import parse_quote
+>>> quote = parse_quote("¥59.90 12×250 mL 加赠 2 瓶", label="A")
+>>> quote.unit_price("L", include_gifts=False)
+Decimal('19.96666666666666666666666667')
+>>> quote.unit_price("L", gift_size=Decimal("250"))  # same-size gift
+Decimal('17.11428571428571428571428571')
+>>> quote.unit_price("瓶")                            # count needs no gift size
+Decimal('4.278571428571428571428571429')
+
+If the free-unit size is unknown, ``unit_price_range`` reports the interval
+that can be determined without inventing a value.  By default the unknown
+size is bounded by the paid unit size; pass ``gift_size_bounds`` to declare a
+tighter policy:
+
+>>> price_range = quote.unit_price_range("L")
+>>> price_range.low < price_range.high
+True
+>>> price_range.assumptions
+('gift size unknown; assumed between 0 and the paid unit size',)
+>>> tight = quote.unit_price_range("L", gift_size_bounds=(100, 200))
+>>> tight.low, tight.high
+(Decimal('17.61764705882352941176470588'), Decimal('18.71875'))
+
+``compare_quotes`` ranks quotes by unit price and reports the gift quantity
+at which one quote catches another, so uncertain free units are visible
+instead of silently affecting the winner:
+
+>>> from price_parser import compare_quotes
+>>> other = parse_quote("¥55.50 12×250 mL", label="B")
+>>> comparison = compare_quotes([quote, other], target_unit="L")
+>>> comparison.certain
+False
+>>> comparison.possible_winners
+('A', 'B')
+>>> change = comparison.rank_changes[0]
+>>> change.gift_size, change.gift_size_unit
+(Decimal('118.9189189189189189189189190'), 'mL')
+
+This says that if each of A's two free bottles contains less than about
+118.9 mL, B remains cheaper; above that crossover, A wins.  The crossover is
+included in the result only because it lies inside A's declared gift bounds.
+
 Contributing
 ============
 

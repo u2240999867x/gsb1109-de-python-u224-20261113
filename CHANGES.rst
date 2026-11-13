@@ -1,6 +1,15 @@
 Changes
 =======
 
+Unreleased
+----------
+
+* Added parsing of multi-packs, free units and minimum order quantities.
+* Added unit-price calculations for a target amount, with explicit control
+  over whether free units are included.
+* Added unit-price ranges for quotes with an unknown free-unit size, and
+  ranking break-even gift quantities.
+
 0.5.1 (2026-03-19)
 ------------------
 
