@@ -12,6 +12,20 @@ parse = NMEASentence.parse
 
 from .types import *
 
+from .depth import (
+    AuditResult,
+    ColumnEvidence,
+    DepthAuditError,
+    Observation,
+    audit_dbt,
+    distinguishing_depth,
+    label_mapping,
+    load_observations,
+    parse_dbt,
+    standard_mapping,
+    swapped_feet_meters_mapping,
+)
+
 from .stream import NMEAStreamReader
 from .nmea_file import NMEAFile
 
