@@ -141,6 +141,43 @@ for line in file.readlines():
         continue
 ```
 
+## GSV satellite-list assembly
+
+A GSV sentence is only one page of a receiver's visible-satellite list: one
+observation round is split across numbered pages. When several receivers are
+multiplexed onto one stream the pages can arrive interleaved or out of order,
+and the next round always starts again at page 1.
+
+`GSVAggregator` reassembles each round, grouped by the physical input
+(`source`), constellation and signal (the talker id, e.g. `GP`, `GL`, `GA`,
+`GB`, `QZ`). Page 1 marks the start of a round, so a new page 1 closes the
+previous round without ever borrowing its pages; a changed retransmission of a
+page replaces the earlier copy and is recorded as a conflict. A report is only
+`complete` when every advertised page was received from the same round without
+conflicts. Incomplete reports still carry `missing_pages` and a `reason`, so an
+operator can see exactly which page was lost.
+
+```python
+import pynmea2
+from pynmea2.gsv import GSVAggregator
+
+aggregator = GSVAggregator()
+for line in stream:                       # sentences from both receivers
+    msg = pynmea2.parse(line)
+    for report in aggregator.feed(msg, source='receiver-a'):
+        if report.complete:
+            print([sat.prn for sat in report.satellites])
+        else:
+            print('incomplete, missing pages', report.missing_pages)
+
+# finalize rounds still open at end of input (also reports missing pages)
+for report in aggregator.flush():
+    print(report)
+```
+
+See [examples/gsv_aggregation.py](/examples/gsv_aggregation.py) for a runnable
+two-receiver example, including a lost page and a changed retransmission.
+
 ## `pySerial` device example
 
 See [examples/read_serial.py](/examples/read_serial.py)

@@ -15,3 +15,5 @@ from .types import *
 from .stream import NMEAStreamReader
 from .nmea_file import NMEAFile
 
+from .gsv import GSVAggregator, GSVReport, Satellite
+
