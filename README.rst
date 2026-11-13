@@ -502,6 +502,53 @@ You can exit with ``sys.exit(exc.code)`` if you want to show the messages
 to the user without traceback. ``error`` messages are given precedence in that
 case.
 
+Collecting every bad field at once (diagnostic validation)
+-------------------------------------------------------------------------------
+
+``Schema.validate`` fails fast and stops at the first problem.  When you need
+a full *rejection slip* for an entry (for example a supplier record), use
+``validate_with_report`` instead.  It runs the exact same validation a single
+time and returns a ``ValidationReport`` that lists every field that can be
+confirmed bad independently.
+
+.. code:: python
+
+    from schema import And, Regex, Schema, Use, validate_with_report
+
+    supplier = Schema({
+        "name": And(str, Regex(r"^[A-Za-z0-9 ]+$")),
+        "code": And(Use(int), lambda n: 1000 <= n <= 9999),
+    })
+
+    report = validate_with_report(supplier, {"name": "x!", "code": "oops"})
+    report.valid            # False
+    for diagnostic in report.failures:
+        diagnostic.path     # ('name',) then ('code',)
+        diagnostic.check    # the check that actually raised
+        diagnostic.message  # the message produced by that check
+
+Each conclusion's ``path`` locates the original field (lists use integer
+indexes, rendered as ``items[0].sku`` by ``path_text``), and ``check`` is the
+deepest auto-generated message so you can trace a conclusion back to the
+validator that actually failed.
+
+Transformations are run once and never replayed, so values backed by a
+one-shot iterator are still safe.  If an earlier check in an ``And`` fails, the
+checks that consequently never execute are returned separately in
+``report.unknown`` (status ``UNKNOWN``) instead of being reported as made-up
+child failures:
+
+.. code:: python
+
+    report = validate_with_report(
+        Schema({"n": And(Use(int), lambda n: n > 0)}), {"n": "abc"}
+    )
+    report.failures[0].status   # 'failed'  -> the Use(int) check raised
+    report.unknown[0].status    # 'unknown' -> the predicate never ran
+
+On a valid entry ``report.valid`` is ``True`` and ``report.value`` is the
+transformed data, identical to what ``schema.validate(data)`` returns.
+
 A JSON API example
 -------------------------------------------------------------------------------
 

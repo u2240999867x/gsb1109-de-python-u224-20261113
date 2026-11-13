@@ -33,6 +33,14 @@ else:
     except ImportError:
         from contextlib2 import ExitStack  # Python 2.x/3.0-3.2 fallback
 
+from .diagnostics import (
+    FAILED,
+    UNKNOWN,
+    DiagnosticCollector,
+    FieldDiagnostic,
+    ValidationReport,
+    validate_with_report,
+)
 
 __version__ = "0.7.8"
 __all__ = [
@@ -51,6 +59,12 @@ __all__ = [
     "SchemaForbiddenKeyError",
     "SchemaUnexpectedTypeError",
     "SchemaOnlyOneAllowedError",
+    "DiagnosticCollector",
+    "FieldDiagnostic",
+    "ValidationReport",
+    "validate_with_report",
+    "FAILED",
+    "UNKNOWN",
 ]
 
 
@@ -157,8 +171,23 @@ class And(Generic[TSchema]):
         :return: Returns validated data.
         """
         # Annotate sub_schema with the type returned by _build_schema
-        for sub_schema in self._build_schemas():  # type: TSchema
-            data = sub_schema.validate(data, **kwargs)
+        diagnostics: Union[DiagnosticCollector, None] = kwargs.get("_diagnostics")
+        sub_schemas = self._build_schemas()
+        for index, sub_schema in enumerate(sub_schemas):
+            try:
+                data = sub_schema.validate(data, **kwargs)
+            except SchemaError:
+                if diagnostics is not None:
+                    # The failed check was already recorded by the sub schema.
+                    # Remaining checks never run on this value; mark them as
+                    # unknown instead of inventing child failures.
+                    for unevaluated in self._args[index + 1 :]:
+                        diagnostics.record_unknown(
+                            tuple(kwargs.get("_path", ())),
+                            repr(unevaluated),
+                            "not evaluated after an earlier failure",
+                        )
+                raise
         return data
 
     def _build_schemas(self) -> List[TSchema]:
@@ -207,20 +236,54 @@ class Or(And[TSchema]):
         """
         autos: List[str] = []
         errors: List[Union[str, None]] = []
+        diagnostics: Union[DiagnosticCollector, None] = kwargs.get("_diagnostics")
+        or_path = tuple(kwargs.get("_path", ()))
+        deepest_failures: List = []
+        deepest_unknown: List = []
         for sub_schema in self._build_schemas():
+            # Conclusions collected while an alternative is being tried are
+            # provisional: they only count when no alternative matches (and
+            # then only the deepest, most precise ones are kept), or are
+            # discarded as soon as one alternative succeeds.
+            snapshot = diagnostics.snapshot() if diagnostics is not None else None
             try:
                 validation: Any = sub_schema.validate(data, **kwargs)
+            except SchemaError as _x:
+                if diagnostics is not None:
+                    assert snapshot is not None
+                    branch_failures = list(diagnostics.failures[snapshot[0] :])
+                    branch_unknown = list(diagnostics.unknown[snapshot[1] :])
+                    diagnostics.restore(snapshot)
+                    # Prefer conclusions that point deeper than the Or value
+                    # itself: they identify the exact failing nested field.
+                    if any(
+                        len(diagnostic.path) > len(or_path)
+                        for diagnostic in branch_failures
+                    ):
+                        deepest_failures = branch_failures
+                        deepest_unknown = branch_unknown
+                autos += _x.autos
+                errors += _x.errors
+            else:
+                if diagnostics is not None:
+                    # A matching alternative means every earlier probe was
+                    # exploratory noise.
+                    assert snapshot is not None
+                    diagnostics.restore(snapshot)
                 self.match_count += 1
                 if self.match_count > 1 and self.only_one:
                     break
                 return validation
-            except SchemaError as _x:
-                autos += _x.autos
-                errors += _x.errors
-        raise SchemaError(
+        failure = SchemaError(
             ["%r did not validate %r" % (self, data)] + autos,
             [self._error.format(data) if self._error else None] + errors,
         )
+        if diagnostics is not None:
+            if deepest_failures:
+                diagnostics.adopt(deepest_failures, deepest_unknown)
+            else:
+                diagnostics.record_failure(or_path, failure)
+        raise failure
 
 
 class Regex:
@@ -268,6 +331,7 @@ class Regex:
         :return: Returns validated data.
         """
         e = self._error
+        diagnostics: Union[DiagnosticCollector, None] = kwargs.get("_diagnostics")
 
         try:
             if self._pattern.search(data):
@@ -278,12 +342,15 @@ class Regex:
                     if e
                     else f"{data!r} does not match {self._pattern_str!r}"
                 )
-                raise SchemaError(error_message)
+                failure = SchemaError(error_message)
         except TypeError:
             error_message = (
                 e.format(data) if e else f"{data!r} is not string nor buffer"
             )
-            raise SchemaError(error_message)
+            failure = SchemaError(error_message)
+        if diagnostics is not None:
+            diagnostics.record_failure(tuple(kwargs.get("_path", ())), failure)
+        raise failure
 
 
 class Use:
@@ -313,19 +380,26 @@ class Use:
         return self._callable(data)
 
     def validate(self, data: Any, **kwargs: Any) -> Any:
+        diagnostics: Union[DiagnosticCollector, None] = kwargs.get("_diagnostics")
         try:
             return self._callable(data)
         except SchemaError as x:
-            raise SchemaError(
+            failure = SchemaError(
                 [None] + x.autos,
                 [self._error.format(data) if self._error else None] + x.errors,
             )
+            if diagnostics is not None:
+                diagnostics.record_failure(tuple(kwargs.get("_path", ())), failure)
+            raise failure
         except BaseException as x:
             f = _callable_str(self._callable)
-            raise SchemaError(
+            failure = SchemaError(
                 "%s(%r) raised %r" % (f, data, x),
                 self._error.format(data) if self._error else None,
             )
+            if diagnostics is not None:
+                diagnostics.record_failure(tuple(kwargs.get("_path", ())), failure)
+            raise failure
 
 
 COMPARABLE, CALLABLE, VALIDATOR, TYPE, DICT, ITERABLE = range(6)
@@ -439,25 +513,80 @@ class Schema(object):
         s: Any = self._schema
         e: Union[str, None] = self._error
         i: bool = self._ignore_extra_keys
+        diagnostics: Union[DiagnosticCollector, None] = cast(
+            Union[DiagnosticCollector, None], kwargs.get("_diagnostics")
+        )
+        path: Tuple[Any, ...] = tuple(kwargs.get("_path", ()))
+
+        def with_path(child_path: Tuple[Any, ...]) -> Dict[str, Any]:
+            child_kwargs: Dict[str, Any] = dict(kwargs)
+            child_kwargs["_path"] = child_path
+            return child_kwargs
 
         if isinstance(s, Literal):
             s = s.schema
 
         flavor = _priority(s)
         if flavor == ITERABLE:
-            data = Schema(type(s), error=e).validate(data, **kwargs)
+            try:
+                data = Schema(type(s), error=e).validate(data, **kwargs)
+            except SchemaError as x:
+                if diagnostics is not None:
+                    diagnostics.record_failure(path, x)
+                raise
             o: Or = Or(*s, error=e, schema=Schema, ignore_extra_keys=i)
-            return type(data)(o.validate(d, **kwargs) for d in data)
+            if diagnostics is None:
+                return type(data)(o.validate(d, **kwargs) for d in data)
+            # Diagnostic mode: validate every element once so each bad index is
+            # reported independently. The wrapped Or runs the element's checks a
+            # single time; failed elements are skipped, never replayed.
+            validated = []
+            container_failed = False
+            for index, element in enumerate(data):
+                try:
+                    validated.append(o.validate(element, **with_path(path + (index,))))
+                except SchemaError:
+                    container_failed = True
+            if container_failed:
+                raise SchemaError("container validation failed")
+            return type(data)(validated)
         if flavor == DICT:
             exitstack = ExitStack()
-            data = Schema(dict, error=e).validate(data, **kwargs)
+            try:
+                data = Schema(dict, error=e).validate(data, **kwargs)
+            except SchemaError as x:
+                if diagnostics is not None:
+                    diagnostics.record_failure(path, x)
+                raise
             new: Dict = type(data)()  # new - is a dict of the validated values
             coverage: Set = set()  # matched schema keys
+            # Number of failures recorded before this dictionary's own fields
+            # run, used to notice nested value failures that are recorded and
+            # then handled so the rest of the fields can still be diagnosed.
+            failure_snapshot = (
+                len(diagnostics.failures) if diagnostics is not None else 0
+            )
+            # Data keys whose value validation failed, so they must not be
+            # reported again as wrong keys in diagnostic mode.
+            failed_value_keys: Set = set()
             # for each key and value find a schema entry matching them, if any
             sorted_skeys = sorted(s, key=self._dict_key_priority)
+
+            def _reset(skey: Any) -> None:
+                # Or-key only_one violations surface when the key is reset.
+                # Record them like any other field failure instead of letting
+                # the callback abort the remaining dictionary checks.
+                try:
+                    skey.reset()
+                except SchemaError as reset_error:
+                    if diagnostics is not None:
+                        diagnostics.record_failure(path, reset_error)
+                        return
+                    raise
+
             for skey in sorted_skeys:
                 if hasattr(skey, "reset"):
-                    exitstack.callback(skey.reset)
+                    exitstack.callback(_reset, skey)
 
             # Custom errors from key schemas that rejected a data key, kept so
             # they can be surfaced if that key ends up being a wrong key.
@@ -468,11 +597,26 @@ class Schema(object):
                     data.items(), key=lambda value: isinstance(value[1], dict)
                 )
                 for key, value in data_items:
+                    key_path = path + (key,)
                     for skey in sorted_skeys:
                         svalue = s[skey]
+                        if diagnostics is not None:
+                            # Key-matching probes must not leave conclusions
+                            # behind: a data key may legitimately fail several
+                            # key schemas before (or instead of) matching one.
+                            snapshot = diagnostics.snapshot()
                         try:
-                            nkey = Schema(skey, error=e).validate(key, **kwargs)
+                            nkey = Schema(skey, error=e).validate(
+                                key,
+                                **(
+                                    with_path(key_path)
+                                    if diagnostics is not None
+                                    else kwargs
+                                ),
+                            )
                         except SchemaError as x:
+                            if diagnostics is not None:
+                                diagnostics.restore(snapshot)
                             # If the rejecting key schema carries a custom error,
                             # remember it in case this data key is reported as wrong.
                             if getattr(skey, "_error", None) is not None:
@@ -487,72 +631,171 @@ class Schema(object):
                                 # on match, allowing for excluding a key only if its
                                 # value has a certain type, and allowing Forbidden to
                                 # work well in combination with Optional.
+                                hook_snapshot = (
+                                    diagnostics.snapshot()
+                                    if diagnostics is not None
+                                    else None
+                                )
                                 try:
                                     nvalue = Schema(svalue, error=e).validate(
-                                        value, **kwargs
+                                        value,
+                                        **(
+                                            with_path(key_path)
+                                            if diagnostics is not None
+                                            else kwargs
+                                        ),
                                     )
                                 except SchemaError:
+                                    if diagnostics is not None:
+                                        assert hook_snapshot is not None
+                                        diagnostics.restore(hook_snapshot)
                                     continue
-                                skey.handler(nkey, data, e)
+                                if diagnostics is not None:
+                                    # The probe only decides whether the hook
+                                    # fires, so its conclusions are not field
+                                    # failures on their own.
+                                    assert hook_snapshot is not None
+                                    diagnostics.restore(hook_snapshot)
+                                try:
+                                    skey.handler(nkey, data, e)
+                                except SchemaError as x:
+                                    if diagnostics is not None:
+                                        failed_value_keys.add(key)
+                                        failed_value_keys.add(nkey)
+                                        diagnostics.record_failure(key_path, x)
+                                        continue
+                                    raise
                             else:
+                                coverage.add(skey)
                                 try:
                                     nvalue = Schema(
                                         svalue, error=e, ignore_extra_keys=i
-                                    ).validate(value, **kwargs)
+                                    ).validate(
+                                        value,
+                                        **(
+                                            with_path(key_path)
+                                            if diagnostics is not None
+                                            else kwargs
+                                        ),
+                                    )
                                 except SchemaError as x:
+                                    if diagnostics is not None:
+                                        # The leaf check already recorded the
+                                        # actual failure; keep this key out of
+                                        # the wrong-key report and move on. Track
+                                        # both the original and validated key in
+                                        # case the key schema transformed it.
+                                        failed_value_keys.add(key)
+                                        failed_value_keys.add(nkey)
+                                        break
                                     k = "Key '%s' error:" % (nkey,)
                                     message = self._prepend_schema_name(k)
-                                    raise SchemaError(
+                                    wrapped = SchemaError(
                                         [message] + x.autos,
                                         [e.format(data) if e else None] + x.errors,
                                     )
+                                    raise wrapped
                                 else:
                                     new[nkey] = nvalue
-                                    coverage.add(skey)
                                     break
             required = set(k for k in s if not self._is_optional_type(k))
+            dict_failed = (
+                diagnostics is not None and len(diagnostics.failures) > failure_snapshot
+            )
             if not required.issubset(coverage):
                 missing_keys = required - coverage
-                s_missing_keys = ", ".join(
-                    repr(k) for k in sorted(missing_keys, key=repr)
-                )
-                message = "Missing key%s: %s" % (
-                    _plural_s(missing_keys),
-                    s_missing_keys,
-                )
-                message = self._prepend_schema_name(message)
-                raise SchemaMissingKeyError(message, e.format(data) if e else None)
+
+                def key_label(candidate: Any) -> Any:
+                    if isinstance(candidate, Optional):
+                        candidate = candidate._schema
+                    if isinstance(candidate, Literal):
+                        return candidate.schema
+                    return candidate
+
+                if diagnostics is not None:
+                    # Record each missing key independently, then keep going so
+                    # wrong keys and other fields can be diagnosed as well.
+                    for missing_key in sorted(missing_keys, key=repr):
+                        message = self._prepend_schema_name(
+                            "Missing key: %r" % (missing_key,)
+                        )
+                        diagnostics.record_failure(
+                            path + (key_label(missing_key),),
+                            SchemaMissingKeyError(
+                                message, e.format(data) if e else None
+                            ),
+                        )
+                    dict_failed = True
+                else:
+                    s_missing_keys = ", ".join(
+                        repr(k) for k in sorted(missing_keys, key=repr)
+                    )
+                    message = "Missing key%s: %s" % (
+                        _plural_s(missing_keys),
+                        s_missing_keys,
+                    )
+                    message = self._prepend_schema_name(message)
+                    raise SchemaMissingKeyError(message, e.format(data) if e else None)
             if not self._ignore_extra_keys and (len(new) != len(data)):
-                wrong_keys = set(data.keys()) - set(new.keys())
-                s_wrong_keys = ", ".join(repr(k) for k in sorted(wrong_keys, key=repr))
-                message = "Wrong key%s %s in %r" % (
-                    _plural_s(wrong_keys),
-                    s_wrong_keys,
-                    data,
-                )
-                message = self._prepend_schema_name(message)
-                # Surface any custom error from the key schema(s) that rejected
-                # the wrong key(s), so an explicit `error=` is not silently lost.
-                custom_errors = [
-                    key_errors[k]
-                    for k in sorted(wrong_keys, key=repr)
-                    if k in key_errors
-                ]
-                errors: Union[List, str, None] = (
-                    [e.format(data) if e else None] + custom_errors
-                    if custom_errors
-                    else (e.format(data) if e else None)
-                )
-                raise SchemaWrongKeyError(message, errors)
+                wrong_keys = set(data.keys()) - set(new.keys()) - failed_value_keys
+                if wrong_keys:
+                    if diagnostics is not None:
+                        for wrong_key in sorted(wrong_keys, key=repr):
+                            custom = key_errors.get(wrong_key)
+                            wrong_message = self._prepend_schema_name(
+                                "Wrong key %r in %r" % (wrong_key, data)
+                            )
+                            autos = (
+                                [wrong_message, custom] if custom else [wrong_message]
+                            )
+                            diagnostics.record_failure(
+                                path + (wrong_key,),
+                                SchemaWrongKeyError(
+                                    autos, e.format(data) if e else None
+                                ),
+                            )
+                        dict_failed = True
+                    else:
+                        s_wrong_keys = ", ".join(
+                            repr(k) for k in sorted(wrong_keys, key=repr)
+                        )
+                        message = "Wrong key%s %s in %r" % (
+                            _plural_s(wrong_keys),
+                            s_wrong_keys,
+                            data,
+                        )
+                        message = self._prepend_schema_name(message)
+                        # Surface any custom error from the key schema(s) that rejected
+                        # the wrong key(s), so an explicit `error=` is not silently lost.
+                        custom_errors = [
+                            key_errors[k]
+                            for k in sorted(wrong_keys, key=repr)
+                            if k in key_errors
+                        ]
+                        errors: Union[List, str, None] = (
+                            [e.format(data) if e else None] + custom_errors
+                            if custom_errors
+                            else (e.format(data) if e else None)
+                        )
+                        raise SchemaWrongKeyError(message, errors)
+            if diagnostics is not None and dict_failed:
+                # All field-level conclusions are already recorded; raise so the
+                # regular control flow treats the entry as rejected.
+                raise SchemaError("dictionary validation failed")
 
             # Apply default-having optionals that haven't been used:
             defaults = (
                 set(k for k in s if isinstance(k, Optional) and hasattr(k, "default"))
                 - coverage
             )
+            default_kwargs = {
+                key: value
+                for key, value in kwargs.items()
+                if key not in ("_diagnostics", "_path")
+            }
             for default in defaults:
                 new[default.key] = (
-                    _invoke_with_optional_kwargs(default.default, **kwargs)
+                    _invoke_with_optional_kwargs(default.default, **default_kwargs)
                     if callable(default.default)
                     else default.default
                 )
@@ -564,40 +807,80 @@ class Schema(object):
             else:
                 message = "%r should be instance of %r" % (data, s.__name__)
                 message = self._prepend_schema_name(message)
-                raise SchemaUnexpectedTypeError(message, e.format(data) if e else None)
+                failure: SchemaError = SchemaUnexpectedTypeError(
+                    message, e.format(data) if e else None
+                )
+                if diagnostics is not None:
+                    diagnostics.record_failure(path, failure)
+                raise failure
         if flavor == VALIDATOR:
+            failures_before = (
+                len(diagnostics.failures) if diagnostics is not None else 0
+            )
             try:
                 return s.validate(data, **kwargs)
             except SchemaError as x:
+                if (
+                    diagnostics is not None
+                    and len(diagnostics.failures) == failures_before
+                ):
+                    # A custom validator raised without recording itself.
+                    diagnostics.record_failure(path, x)
                 raise SchemaError(
                     [None] + x.autos, [e.format(data) if e else None] + x.errors
                 )
             except BaseException as x:
                 message = "%r.validate(%r) raised %r" % (s, data, x)
                 message = self._prepend_schema_name(message)
-                raise SchemaError(message, e.format(data) if e else None)
+                failure = SchemaError(message, e.format(data) if e else None)
+                if (
+                    diagnostics is not None
+                    and len(diagnostics.failures) == failures_before
+                ):
+                    diagnostics.record_failure(path, failure)
+                raise failure
         if flavor == CALLABLE:
             f = _callable_str(s)
+            failures_before = (
+                len(diagnostics.failures) if diagnostics is not None else 0
+            )
             try:
                 if s(data):
                     return data
             except SchemaError as x:
+                if (
+                    diagnostics is not None
+                    and len(diagnostics.failures) == failures_before
+                ):
+                    diagnostics.record_failure(path, x)
                 raise SchemaError(
                     [None] + x.autos, [e.format(data) if e else None] + x.errors
                 )
             except BaseException as x:
                 message = "%s(%r) raised %r" % (f, data, x)
                 message = self._prepend_schema_name(message)
-                raise SchemaError(message, e.format(data) if e else None)
+                failure = SchemaError(message, e.format(data) if e else None)
+                if (
+                    diagnostics is not None
+                    and len(diagnostics.failures) == failures_before
+                ):
+                    diagnostics.record_failure(path, failure)
+                raise failure
             message = "%s(%r) should evaluate to True" % (f, data)
             message = self._prepend_schema_name(message)
-            raise SchemaError(message, e.format(data) if e else None)
+            failure = SchemaError(message, e.format(data) if e else None)
+            if diagnostics is not None:
+                diagnostics.record_failure(path, failure)
+            raise failure
         if s == data:
             return data
         else:
             message = "%r does not match %r" % (s, data)
             message = self._prepend_schema_name(message)
-            raise SchemaError(message, e.format(data) if e else None)
+            failure = SchemaError(message, e.format(data) if e else None)
+            if diagnostics is not None:
+                diagnostics.record_failure(path, failure)
+            raise failure
 
     def json_schema(
         self, schema_id: str, use_refs: bool = False, **kwargs: Any
