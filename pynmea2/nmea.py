@@ -87,7 +87,8 @@ class NMEASentence(NMEASentenceBase):
         return reduce(operator.xor, map(ord, nmea_str), 0)
 
     @staticmethod
-    def parse(line, check=None, checksums='check'):
+    def parse(line, check=None, checksums='check', registry=None, at=None,
+              device=None, force_revision=None):
         '''
         parse(line)
 
@@ -96,6 +97,13 @@ class NMEASentence(NMEASentenceBase):
 
         Raises ValueError if the string could not be parsed, or if the checksum
         did not match.
+
+        Firmware-aware proprietary sentences additionally accept:
+          `registry`       a FirmwareRevisionRegistry holding the evidenced
+                           revision intervals (defaults to the shared one)
+          `at`             the observation time used to choose a revision
+          `device`         the id of the device the sentence came from
+          `force_revision` skip interval resolution and use this reading
         '''
 
         # backwards compatibility
@@ -106,6 +114,17 @@ class NMEASentence(NMEASentenceBase):
                 checksums = 'check'
         assert checksums in {'required', 'check', 'my_data_is_corrupt'}
 
+        from . import revision as _revision
+        token = _revision.push_revision_context(
+            registry=registry, at=at, device=device,
+            force_revision=force_revision, line=line, checksums=checksums)
+        try:
+            return NMEASentence._parse(line, checksums)
+        finally:
+            _revision.pop_revision_context(token)
+
+    @staticmethod
+    def _parse(line, checksums):
         match = NMEASentence.sentence_re.match(line)
         if not match:
             raise ParseError('could not parse data', line)

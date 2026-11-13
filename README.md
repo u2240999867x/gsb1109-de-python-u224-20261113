@@ -91,6 +91,56 @@ For example, `latitude` and `longitude` properties exist as helpers to access th
 
 Sentence types that pynmea2 has no definition for are still parsed: a talker sentence is returned as a plain `TalkerSentence` and a proprietary sentence as a plain `ProprietarySentence`, with the raw field values in `data`. Input that is not an NMEA sentence still raises `ParseError`.
 
+## Firmware revisions of proprietary sentences
+
+A manufacturer may release firmware that reorders the columns of an existing
+proprietary sentence without changing its name, field count or checksum (XOR
+checksums are invariant under a permutation of the bytes). Such sentences
+derive from `VersionedProprietarySentence` and declare each published layout
+in a class-level `revisions` mapping.
+
+```python
+from datetime import datetime
+import pynmea2
+
+registry = pynmea2.FirmwareRevisionRegistry()
+line = '$PACM,FLX,7,21.5,1013.0,OK*57'
+
+# No evidence yet: both readings are retained, never guessed.
+msg = pynmea2.parse(line, registry=registry, device='unit-1',
+                    at=datetime(2026, 1, 1))
+msg.ambiguous                # True
+msg.revision_candidates      # ['fw1', 'fw2']
+for reading in msg.interpretations():
+    print(reading.revision, reading.temperature, reading.pressure)
+
+# A (possibly late) firmware announcement pins the switch instant.
+fields = pynmea2.acm.ACMFLX.revisions
+registry.announce('ACM', 'FLX', 'fw1', fields=fields['fw1'],
+                  effective_until=datetime(2026, 3, 1), device='unit-1')
+diff = registry.announce('ACM', 'FLX', 'fw2', fields=fields['fw2'],
+                         effective_from=datetime(2026, 3, 1),
+                         device='unit-1', replaces='fw1')
+diff['changed_fields']       # ['pressure', 'temperature']
+
+# The original raw message is re-interpreted with the now-evidenced layout.
+pinned = msg.reinterpret()
+pinned.revision              # 'fw1' (the January observation predates March)
+```
+
+Key behaviour:
+
+- `at` accepts a `datetime`, `date` or numeric epoch; selection uses the
+  evidenced `effective_from` / `effective_until` interval for that device.
+- While the switch instant is undetermined, every still-possible reading is
+  retained (`ambiguous` / `interpretations()`) instead of picking one.
+- Timelines are scoped per `(manufacturer, sentence, device)`, so one
+  device's firmware never leaks onto another device or an unknown device.
+- `parse(..., force_revision='fw2')` forces a single reading, and
+  `msg.apply_announcement(...)` records evidence and re-parses in one call.
+- The diff returned by each announcement lists the published fields that
+  actually changed (added, removed, moved, relabelled, or converter changed).
+
 
 ## Checksums
 

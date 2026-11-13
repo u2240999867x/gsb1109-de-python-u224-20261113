@@ -7,6 +7,12 @@ version = __version__
 
 from .nmea import NMEASentence, ProprietarySentence, QuerySentence
 from .nmea import ChecksumError, ParseError, SentenceTypeError
+from .revision import (
+    FirmwareRevisionRegistry,
+    VersionedProprietarySentence,
+    firmware_registry,
+    diff_fields,
+)
 
 parse = NMEASentence.parse
 
