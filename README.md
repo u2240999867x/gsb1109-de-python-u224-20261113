@@ -141,6 +141,39 @@ for line in file.readlines():
         continue
 ```
 
+## Multiplexed serial ports
+
+`NMEAStreamReader` can also keep an independent buffer and byte cursor for
+several ports. Feed chunks as they arrive; a chunk may end anywhere,
+including in the middle of a sentence:
+
+```python
+import pynmea2
+
+reader = pynmea2.NMEAStreamReader(channels=['gps', 'ais', 'wind', 'depth'])
+
+for record in reader.feed('gps', chunk):
+    if record.status == 'ok':
+        print(record.sentence)
+    elif record.status == 'bad':
+        print('discarded:', record.error, record.raw)
+
+# Each channel remembers its own incomplete tail.
+tail = reader.pending('ais')
+
+# A reconnect must not join the old half sentence to the new connection.
+reader.reconnect('gps')
+
+# Closing reports any remaining tail as a discard record.
+reader.close('gps')
+```
+
+Each `StreamRecord` has `channel`, `status` (`'ok'`, `'bad'` or `'discard'`),
+`start`/`end` byte offsets within that channel, the raw bytes in `raw`, and
+either `sentence` or `error`. `reader.coverage(channel)` reports the success
+and discard ranges so they can be checked against `received`; complete
+input has `covered == received`, no gaps and no overlaps.
+
 ## `pySerial` device example
 
 See [examples/read_serial.py](/examples/read_serial.py)

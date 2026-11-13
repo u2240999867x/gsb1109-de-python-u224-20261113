@@ -12,6 +12,8 @@ parse = NMEASentence.parse
 
 from .types import *
 
-from .stream import NMEAStreamReader
+from .stream import NMEAStreamReader, NMEAChannelReader
+from .stream import StreamRecord, StreamRange, PendingTail, Coverage
+from .stream import OK, BAD, PENDING, DISCARD
 from .nmea_file import NMEAFile
 
