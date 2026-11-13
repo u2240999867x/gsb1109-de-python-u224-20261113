@@ -4,6 +4,8 @@ Test the DatabaseULog module.
 
 import unittest
 import os
+import sqlite3
+import struct
 import tempfile
 from unittest.mock import patch
 import numpy as np
@@ -241,6 +243,131 @@ class TestDatabaseULog(unittest.TestCase):
                         self.assertEqual(len(db_timestamps), len(values))
                         np.testing.assert_allclose(db_timestamps, values)
             cur.close()
+
+    @staticmethod
+    def _info_multiple_payload(is_continued, value_type, key, value):
+        ''' Build the payload of one INFO_MULTIPLE ('M') message. '''
+        type_key = '{} {}'.format(value_type, key).encode('utf-8')
+        payload = bytes([is_continued, len(type_key)]) + type_key + value
+        return struct.pack('<HB', len(payload), ord('M')) + payload
+
+    def _build_info_multiple_ulog(self, blocks):
+        ''' Build in-memory ULog bytes from (continued, type, key, value) blocks. '''
+        content = ULog.HEADER_BYTES + b'\x01' + struct.pack('<Q', 0)
+        for block in blocks:
+            content += self._info_multiple_payload(*block)
+        return content
+
+    def _write_temp_ulog(self, content):
+        ''' Write ULog bytes to a temporary file and return its path. '''
+        handle = tempfile.NamedTemporaryFile(suffix='.ulg', delete=False)
+        handle.write(content)
+        handle.close()
+        self.addCleanup(os.remove, handle.name)
+        return handle.name
+
+    def test_info_multiple_block_reconciliation_roundtrip(self):
+        '''
+        Raw blocks and the block-to-logical-value reconciliation survive the
+        database roundtrip, including duplicate keys, continuations separated
+        by an independent value, split multibyte characters and orphan blocks.
+        '''
+        log_file = self._write_temp_ulog(self._build_info_multiple_ulog([
+            (0, 'char[8]', 'a', b'caf'),
+            (1, 'char[8]', 'a', b'\xc3'),
+            (0, 'char[4]', 'b', b'indep'),
+            (1, 'char[8]', 'a', b'\xa9'),
+            (1, 'char[6]', 'z', b'orphan'),
+            (0, 'char[4]', 'dup', b'same'),
+            (0, 'char[4]', 'dup', b'same'),
+        ]))
+        dbulog = DatabaseULog(self.db_handle, log_file=log_file)
+        dbulog.save()
+        loaded = DatabaseULog(self.db_handle,
+                              primary_key=dbulog.primary_key, lazy=False)
+
+        source_summary = dbulog.get_info_multiple_summary()
+        loaded_summary = loaded.get_info_multiple_summary()
+        self.assertEqual(
+            [(b.index, b.key, b.type, b.is_continued, b.value)
+             for b in source_summary.raw_blocks],
+            [(b.index, b.key, b.type, b.is_continued, b.value)
+             for b in loaded_summary.raw_blocks])
+        self.assertEqual(
+            [(m.key, m.type, m.block_indices, m.blocks)
+             for m in source_summary.messages],
+            [(m.key, m.type, m.block_indices, m.blocks)
+             for m in loaded_summary.messages])
+
+        messages = loaded_summary.messages
+        value_a = next(message for message in messages if message.key == 'a')
+        self.assertEqual(value_a.block_indices, [0, 1, 3])
+        self.assertEqual(value_a.value, 'café')
+        self.assertEqual(
+            [message.block_indices for message in messages if message.key == 'dup'],
+            [[5], [6]])
+        self.assertEqual(
+            [block.index for block in loaded_summary.unconsumed_blocks], [4])
+        self.assertEqual(loaded.msg_info_multiple_dict['dup'], [['same'], ['same']])
+
+    def test_info_multiple_blocks_persisted_separately(self):
+        ''' Every raw block is stored as its own row, orphans included. '''
+        log_file = self._write_temp_ulog(self._build_info_multiple_ulog([
+            (0, 'char[4]', 'a', b'v0'),
+            (1, 'char[4]', 'a', b'v1'),
+            (1, 'char[4]', 'z', b'orphan'),
+        ]))
+        dbulog = DatabaseULog(self.db_handle, log_file=log_file)
+        dbulog.save()
+        with self.db_handle() as con:
+            cur = con.cursor()
+            cur.execute('''
+                SELECT SeriesIndex, Key, IsContinued, Value
+                FROM ULogMessageInfoMultipleBlock
+                WHERE ULogId = ?
+                ORDER BY SeriesIndex
+            ''', (dbulog.primary_key,))
+            rows = cur.fetchall()
+            cur.execute('''
+                SELECT BlockSeriesIndex
+                FROM ULogMessageInfoMultipleListElement
+                ORDER BY SeriesIndex
+            ''')
+            linked = [index for (index,) in cur.fetchall()]
+            cur.close()
+        self.assertEqual(
+            rows,
+            [(0, 'a', 0, b'v0'), (1, 'a', 1, b'v1'), (2, 'z', 1, b'orphan')])
+        # the orphan block is present but never referenced by a logical value
+        self.assertEqual(sorted(linked), [0, 1])
+        self.assertTrue(dbulog.file_corruption)
+
+    def test_info_multiple_legacy_schema_without_block_table(self):
+        ''' A database lacking the block table still loads logical values and
+        reconstructs raw blocks from the legacy element rows. '''
+        log_path = os.path.join(TEST_PATH, 'sample_log_small.ulg')
+        dbulog = DatabaseULog(self.db_handle, log_file=log_path)
+        dbulog.save()
+        with self.db_handle() as con:
+            con.execute('UPDATE ULogMessageInfoMultipleListElement '
+                        'SET BlockSeriesIndex = NULL')
+            con.execute('DROP TABLE ULogMessageInfoMultipleBlock')
+        loaded = DatabaseULog(self.db_handle,
+                              primary_key=dbulog.primary_key, lazy=False)
+        reference = ULog(log_path)
+        self.assertEqual(loaded.msg_info_multiple_dict,
+                         reference.msg_info_multiple_dict)
+        summary = loaded.get_info_multiple_summary()
+        expected_block_count = sum(
+            len(value)
+            for lists in reference.msg_info_multiple_dict.values()
+            for value in lists)
+        self.assertEqual(len(summary.raw_blocks), expected_block_count)
+        self.assertEqual(summary.unconsumed_blocks, [])
+        self.assertEqual(
+            [(m.key, m.block_indices) for m in summary.messages],
+            [(m.key, m.block_indices)
+             for m in reference.get_info_multiple_summary().messages])
 
     @data('sample',
           'sample_appended',

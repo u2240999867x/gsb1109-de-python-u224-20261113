@@ -115,6 +115,12 @@ class ULog(object):
         self._msg_info_dict_types = {}
         self._msg_info_multiple_dict = {}
         self._msg_info_multiple_dict_types = {}
+        # one MessageInfoMultiple per logical value, in stream order
+        self._msg_info_multiple_messages = []
+        # every raw INFO_MULTIPLE block in stream order, including orphans
+        self._info_multiple_raw_blocks = []
+        # key -> the last open logical value, used to attach continued blocks
+        self._open_info_multiple = {}
         self._initial_parameters = {}
         self._default_parameters = {}
         self._changed_parameters = []
@@ -162,6 +168,13 @@ class ULog(object):
         """ dictionary of all information multiple messages (key is a string, value
         is a list of lists that contains the messages) """
         return self._msg_info_multiple_dict
+
+    @property
+    def msg_info_multiple_messages(self):
+        """ list of MessageInfoMultiple objects, one per logical value, in the
+        order the values appear in the log. Unlike msg_info_multiple_dict it
+        keeps duplicate keys as separate entries and retains every raw block. """
+        return self._msg_info_multiple_messages
 
     @property
     def initial_parameters(self):
@@ -300,20 +313,21 @@ class ULog(object):
             file.write(data)
 
     def _write_info_multiple_message(self, file):
-        for base_key, value_sets in self._msg_info_multiple_dict.items():
-            value_type: str = self._msg_info_multiple_dict_types[base_key]
-            key: str = value_type + ' ' + base_key
+        # Re-emit the raw blocks in stream order so that every block keeps its
+        # own key, type and continuation flag. Duplicate keys and blocks that
+        # were never reconciled into a complete value are preserved as-is.
+        for block in self._info_multiple_raw_blocks:
+            key = block.type + ' ' + block.key
+            key_bytes = bytes(key, 'utf-8')
+            data = bytearray()
+            data.extend(struct.pack('<B', int(block.is_continued)))
+            data.extend(struct.pack('<B', len(key_bytes)))
+            data.extend(key_bytes)
+            data.extend(bytes(block.value))
 
-            for value_set in value_sets:
-                continued = False
-                for value in value_set:
-                    data = self._make_info_message_data(key, value, value_type, continued)
-                    header = struct.pack('<HB', len(data), self.MSG_TYPE_INFO_MULTIPLE)
-
-                    file.write(header)
-                    file.write(data)
-
-                    continued = True
+            header = struct.pack('<HB', len(data), self.MSG_TYPE_INFO_MULTIPLE)
+            file.write(header)
+            file.write(data)
 
     def _write_initial_parameters(self, file):
         for parameter_name, value in self._initial_parameters.items():
@@ -635,13 +649,15 @@ class ULog(object):
             type_key_split = type_key.split(' ')
             self.type = type_key_split[0]
             self.key = type_key_split[1]
+            # raw, undecoded payload bytes of the value within this block
+            self.raw_value = data[1+key_len:]
             if self.type.startswith('char['): # it's a string
-                self.value = ULog.parse_string(data[1+key_len:])
+                self.value = ULog.parse_string(self.raw_value)
             elif self.type in ULog._UNPACK_TYPES:
                 unpack_type = ULog._UNPACK_TYPES[self.type]
-                self.value, = struct.unpack('<'+unpack_type[0], data[1+key_len:])
+                self.value, = struct.unpack('<'+unpack_type[0], self.raw_value)
             else: # probably an array (or non-basic type)
-                self.value = data[1+key_len:]
+                self.value = self.raw_value
 
     class _MessageParameterDefault(object):
         """ ULog parameter default message representation """
@@ -652,6 +668,119 @@ class ULog(object):
             self.type = msg_info.type
             self.key = msg_info.key
             self.value = msg_info.value
+
+    class MessageInfoMultiple(object):
+        """
+        A single logical INFO_MULTIPLE value, reconciled from its raw blocks.
+
+        A logical value starts at a block with is_continued == 0 and is made up
+        of that block plus the following blocks with is_continued == 1 carrying
+        the same key. Continuation only reaches back to the still-open value of
+        the same key: a later independent value (is_continued == 0) is never used
+        to complete an earlier value, and a continued block without an open value
+        of the same key cannot be reconciled and stays unconsumed.
+
+        Duplicate keys produce separate MessageInfoMultiple objects, even when
+        their values are identical.
+        """
+
+        def __init__(self, key, value_type, block_index, block):
+            self.key = key
+            self.type = value_type
+            self.blocks = [block]
+            self.block_indices = [block_index]
+
+        def append_block(self, block_index, block):
+            """ attach a continued raw block to this logical value """
+            self.blocks.append(block)
+            self.block_indices.append(block_index)
+
+        @property
+        def value(self):
+            """ the logical value, interpreted over all blocks together """
+            if self.type.startswith('char['):
+                return ULog.parse_string(b''.join(self.blocks))
+            return b''.join(self.blocks)
+
+        @property
+        def raw_value(self):
+            """ the undecoded bytes of the complete value across all blocks """
+            return b''.join(self.blocks)
+
+        def __eq__(self, other):
+            if not isinstance(other, ULog.MessageInfoMultiple):
+                return NotImplemented
+            return (self.key == other.key and
+                    self.type == other.type and
+                    self.block_indices == other.block_indices and
+                    self.blocks == other.blocks)
+
+    class InfoMultipleRawBlock(object):
+        """
+        A single raw INFO_MULTIPLE block as it appeared in the stream, before
+        any continuation handling. The index is unique across the whole log and
+        defines the block order.
+        """
+
+        def __init__(self, index, key, value_type, is_continued, value):
+            self.index = index
+            self.key = key
+            self.type = value_type
+            self.is_continued = is_continued
+            self.value = value
+
+        def __eq__(self, other):
+            if not isinstance(other, ULog.InfoMultipleRawBlock):
+                return NotImplemented
+            return (self.index == other.index and
+                    self.key == other.key and
+                    self.type == other.type and
+                    self.is_continued == other.is_continued and
+                    self.value == other.value)
+
+    class InfoMultipleSummary(object):
+        """
+        Reconciliation record between raw INFO_MULTIPLE blocks and logical
+        values. It answers which raw blocks each logical value consumed, and
+        which raw blocks never became part of a complete logical value.
+        """
+
+        def __init__(self, raw_blocks, messages):
+            self.raw_blocks = list(raw_blocks)
+            self.messages = list(messages)
+            self._list_id_by_block = {}
+            for message in self.messages:
+                for block_index in message.block_indices:
+                    self._list_id_by_block[block_index] = message
+
+        @property
+        def consumed_block_indices(self):
+            """ sorted indices of all raw blocks consumed by a logical value """
+            return sorted(self._list_id_by_block)
+
+        @property
+        def unconsumed_blocks(self):
+            """ raw blocks that never became part of a complete logical value """
+            return [block for block in self.raw_blocks
+                    if block.index not in self._list_id_by_block]
+
+        def get_message(self, block_index):
+            """ return the logical value consuming the block, or None """
+            return self._list_id_by_block.get(block_index)
+
+        def get_blocks(self, message):
+            """ return the raw blocks consumed by the given logical value """
+            blocks_by_index = {block.index: block for block in self.raw_blocks}
+            return [blocks_by_index[index] for index in message.block_indices]
+
+        def reconciliation(self):
+            """
+            return (logical_value, consumed_blocks) pairs in stream order,
+            followed by the unconsumed raw blocks.
+            """
+            pairs = [(message, self.get_blocks(message))
+                     for message in self.messages]
+            return pairs, self.unconsumed_blocks
 
     class _MessageFlagBits(object):
         """ ULog message flag bits """
@@ -892,15 +1021,56 @@ class ULog(object):
             self._default_parameters[def_type][msg_param.key] = msg_param.value
 
     def _add_message_info_multiple(self, msg_info):
-        """ add a message info multiple to self._msg_info_multiple_dict """
-        if msg_info.key in self._msg_info_multiple_dict:
-            if msg_info.is_continued:
-                self._msg_info_multiple_dict[msg_info.key][-1].append(msg_info.value)
-            else:
-                self._msg_info_multiple_dict[msg_info.key].append([msg_info.value])
-        else:
-            self._msg_info_multiple_dict[msg_info.key] = [[msg_info.value]]
-            self._msg_info_multiple_dict_types[msg_info.key] = msg_info.type
+        """ reconcile a raw INFO_MULTIPLE block into blocks and logical values """
+        block_index = len(self._info_multiple_raw_blocks)
+        block = bytes(msg_info.raw_value)
+        self._info_multiple_raw_blocks.append(
+            ULog.InfoMultipleRawBlock(
+                index=block_index,
+                key=msg_info.key,
+                value_type=msg_info.type,
+                is_continued=bool(msg_info.is_continued),
+                value=block,
+            )
+        )
+
+        open_message = self._open_info_multiple.get(msg_info.key)
+        if msg_info.is_continued:
+            if open_message is None:
+                # A continued block must extend the still-open value of the same
+                # key. An independent value cannot complete an earlier one, so an
+                # orphaned continuation is kept only as an unconsumed raw block.
+                self._file_corrupt = True
+                return
+            open_message.append_block(block_index, block)
+            self._msg_info_multiple_dict[msg_info.key][-1].append(msg_info.value)
+            return
+
+        message = ULog.MessageInfoMultiple(
+            key=msg_info.key,
+            value_type=msg_info.type,
+            block_index=block_index,
+            block=block,
+        )
+        self._msg_info_multiple_messages.append(message)
+        # a non-continued block opens a new, independent value of this key
+        self._open_info_multiple[msg_info.key] = message
+        self._msg_info_multiple_dict.setdefault(msg_info.key, []).append(
+            [msg_info.value]
+        )
+        self._msg_info_multiple_dict_types.setdefault(msg_info.key, msg_info.type)
+
+    def get_info_multiple_summary(self):
+        """
+        Return an InfoMultipleSummary reconciling raw blocks with logical values.
+
+        From the summary one can look up which raw blocks a logical value
+        consumed, and which raw blocks never became part of a complete value.
+        """
+        return ULog.InfoMultipleSummary(
+            raw_blocks=list(self._info_multiple_raw_blocks),
+            messages=list(self._msg_info_multiple_messages),
+        )
 
     def _load_file(self, log_file, message_name_filter_list, parse_header_only=False):
         """ load and parse an ULog file into memory """

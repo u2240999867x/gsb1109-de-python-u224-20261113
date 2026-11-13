@@ -5,6 +5,7 @@ Module containing the DatabaseULog class.
 import sqlite3
 import hashlib
 import contextlib
+import struct
 import numpy as np
 from pyulog import ULog
 
@@ -49,7 +50,7 @@ class DatabaseULog(ULog):
     contsructor will throw an exception. See the documentation of
     "ulog_migratedb" for more information.
     '''
-    SCHEMA_VERSION = 5
+    SCHEMA_VERSION = 6
 
     @staticmethod
     def get_db_handle(db_path):
@@ -353,12 +354,40 @@ class DatabaseULog(ULog):
                 self._msg_info_dict[key] = value
                 self._msg_info_dict_types[key] = typename
 
-            # msg_info_multiple_dict
+            # msg_info_multiple_dict, raw blocks and logical values
+            cur.execute('''
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table' AND name = 'ULogMessageInfoMultipleBlock'
+                ''')
+            has_block_table = cur.fetchone() is not None
+
+            blocks_by_index = {}
+            if has_block_table:
+                cur.execute('''
+                    SELECT SeriesIndex, Key, Typename, IsContinued, Value
+                    FROM ULogMessageInfoMultipleBlock
+                    WHERE ULogId = ?
+                    ORDER BY SeriesIndex
+                    ''', (self._pk,))
+                for series_index, key, typename, is_continued, value in cur.fetchall():
+                    raw_block = ULog.InfoMultipleRawBlock(
+                        index=series_index,
+                        key=key,
+                        value_type=typename,
+                        is_continued=bool(is_continued),
+                        value=bytes(value),
+                    )
+                    self._info_multiple_raw_blocks.append(raw_block)
+                    blocks_by_index[series_index] = raw_block
+
             cur.execute('''
                 SELECT Id, Key, Typename
                 FROM ULogMessageInfoMultiple
                 WHERE ULogId = ?
                 ''', (self._pk,))
+            loaded_messages = []
+            synthetic_block_index = 0
             for message_id, key, typename in cur.fetchall():
                 self._msg_info_multiple_dict[key] = []
                 self._msg_info_multiple_dict_types[key] = typename
@@ -369,13 +398,70 @@ class DatabaseULog(ULog):
                     ORDER BY SeriesIndex
                     ''', (message_id,))
                 for (list_id,) in cur.fetchall():
-                    cur.execute('''
-                        SELECT Value
-                        FROM ULogMessageInfoMultipleListElement
-                        WHERE ListId = ?
-                        ORDER BY SeriesIndex
-                        ''', (list_id,))
-                    self._msg_info_multiple_dict[key].append([value for (value,) in cur.fetchall()])
+                    if has_block_table:
+                        cur.execute('''
+                            SELECT SeriesIndex, Value, BlockSeriesIndex
+                            FROM ULogMessageInfoMultipleListElement
+                            WHERE ListId = ?
+                            ORDER BY SeriesIndex
+                            ''', (list_id,))
+                        element_rows = cur.fetchall()
+                        block_pairs = [
+                            (block_index, blocks_by_index[block_index].value)
+                            for (_, _, block_index) in element_rows
+                        ]
+                    else:
+                        # legacy database: reconstruct raw blocks from the stored
+                        # elements, marking all but the first as continuations.
+                        cur.execute('''
+                            SELECT SeriesIndex, Value
+                            FROM ULogMessageInfoMultipleListElement
+                            WHERE ListId = ?
+                            ORDER BY SeriesIndex
+                            ''', (list_id,))
+                        element_rows = cur.fetchall()
+                        block_pairs = []
+                        for element_position, (_, value) in enumerate(element_rows):
+                            if isinstance(value, str):
+                                raw_value = value.encode('utf-8')
+                            elif isinstance(value, (bytes, bytearray)):
+                                raw_value = bytes(value)
+                            else:
+                                # scalar basic type stored as a number
+                                code = ULog._UNPACK_TYPES[typename][0]
+                                raw_value = struct.pack('<' + code, value)
+                            block_pairs.append((synthetic_block_index, raw_value))
+                            self._info_multiple_raw_blocks.append(
+                                ULog.InfoMultipleRawBlock(
+                                    index=synthetic_block_index,
+                                    key=key,
+                                    value_type=typename,
+                                    is_continued=element_position > 0,
+                                    value=raw_value,
+                                )
+                            )
+                            synthetic_block_index += 1
+                    self._msg_info_multiple_dict[key].append(
+                        [value for (_, value, *_) in element_rows])
+                    if block_pairs:
+                        # Each logical value carries the type of its own first
+                        # raw block: duplicate keys may declare different array
+                        # sizes. Legacy rows fall back to the per-key Typename.
+                        if has_block_table:
+                            message_typename = blocks_by_index[
+                                block_pairs[0][0]].type
+                        else:
+                            message_typename = typename
+                        loaded_messages.append(
+                            self._load_info_multiple_message(
+                                key, message_typename, block_pairs))
+
+            # restore stream order from the first raw block each value consumed
+            loaded_messages.sort(key=lambda message: message.block_indices[0])
+            self._msg_info_multiple_messages = loaded_messages
+            # the last value of each key is the one a continuation would extend
+            for message in loaded_messages:
+                self._open_info_multiple[message.key] = message
 
             # initial_parameters
             cur.execute('''
@@ -408,6 +494,22 @@ class DatabaseULog(ULog):
 
             cur.close()
         self._lazy_loaded = lazy
+
+    def _load_info_multiple_message(self, key, typename, block_pairs):
+        '''
+        Reconstruct a ULog.MessageInfoMultiple logical value from
+        (block_index, raw_block_bytes) pairs stored for one list.
+        '''
+        first_index, first_block = block_pairs[0]
+        message = ULog.MessageInfoMultiple(
+            key=key,
+            value_type=typename,
+            block_index=first_index,
+            block=bytes(first_block),
+        )
+        for block_index, raw_block in block_pairs[1:]:
+            message.append_block(block_index, bytes(raw_block))
+        return message
 
     def get_dataset(self, name, multi_instance=0, lazy=False, db_cursor=None, caching=True):
         '''
@@ -659,33 +761,59 @@ class DatabaseULog(ULog):
                     self._pk,
                 ) for key, value in self.msg_info_dict.items()])
 
-            # msg_info_multiple_dict
-            for key, lists in self.msg_info_multiple_dict.items():
-                cur.execute('''
-                    INSERT INTO ULogMessageInfoMultiple
-                    (Key, Typename, ULogId)
-                    VALUES
-                    (?, ?, ?)
-                    ''', (key, self._msg_info_multiple_dict_types[key], self._pk))
-                message_id = cur.lastrowid
-                for list_index, message_list in enumerate(lists):
+            # msg_info_multiple: persist every raw block first, including blocks
+            # that are never reconciled into a complete logical value.
+            cur.executemany('''
+                INSERT INTO ULogMessageInfoMultipleBlock
+                (SeriesIndex, Key, Typename, IsContinued, Value, ULogId)
+                VALUES
+                (?, ?, ?, ?, ?, ?)
+                ''', [(
+                    block.index,
+                    block.key,
+                    block.type,
+                    int(block.is_continued),
+                    bytes(block.value),
+                    self._pk,
+                ) for block in self._info_multiple_raw_blocks])
+
+            # logical values, one ULogMessageInfoMultiple row per distinct key,
+            # each value referencing the raw blocks it consumed.
+            message_ids = {}
+            key_list_indices = {}
+            for message in self._msg_info_multiple_messages:
+                if message.key not in message_ids:
                     cur.execute('''
-                        INSERT INTO ULogMessageInfoMultipleList
-                        (SeriesIndex, MessageId)
-                        VALUES
-                        (?, ?)
-                        ''', (list_index, message_id))
-                    list_id = cur.lastrowid
-                    cur.executemany('''
-                        INSERT INTO ULogMessageInfoMultipleListElement
-                        (SeriesIndex, Value, ListId)
+                        INSERT INTO ULogMessageInfoMultiple
+                        (Key, Typename, ULogId)
                         VALUES
                         (?, ?, ?)
-                        ''', [(
-                            series_index,
-                            value,
-                            list_id,
-                        ) for series_index, value in enumerate(message_list)])
+                        ''', (message.key, message.type, self._pk))
+                    message_ids[message.key] = cur.lastrowid
+                    key_list_indices[message.key] = 0
+                list_index = key_list_indices[message.key]
+                key_list_indices[message.key] += 1
+                # the legacy dict holds the exact per-block parsed values in the
+                # same order as message.block_indices.
+                message_list = self._msg_info_multiple_dict[message.key][list_index]
+                cur.execute('''
+                    INSERT INTO ULogMessageInfoMultipleList
+                    (SeriesIndex, MessageId)
+                    VALUES
+                    (?, ?)
+                    ''', (list_index, message_ids[message.key]))
+                list_id = cur.lastrowid
+                element_rows = [
+                    (series_index, value, block_index, list_id)
+                    for series_index, (value, block_index) in enumerate(
+                        zip(message_list, message.block_indices))
+                ]
+                cur.executemany('''
+                    INSERT INTO ULogMessageInfoMultipleListElement
+                    (SeriesIndex, Value, BlockSeriesIndex, ListId)
+                    VALUES
+                    (?, ?, ?, ?)
+                    ''', element_rows)
 
             # initial_parameters
             cur.executemany('''

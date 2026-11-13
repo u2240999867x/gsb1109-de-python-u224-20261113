@@ -141,6 +141,119 @@ class TestULog(unittest.TestCase):
                 pyulog.ULog(self._build_ulog((msg_type, payload)), disable_str_exceptions=False)
             assert not pyulog.ULog(self._build_ulog((msg_type, payload))).file_corruption
 
+class TestInfoMultipleReconciliation(unittest.TestCase):
+    '''
+    Tests the reconciliation of raw INFO_MULTIPLE blocks into logical values:
+    duplicate keys stay separate, continuations only extend the open value of
+    the same key, orphan blocks are retained, and text is decoded over the
+    complete value.
+    '''
+
+    @staticmethod
+    def _info_multiple_payload(is_continued, value_type, key, value):
+        ''' Build the payload of one INFO_MULTIPLE ('M') message. '''
+        type_key = '{} {}'.format(value_type, key).encode('utf-8')
+        return bytes([is_continued, len(type_key)]) + type_key + value
+
+    def _parse(self, *blocks):
+        ''' blocks are (is_continued, type, key, value) tuples '''
+        messages = [('M', self._info_multiple_payload(*block)) for block in blocks]
+        return pyulog.ULog(TestULog._build_ulog(*messages))
+
+    def test_duplicate_keys_are_kept_separate(self):
+        ''' Identical values under the same key remain separate logical values. '''
+        ulog = self._parse(
+            (0, 'char[4]', 'dup', b'same'),
+            (0, 'char[4]', 'dup', b'same'),
+        )
+        summary = ulog.get_info_multiple_summary()
+        self.assertEqual(len(summary.messages), 2)
+        self.assertTrue(all(message.key == 'dup' for message in summary.messages))
+        self.assertEqual([message.value for message in summary.messages], ['same', 'same'])
+        # distinct block indices, each value consumes exactly its own block
+        self.assertEqual([message.block_indices for message in summary.messages], [[0], [1]])
+        self.assertEqual(ulog.msg_info_multiple_dict['dup'], [['same'], ['same']])
+
+    def test_continuation_extends_only_open_same_key_value(self):
+        ''' A continued block extends the open value of its key, even if an
+        independent value of another key appears in between. '''
+        ulog = self._parse(
+            (0, 'char[8]', 'a', b'hello '),
+            (1, 'char[8]', 'a', b'world'),
+            (0, 'char[8]', 'b', b'indep'),
+            (1, 'char[8]', 'a', b'!'),
+        )
+        summary = ulog.get_info_multiple_summary()
+        by_key = {message.key: message for message in summary.messages}
+        self.assertEqual(by_key['a'].block_indices, [0, 1, 3])
+        self.assertEqual(by_key['a'].value, 'hello world!')
+        self.assertEqual(by_key['b'].block_indices, [2])
+        self.assertEqual(by_key['b'].value, 'indep')
+        self.assertEqual(summary.consumed_block_indices, [0, 1, 2, 3])
+        self.assertEqual(summary.unconsumed_blocks, [])
+
+    def test_orphan_continuation_is_retained_not_attached(self):
+        ''' A continuation without an open value of its key cannot complete an
+        earlier value: it stays an unconsumed raw block. '''
+        ulog = self._parse(
+            (0, 'char[4]', 'a', b'val0'),
+            (1, 'char[6]', 'z', b'orphan'),
+        )
+        self.assertTrue(ulog.file_corruption)
+        summary = ulog.get_info_multiple_summary()
+        self.assertEqual([message.key for message in summary.messages], ['a'])
+        self.assertEqual(summary.consumed_block_indices, [0])
+        unconsumed = summary.unconsumed_blocks
+        self.assertEqual(len(unconsumed), 1)
+        self.assertEqual(unconsumed[0].index, 1)
+        self.assertEqual(unconsumed[0].key, 'z')
+        self.assertTrue(unconsumed[0].is_continued)
+        # every raw block is accounted for exactly once
+        self.assertEqual(
+            sorted(summary.consumed_block_indices + [b.index for b in unconsumed]),
+            [block.index for block in summary.raw_blocks])
+
+    def test_multibyte_character_split_across_blocks(self):
+        ''' Text characters spanning blocks are interpreted on the joined
+        complete value, not per block. '''
+        ulog = self._parse(
+            (0, 'char[8]', 'a', b'caf'),
+            (1, 'char[8]', 'a', b'\xc3'),
+            (1, 'char[8]', 'a', b'\xa9'),
+        )
+        message, = ulog.get_info_multiple_summary().messages
+        self.assertEqual(message.raw_value, b'caf\xc3\xa9')
+        self.assertEqual(message.value, 'café')
+
+    def test_binary_arrays_are_concatenated(self):
+        ''' Non-char array blocks concatenate to the complete binary value. '''
+        ulog = self._parse(
+            (0, 'uint8_t[4]', 'u', bytes([1, 2])),
+            (1, 'uint8_t[4]', 'u', bytes([3, 4])),
+        )
+        message, = ulog.get_info_multiple_summary().messages
+        self.assertEqual(message.value, bytes([1, 2, 3, 4]))
+
+    def test_summary_lookups(self):
+        ''' The summary maps blocks to values in both directions. '''
+        ulog = self._parse(
+            (0, 'char[4]', 'a', b'aa'),
+            (1, 'char[4]', 'a', b'bb'),
+            (0, 'char[4]', 'b', b'cc'),
+        )
+        summary = ulog.get_info_multiple_summary()
+        message_a = summary.messages[0]
+        self.assertIs(summary.get_message(0), message_a)
+        self.assertIs(summary.get_message(1), message_a)
+        self.assertIs(summary.get_message(2), summary.messages[1])
+        self.assertIsNone(summary.get_message(99))
+        self.assertEqual([block.index for block in summary.get_blocks(message_a)], [0, 1])
+        pairs, unconsumed = summary.reconciliation()
+        self.assertEqual([(m.key, [b.index for b in blocks]) for m, blocks in pairs],
+                         [('a', [0, 1]), ('b', [2])])
+        self.assertEqual(unconsumed, [])
+
+
 class TestDataStringFields(unittest.TestCase):
     '''
     Tests the ULog.Data helpers that combine char array fields into strings.
