@@ -337,6 +337,53 @@ https://github.com/npm/node-semver#ranges):
     >>> semver.Version('2.3.4') in semver.NpmSpec('>=0.1.1 <0.1.3 || 2.x')
     True
 
+
+Migrating legacy collection records
+-----------------------------------
+
+Some historical records only store a partial version (``1.2`` or even
+``1``), while others hold an exact ``X.Y.Z`` string.  Upgrading them to
+strict SemVer must be driven by evidence, not by filling missing
+components with zeroes.
+
+The migration helpers combine the records with a
+:class:`ReleaseCatalogue` describing every published artifact, its
+channel and its release date:
+
+.. code-block:: pycon
+
+    >>> catalogue = semver.ReleaseCatalogue.from_directories({
+    ...     'pypi': {
+    ...         '2024-01-10': ['1.2.7'],
+    ...         '2024-03-01': ['2.0.0'],
+    ...         '2024-05-01': ['2.0.3'],
+    ...     },
+    ...     'internal': {'2024-02-01': ['1.2.9']},
+    ... }, as_of='2024-06-01')
+    >>> records = [
+    ...     semver.LegacyRecord('app-a', '1.2', 'pypi', '2024-06-01'),
+    ...     semver.LegacyRecord('app-b', '2.0', 'pypi', '2024-06-01'),
+    ... ]
+    >>> for result in semver.migrate(records, catalogue):
+    ...     print(result.record.identifier, result.resolved, result.version)
+    app-a True 1.2.7
+    app-b False None
+
+The rules are:
+
+* A record is upgraded to an exact :class:`Version` only when a single
+  published artifact is compatible; otherwise it stays unresolved and
+  :attr:`MigrationResult.feasible_versions` retains every still-viable
+  version -- missing components are never replaced with ``0``.
+* An artifact is only eligible if it was published to the record's
+  channel; a matching version from another channel is recorded on
+  :attr:`MigrationResult.excluded` with reason
+  :data:`REASON_CHANNEL`.
+* Releases published after the collection date are excluded with reason
+  :data:`REASON_CUTOFF`, even when their version matches.
+* Every exclusion keeps the full :class:`Release` and its reason, so
+  each completion (or refusal to complete) is auditable afterwards.
+
 Using with Django
 -----------------
 

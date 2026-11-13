@@ -4,6 +4,17 @@
 
 
 from .base import compare, match, validate, SimpleSpec, NpmSpec, Spec, SpecItem, Version
+from .migration import (
+    REASON_CHANNEL,
+    REASON_CUTOFF,
+    ExcludedRelease,
+    LegacyRecord,
+    MigrationResult,
+    Release,
+    ReleaseCatalogue,
+    migrate,
+    migrate_record,
+)
 
 
 __author__ = "Raphaël Barrois <raphael.barrois+semver@polytechnique.org>"

@@ -4,6 +4,16 @@ ChangeLog
 2.10.1 (unreleased)
 -------------------
 
+*New:*
+
+    * Add a legacy record migration API (``migrate``, ``migrate_record``,
+      ``ReleaseCatalogue``, ``LegacyRecord``): partial version records are
+      completed to exact SemVer versions only when the release directory
+      and channel constraints leave a single compatible artifact.
+      Missing components are never filled with zeroes; unresolved records
+      keep their feasible set, and every artifact excluded by channel or
+      the collection-date cutoff is retained with its reason for auditing.
+
 *Minor:*
 
     * `112 <https://github.com/rbarrois/python-semanticversion/issues/112>`_:

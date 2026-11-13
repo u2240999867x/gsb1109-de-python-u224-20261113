@@ -728,3 +728,130 @@ Each of those ``Spec`` classes provides a shared set of methods to work with ver
 
 .. _SemVer: http://semver.org/
 .. _`compatible release clauses`: https://www.python.org/dev/peps/pep-0440/#compatible-release
+
+
+Legacy record migration
+-----------------------
+
+.. versionadded:: 2.10.1
+
+Helpers for upgrading loosely-collected version records (partial
+``X`` / ``X.Y`` strings alongside exact ``X.Y.Z`` ones) into strict
+:class:`Version` objects, constrained by the release directory and the
+channel each artifact was actually published to.
+
+
+.. class:: Release(version, channel, released_on)
+
+    An artifact published to a channel on a given day.
+
+    :param version: the published :class:`Version` (or its string form).
+    :param str channel: the publication channel.
+    :param released_on: a :class:`datetime.date` or an ISO ``YYYY-MM-DD`` string.
+
+    .. attribute:: version
+    .. attribute:: channel
+    .. attribute:: released_on
+
+
+.. class:: ReleaseCatalogue(releases[, as_of])
+
+    The release directory: every known :class:`Release`, optionally with
+    a catalogue-wide cutoff date.
+
+    .. classmethod:: from_directories(directories[, as_of])
+
+        Build a catalogue from a ``{channel: {released_on: [version]}}``
+        mapping, as cut off at the collection date.
+
+    .. method:: classify(record)
+
+        Return a ``(candidates, excluded)`` tuple for a
+        :class:`LegacyRecord`: version-compatible releases available on
+        the record's channel by its collection date, and every other
+        version-compatible release wrapped in an :class:`ExcludedRelease`
+        with the reason it was ruled out.
+
+    .. attribute:: releases
+
+
+.. class:: LegacyRecord(identifier, version_text, channel, collected_on)
+
+    A record collected before strict SemVer enforcement.
+
+    :param identifier: stable identifier of the collected item.
+    :param str version_text: an exact ``X.Y.Z`` or partial ``X`` / ``X.Y`` string.
+    :param str channel: channel the item was collected from.
+    :param collected_on: the collection date.
+
+    .. attribute:: identifier
+    .. attribute:: version_text
+    .. attribute:: channel
+    .. attribute:: collected_on
+
+
+.. class:: MigrationResult
+
+    Outcome of migrating one record.
+
+    .. attribute:: record
+
+        The :class:`LegacyRecord` this result applies to.
+
+    .. attribute:: resolved
+
+        ``True`` when a single compatible artifact was found.
+
+    .. attribute:: version
+
+        The exact :class:`Version` when :attr:`resolved`, else :data:`None`.
+
+    .. attribute:: candidates
+
+        Tuple of still-eligible :class:`Release` objects.
+
+    .. attribute:: feasible_versions
+
+        Tuple of distinct versions from :attr:`candidates`, retaining the
+        viable set for unresolved records.
+
+    .. attribute:: excluded
+
+        Tuple of :class:`ExcludedRelease` objects; the full audit trail of
+        version-compatible artifacts ruled out by channel or date constraints.
+
+    .. attribute:: reason
+
+        Human-readable explanation when the record could not be completed.
+
+
+.. class:: ExcludedRelease(release, reason)
+
+    A compatible release that could not be selected.
+
+    .. attribute:: release
+
+        The :class:`Release` that was ruled out.
+
+    .. attribute:: reason
+
+        One of :data:`REASON_CHANNEL` (the artifact never reached the
+        record's channel) or :data:`REASON_CUTOFF` (it was published
+        after the collection date).
+
+
+.. data:: REASON_CHANNEL
+.. data:: REASON_CUTOFF
+
+
+.. function:: migrate_record(record, catalogue)
+
+    Migrate a single :class:`LegacyRecord` against a
+    :class:`ReleaseCatalogue` and return a :class:`MigrationResult`.
+
+
+.. function:: migrate(records, catalogue_or_releases[, as_of])
+
+    Migrate an iterable of records.  The second argument may be a
+    :class:`ReleaseCatalogue` or an iterable of :class:`Release`
+    objects / ``(version, channel, released_on)`` tuples.
