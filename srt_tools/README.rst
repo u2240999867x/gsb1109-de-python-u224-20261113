@@ -29,6 +29,12 @@ Utilities
 - *deduplicate* removes subtitles with duplicate content. If you have subtitles
   which mistakenly repeat the same content in different subs at roughly the
   same time, you can run this tool to remove them.
+- *export* snaps microsecond-accurate timing onto the whole-millisecond grid an
+  SRT file can express. A cutpoint shared by two subtitles is written to a
+  single position, the opening and closing frame can be locked, and a minimum
+  display duration can be enforced. If the constraints cannot all be satisfied,
+  it reports the first conflicting boundary and exits non-zero rather than
+  dropping a subtitle.
 - *fixed-timeshift* does fixed time correction. For example, if you have a
   movie that is consistently out of sync by two seconds, you can run this tool
   to shift the entire subtitle two seconds ahead or behind.

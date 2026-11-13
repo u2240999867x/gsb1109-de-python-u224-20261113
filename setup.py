@@ -21,6 +21,7 @@ setup(
         "srt_tools/srt",
         "srt_tools/srt-deduplicate",
         "srt_tools/srt-normalise",
+        "srt_tools/srt-export",
         "srt_tools/srt-fixed-timeshift",
         "srt_tools/srt-linear-timeshift",
         "srt_tools/srt-lines-matching",

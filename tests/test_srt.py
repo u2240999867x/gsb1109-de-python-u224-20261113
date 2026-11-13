@@ -771,3 +771,271 @@ def test_parse_file_with_missing_index(input_subs):  # cf. issue #51
 
     # ...and sort the same.
     assert srt.compose(subs_no_index) == srt.compose(subs_zero_index)
+
+
+def _is_on_millisecond_grid(delta):
+    """A timedelta lands exactly on a whole millisecond."""
+    return (delta // timedelta(microseconds=1)) % 1000 == 0
+
+
+def _milliseconds(delta):
+    return delta // timedelta(milliseconds=1)
+
+
+def test_quantize_rounds_isolated_boundary_to_nearest_millisecond():
+    sub = srt.Subtitle(
+        1, timedelta(microseconds=1400), timedelta(microseconds=2600), "x"
+    )
+    quantized = list(srt.quantize_to_milliseconds([sub]))[0]
+
+    assert _is_on_millisecond_grid(quantized.start)
+    assert _is_on_millisecond_grid(quantized.end)
+    assert _milliseconds(quantized.start) == 1
+    assert _milliseconds(quantized.end) == 3
+
+
+@given(st.integers(min_value=0, max_value=1_000_000))
+def test_quantize_never_more_than_half_millisecond_off_when_unconstrained(start_us):
+    # A comfortably long subtitle never needs to be pushed off its nearest grid
+    # value, so each boundary independently rounds to within 0.5 ms.
+    sub = srt.Subtitle(
+        1,
+        timedelta(microseconds=start_us),
+        timedelta(microseconds=start_us + 5000),
+        "x",
+    )
+    quantized = list(srt.quantize_to_milliseconds([sub]))[0]
+
+    for original, rounded in ((sub.start, quantized.start), (sub.end, quantized.end)):
+        error_us = abs((rounded - original) // timedelta(microseconds=1))
+        assert error_us <= 500
+        assert _is_on_millisecond_grid(rounded)
+
+
+def test_quantize_merges_shared_cutpoint_to_one_position():
+    shared = timedelta(microseconds=1500)
+    subs = [
+        srt.Subtitle(1, timedelta(milliseconds=1), shared, "a"),
+        srt.Subtitle(2, shared, timedelta(milliseconds=3), "b"),
+    ]
+    quantized = list(srt.quantize_to_milliseconds(subs))
+
+    # The shared end/start must be a single value, not two neighbouring ms.
+    assert quantized[0].end == quantized[1].start
+    assert _milliseconds(quantized[0].end) == 2
+
+
+def test_quantize_minimises_the_largest_error():
+    # Origins are 1.4 ms and 2.1 ms, but the subtitle must span at least 1 ms.
+    # start=1 / end=2 keeps both ordered with a maximum error of 0.4 ms.
+    sub = srt.Subtitle(
+        1, timedelta(microseconds=1400), timedelta(microseconds=2100), "x"
+    )
+    quantized = list(
+        srt.quantize_to_milliseconds([sub], min_duration=timedelta(milliseconds=1))
+    )[0]
+
+    assert _milliseconds(quantized.start) == 1
+    assert _milliseconds(quantized.end) == 2
+    max_error = max(
+        abs(_milliseconds(quantized.start) - 1.4),
+        abs(_milliseconds(quantized.end) - 2.1),
+    )
+    assert max_error == pytest.approx(0.4)
+
+
+def test_quantize_locks_head_and_tail_to_exact_milliseconds():
+    subs = [
+        srt.Subtitle(1, timedelta(milliseconds=10), timedelta(milliseconds=20), "a"),
+        srt.Subtitle(2, timedelta(milliseconds=20), timedelta(milliseconds=30), "b"),
+    ]
+    quantized = list(
+        srt.quantize_to_milliseconds(
+            subs, start_limit=timedelta(0), end_limit=timedelta(milliseconds=99)
+        )
+    )
+
+    assert _milliseconds(quantized[0].start) == 0
+    assert _milliseconds(quantized[-1].end) == 99
+
+
+def test_quantize_accepts_raw_millisecond_locks():
+    sub = srt.Subtitle(1, timedelta(milliseconds=10), timedelta(milliseconds=20), "a")
+    quantized = list(
+        srt.quantize_to_milliseconds([sub], start_limit=0, end_limit=50)
+    )[0]
+    assert _milliseconds(quantized.start) == 0
+    assert _milliseconds(quantized.end) == 50
+
+
+def test_quantize_enforces_minimum_duration():
+    sub = srt.Subtitle(1, timedelta(milliseconds=10), timedelta(milliseconds=12), "a")
+    quantized = list(
+        srt.quantize_to_milliseconds([sub], min_duration=timedelta(milliseconds=50))
+    )[0]
+
+    assert quantized.end - quantized.start >= timedelta(milliseconds=50)
+    assert _is_on_millisecond_grid(quantized.start)
+    assert _is_on_millisecond_grid(quantized.end)
+
+
+def test_quantize_always_keeps_a_one_millisecond_span():
+    # Two distinct-but-tiny boundaries must not collapse to a zero-length,
+    # skippable block.
+    sub = srt.Subtitle(1, timedelta(microseconds=100), timedelta(microseconds=200), "a")
+    quantized = list(srt.quantize_to_milliseconds([sub]))[0]
+    assert quantized.end > quantized.start
+    assert quantized.end - quantized.start >= timedelta(milliseconds=1)
+
+
+def test_quantize_reports_first_conflict_instead_of_dropping_subtitles():
+    # Five subtitles need at least five milliseconds, but only a three ms
+    # window is available between the locks.
+    subs = [
+        srt.Subtitle(
+            i, timedelta(milliseconds=i), timedelta(milliseconds=i + 1), str(i)
+        )
+        for i in range(5)
+    ]
+    original_count = len(subs)
+
+    with pytest.raises(srt.TimestampQuantizationError) as thrown:
+        list(
+            srt.quantize_to_milliseconds(
+                subs,
+                start_limit=timedelta(0),
+                end_limit=timedelta(milliseconds=3),
+                min_duration=timedelta(milliseconds=1),
+            )
+        )
+
+    assert thrown.value.conflict == "minimum_duration"
+    # The first boundary group that cannot fit is named explicitly.
+    assert thrown.value.boundaries == [(1, "start"), (1, "end")]
+    # Nothing is silently removed and the originals are left untouched.
+    assert len(subs) == original_count
+
+
+def test_quantize_rejects_reversed_locks():
+    sub = srt.Subtitle(1, timedelta(milliseconds=1), timedelta(milliseconds=2), "a")
+    with pytest.raises(srt.TimestampQuantizationError):
+        list(
+            srt.quantize_to_milliseconds(
+                [sub], start_limit=timedelta(milliseconds=9), end_limit=timedelta(0)
+            )
+        )
+
+
+def test_quantize_rejects_zero_length_subtitle_with_duration_requirement():
+    sub = srt.Subtitle(1, timedelta(milliseconds=5), timedelta(milliseconds=5), "a")
+    with pytest.raises(srt.TimestampQuantizationError) as thrown:
+        list(
+            srt.quantize_to_milliseconds([sub], min_duration=timedelta(milliseconds=10))
+        )
+    assert thrown.value.conflict == "zero_length"
+
+
+def test_quantize_in_place_mutates_originals():
+    sub = srt.Subtitle(
+        1, timedelta(microseconds=1400), timedelta(microseconds=2600), "a"
+    )
+    list(srt.quantize_to_milliseconds([sub], in_place=True))
+    assert _is_on_millisecond_grid(sub.start)
+    assert _is_on_millisecond_grid(sub.end)
+
+
+def test_quantize_without_in_place_leaves_originals_alone():
+    sub = srt.Subtitle(
+        1, timedelta(microseconds=1400), timedelta(microseconds=2600), "a"
+    )
+    original_start = sub.start
+    list(srt.quantize_to_milliseconds([sub]))
+    assert sub.start == original_start
+
+
+def test_quantize_empty_input():
+    assert list(srt.quantize_to_milliseconds([])) == []
+
+
+@given(st.lists(st.integers(min_value=0, max_value=50_000), min_size=1, max_size=6))
+def test_quantize_preserves_count_order_and_grid(gaps):
+    cursor = 0
+    subs = []
+    for index, gap in enumerate(gaps):
+        start = timedelta(microseconds=cursor)
+        cursor += max(gap, 1) + 2000
+        end = timedelta(microseconds=cursor)
+        subs.append(srt.Subtitle(index + 1, start, end, str(index)))
+
+    quantized = list(srt.quantize_to_milliseconds(subs))
+
+    assert len(quantized) == len(subs)
+    for sub in quantized:
+        assert _is_on_millisecond_grid(sub.start)
+        assert _is_on_millisecond_grid(sub.end)
+        assert sub.end > sub.start
+
+    for earlier, later in zip(quantized, quantized[1:]):
+        assert earlier.start <= later.start
+
+
+def test_export_processes_string_on_millisecond_grid():
+    subs = [
+        srt.Subtitle(1, timedelta(milliseconds=10), timedelta(milliseconds=90), "a"),
+        srt.Subtitle(2, timedelta(milliseconds=90), timedelta(milliseconds=200), "b"),
+    ]
+    rendered = srt.export(
+        subs,
+        start_limit=timedelta(0),
+        end_limit=timedelta(milliseconds=300),
+        min_duration=timedelta(milliseconds=50),
+    )
+
+    reparsed = list(srt.parse(rendered))
+    assert len(reparsed) == len(subs)
+    assert _milliseconds(reparsed[0].start) == 0
+    assert _milliseconds(reparsed[-1].end) == 300
+    for sub in reparsed:
+        assert _is_on_millisecond_grid(sub.start)
+        assert sub.end - sub.start >= timedelta(milliseconds=50)
+
+
+def test_export_raises_rather_than_emitting_invalid_file():
+    subs = [
+        srt.Subtitle(
+            i, timedelta(milliseconds=i), timedelta(milliseconds=i + 1), str(i)
+        )
+        for i in range(5)
+    ]
+    with pytest.raises(srt.TimestampQuantizationError):
+        srt.export(
+            subs,
+            start_limit=timedelta(0),
+            end_limit=timedelta(milliseconds=3),
+            min_duration=timedelta(milliseconds=1),
+        )
+
+
+@pytest.mark.parametrize(
+    "microseconds, expected",
+    [
+        (0, 0),
+        (1499, 1),
+        (1500, 2),  # exact half rounds away from zero
+        (2500, 3),
+        (-1500, -2),
+        (-1499, -1),
+    ],
+)
+def test_nearest_millisecond_rounding_halves_away_from_zero(
+    microseconds, expected
+):
+    assert (
+        srt._nearest_milliseconds(timedelta(microseconds=microseconds)) == expected
+    )
+
+
+def test_quantize_accepts_minimum_duration_as_raw_milliseconds():
+    sub = srt.Subtitle(1, timedelta(milliseconds=10), timedelta(milliseconds=11), "a")
+    quantized = list(srt.quantize_to_milliseconds([sub], min_duration=25))[0]
+    assert quantized.end - quantized.start >= timedelta(milliseconds=25)

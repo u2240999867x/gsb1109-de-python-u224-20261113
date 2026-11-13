@@ -5,6 +5,8 @@ import subprocess
 import sys
 import tempfile
 
+import pytest
+
 try:
     from shlex import quote
 except ImportError:  # <3.3 fallback
@@ -107,6 +109,19 @@ def test_tools_support():
         ),
         (["srt-lines-matching", "-f", "lambda x: True"], False),
         (["srt-process", "-f", "lambda x: x"], False),
+        (["srt-export"], False),
+        (
+            [
+                "srt-export",
+                "--start-lock",
+                "00:00:00,000",
+                "--end-lock",
+                "00:00:40,000",
+                "--min-duration",
+                "0.001",
+            ],
+            False,
+        ),
         (["srt-mux"], False, True),
         (["srt-mux", "-t"], False, True),
         # Need to sort out time/thread issues
@@ -115,3 +130,26 @@ def test_tools_support():
 
     for args in matrix:
         assert_supports_all_io_methods(*args)
+
+
+def test_export_refuses_infeasible_constraints():
+    in_file = os.path.join(sample_dir, "ascii.srt")
+    cmd = [
+        sys.executable,
+        "srt_tools/srt-export",
+        "-i",
+        in_file,
+        "--start-lock",
+        "00:00:00,000",
+        # Far too short a window for the subtitles to keep any duration.
+        "--end-lock",
+        "00:00:00,002",
+        "--min-duration",
+        "1",
+    ]
+    env = {"PYTHONPATH": ".", "SystemRoot": r"C:\Windows"}
+
+    with pytest.raises(subprocess.CalledProcessError) as thrown:
+        subprocess.check_output(cmd, env=env, stderr=subprocess.STDOUT)
+
+    assert thrown.value.returncode == 1

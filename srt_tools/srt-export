@@ -1,0 +1,88 @@
+#!/usr/bin/env python
+
+"""Quantise subtitles to whole milliseconds and export a valid SRT file."""
+
+import datetime
+import os
+import srt
+import srt_tools.utils
+import logging
+
+log = logging.getLogger(__name__)
+
+
+def _parse_timestamp(timestamp):
+    """Accept either an SRT timestamp or a number of seconds."""
+    try:
+        return srt.srt_timestamp_to_timedelta(timestamp)
+    except srt.TimestampParseError:
+        return datetime.timedelta(seconds=float(timestamp))
+
+
+def parse_args():
+    examples = {
+        "Export on the millisecond grid without extra constraints":
+            "srt export -i subs.srt -o out.srt",
+        "Lock the opening and closing frames":
+            "srt export -i subs.srt --start-lock 00:00:00,000 "
+            "--end-lock 00:01:30,000",
+        "Keep every subtitle on screen for at least 700 milliseconds":
+            "srt export -i subs.srt --min-duration 0.7",
+    }
+
+    parser = srt_tools.utils.basic_parser(description=__doc__, examples=examples)
+    parser.add_argument(
+        "--start-lock",
+        type=_parse_timestamp,
+        default=None,
+        help="fix the first subtitle's start to this SRT timestamp or number "
+        "of seconds (default: leave it free)",
+    )
+    parser.add_argument(
+        "--end-lock",
+        type=_parse_timestamp,
+        default=None,
+        help="fix the last subtitle's end to this SRT timestamp or number of "
+        "seconds (default: leave it free)",
+    )
+    parser.add_argument(
+        "--min-duration",
+        type=lambda seconds: datetime.timedelta(seconds=float(seconds)),
+        default=None,
+        help="minimum on-screen time in seconds for every subtitle "
+        "(default: only enforce the 1 ms SRT minimum)",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    logging.basicConfig(level=args.log_level)
+    srt_tools.utils.set_basic_args(args)
+
+    try:
+        output = srt.export(
+            args.input,
+            start_limit=args.start_lock,
+            end_limit=args.end_lock,
+            min_duration=args.min_duration,
+            strict=args.strict,
+            eol=os.linesep,
+            in_place=True,
+        )
+    except srt.TimestampQuantizationError as thrown_exc:
+        log.critical(
+            "Refusing to export: %s (conflict at %s)",
+            thrown_exc.message,
+            thrown_exc.boundaries,
+        )
+        raise SystemExit(1)
+
+    try:
+        args.output.write(output)
+    except (UnicodeEncodeError, TypeError):  # Python 2 fallback
+        args.output.write(output.encode(args.encoding))
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()
