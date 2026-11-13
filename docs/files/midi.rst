@@ -245,3 +245,68 @@ If you have a lot of rounding errors you should increase the time resolution
 with more ticks per quarter note, by setting MidiFile.ticks_per_beat to a
 large number. Typical values range from 96 to 480 but some use even more ticks
 per quarter note.
+
+
+Converting Between SMPTE Time Code and Frames
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+MIDI files can carry an ``smpte_offset`` meta message that marks the
+time code at which a track starts.  Use :py:func:`timecode_to_frames`
+and :py:func:`frames_to_timecode` to convert between such a label and a
+continuous frame count::
+
+    >>> from mido import frames_to_timecode, timecode_to_frames
+    >>> timecode_to_frames('00:10:00;00', '29.97')
+    17982
+    >>> frames_to_timecode(1800, '29.97')
+    (0, 1, 0, 2)
+
+The frame rate may be a number or one of the names ``'23.976'``,
+``'24'``, ``'25'``, ``'29.97'``, ``'30'`` and ``'59.94'``.  NTSC rates
+are handled as their exact rational values (30000/1001 for 29.97),
+never as a rounded float, so long durations do not drift.
+
+Drop-frame numbering is used automatically for 29.97 and 59.94 fps and
+can be disabled with ``drop_frame=False``.  Labels that drop-frame
+numbering skips (for example ``00:01:00;00``) raise
+:py:class:`DroppedFrameError`, whose ``parts`` attribute holds the exact
+position that does not exist::
+
+    >>> timecode_to_frames('00:01:00;00', '29.97')
+    Traceback (most recent call last):
+    ...
+    mido.midifiles.timecode.DroppedFrameError: time code 00:01:00:00 does not exist: frame numbers 00..01 are dropped at the start of minute 1 (29.97 fps drop-frame)
+
+Frame counts wrap at midnight by default.  Pass ``wrap=False`` to let
+the hours grow past 23 instead.
+
+A studio typically works with several reels of material.  A
+:py:class:`ReelTable` maps the source labels of each reel onto one
+continuous frame count and back::
+
+    >>> from mido import Reel, ReelTable
+    >>> table = ReelTable.from_starts(
+    ...     {'A': '00:00:00;00', 'B': '00:01:00;02'}, frame_rate='29.97')
+    >>> table.roundtrip('A', '00:00:10;05')
+    Timecode(0, 0, 10, 5, sub_frames=0, frame_rate=Fraction(30000, 1001), drop_frame=True, reel='A')
+    >>> table.roundtrip('A', '00:00:10;05', sub_frames=25)
+    Timecode(0, 0, 10, 5, sub_frames=25, frame_rate=Fraction(30000, 1001), drop_frame=True, reel='A')
+
+A reel may also be built from several segments when its numbering is
+broken; labels inside the jump are reported as numbering gaps::
+
+    >>> reel = Reel('R', segments=[('00:00:00;00', 100),
+    ...                            ('00:00:10;00', 100)])
+    >>> table = ReelTable([reel], frame_rate='29.97')
+    >>> table.to_frames('R', '00:00:05;00')
+    Traceback (most recent call last):
+    ...
+    mido.midifiles.timecode.TimecodeGapError: time code 00:00:05:00 does not belong to reel 'R': it falls in a gap in the numbering (29.97 fps)
+
+:py:class:`Timecode` carries a label together with its frame rate,
+sub-frames and reel.  Equality includes all of them, which makes it
+straightforward to verify a round trip::
+
+    >>> table.roundtrip('R', '00:00:00;00') == \
+    ...     table.roundtrip('R', '00:00:00;00')
+    True

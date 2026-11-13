@@ -189,6 +189,54 @@ Standard MIDI Files
 
 .. autofunction:: merge_tracks
 
+SMPTE Time Code
+^^^^^^^^^^^^^^^
+
+.. module:: mido
+
+.. autofunction:: timecode_to_frames
+
+.. autofunction:: frames_to_timecode
+
+.. autofunction:: timecode_to_seconds
+
+.. autofunction:: seconds_to_timecode
+
+.. autofunction:: parse_timecode
+
+.. autofunction:: format_timecode
+
+.. autofunction:: frame_rate_fraction
+
+.. autofunction:: nominal_frame_rate
+
+.. autofunction:: is_drop_frame_rate
+
+.. autofunction:: frames_per_day
+
+.. autofunction:: midnight_wrap
+
+.. autofunction:: smpte_offset_to_frames
+
+.. autofunction:: frames_to_smpte_offset
+
+.. autoclass:: Timecode
+   :members:
+
+.. autoclass:: Reel
+   :members:
+
+.. autoclass:: ReelTable
+   :members:
+
+.. autoclass:: TimecodeTable
+
+.. autoclass:: InvalidTimecodeError
+
+.. autoclass:: DroppedFrameError
+
+.. autoclass:: TimecodeGapError
+
 .. module:: mido.midifiles
 
 .. todo: Expose more of the internal API? (meta, tracks, units…)

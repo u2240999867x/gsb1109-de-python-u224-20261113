@@ -44,3 +44,32 @@ def tempo2bpm(tempo, time_signature=(4, 4)):
     returned tempo depends on the time signature denominator.
     """
     return 60 * 1e6 / tempo * time_signature[1] / 4.
+
+
+# SMPTE time code belongs with the other time conversions.  Importing
+# them here keeps ``mido.midifiles.units`` the one place to look for
+# time unit conversions while the implementation lives in
+# ``mido.midifiles.timecode``.
+from .timecode import (  # noqa: E402,F401
+    DroppedFrameError,
+    InvalidTimecodeError,
+    Reel,
+    ReelTable,
+    Timecode,
+    TimecodeError,
+    TimecodeGapError,
+    TimecodeTable,
+    format_timecode,
+    frame_rate_fraction,
+    frames_per_day,
+    frames_to_smpte_offset,
+    frames_to_timecode,
+    is_drop_frame_rate,
+    midnight_wrap,
+    nominal_frame_rate,
+    parse_timecode,
+    seconds_to_timecode,
+    smpte_offset_to_frames,
+    timecode_to_frames,
+    timecode_to_seconds,
+)

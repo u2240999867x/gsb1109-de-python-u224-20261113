@@ -34,6 +34,13 @@ MIDI files:
     tempo2bpm()  -- convert MIDI file tempo to beats per minute
     merge_tracks(tracks)  -- merge tracks into one track
 
+SMPTE time code:
+
+    timecode_to_frames()  -- convert a SMPTE label to a frame count
+    frames_to_timecode()  -- convert a frame count to a SMPTE label
+    ReelTable(reels)  -- address several reels by one frame count
+    Timecode  -- a label with frame rate, sub-frames and reel
+
 SYX files:
 
     read_syx_file(filename)  -- read a SYX file
@@ -108,16 +115,37 @@ from .messages import (
     parse_string_stream,
 )
 from .midifiles import (
+    DroppedFrameError,
+    InvalidTimecodeError,
     KeySignatureError,
     MetaMessage,
     MidiFile,
     MidiTrack,
+    Reel,
+    ReelTable,
+    Timecode,
+    TimecodeError,
+    TimecodeGapError,
+    TimecodeTable,
     UnknownMetaMessage,
     bpm2tempo,
+    format_timecode,
+    frame_rate_fraction,
+    frames_per_day,
+    frames_to_smpte_offset,
+    frames_to_timecode,
+    is_drop_frame_rate,
     merge_tracks,
+    midnight_wrap,
+    nominal_frame_rate,
+    parse_timecode,
     second2tick,
+    seconds_to_timecode,
+    smpte_offset_to_frames,
     tempo2bpm,
     tick2second,
+    timecode_to_frames,
+    timecode_to_seconds,
 )
 from .parser import Parser, parse, parse_all
 from .syx import read_syx_file, write_syx_file
@@ -127,6 +155,8 @@ if TYPE_CHECKING:
     from .backends.backend import get_input_names, get_ioport_names, get_output_names
 
 __all__ = [
+    "DroppedFrameError",
+    "InvalidTimecodeError",
     "KeySignatureError",
     "MAX_PITCHWHEEL",
     "MAX_SONGPOS",
@@ -137,20 +167,39 @@ __all__ = [
     "MidiFile",
     "MidiTrack",
     "Parser",
+    "Reel",
+    "ReelTable",
+    "Timecode",
+    "TimecodeError",
+    "TimecodeGapError",
+    "TimecodeTable",
     "UnknownMetaMessage",
     "bpm2tempo",
     "format_as_string",
+    "format_timecode",
+    "frame_rate_fraction",
+    "frames_per_day",
+    "frames_to_smpte_offset",
+    "frames_to_timecode",
+    "is_drop_frame_rate",
     "merge_tracks",
+    "midnight_wrap",
+    "nominal_frame_rate",
     "parse",
     "parse_all",
     "parse_string",
     "parse_string_stream",
+    "parse_timecode",
     "ports",
     "read_syx_file",
     "second2tick",
+    "seconds_to_timecode",
     "sockets",
+    "smpte_offset_to_frames",
     "tempo2bpm",
     "tick2second",
+    "timecode_to_frames",
+    "timecode_to_seconds",
     "version_info",
     "write_syx_file",
 ]
