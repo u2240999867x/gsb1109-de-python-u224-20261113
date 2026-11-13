@@ -1,0 +1,10 @@
+{
+    "name": "identity_map",
+    "columns": [
+        "biz_id",
+        "id_no",
+        "cust_id",
+        "note"
+    ],
+    "schema": "CREATE TABLE [identity_map] (\n   [biz_id] TEXT PRIMARY KEY,\n   [id_no] TEXT,\n   [cust_id] INTEGER,\n   [note] TEXT\n)"
+}

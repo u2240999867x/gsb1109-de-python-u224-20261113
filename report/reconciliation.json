@@ -1,0 +1,572 @@
+{
+  "v1_dir": "/Users/guo/Documents/GSB/1109/batches/de-python-u224-100-20261113/control/questions/GSB1109-20261113-U224-DE-PY-038/workspace/data/export_v1",
+  "v2_dir": "/Users/guo/Documents/GSB/1109/batches/de-python-u224-100-20261113/control/questions/GSB1109-20261113-U224-DE-PY-038/workspace/data/export_v2",
+  "buckets": {
+    "可确认延续": [
+      {
+        "cust_id": 1,
+        "classification": "可确认延续",
+        "reasons": [
+          "部门由 A 调整为 B(部门变动本身不改变自然人身份)",
+          "客户主表证件号一致(ID01), 自然人身份延续可确认",
+          "活跃账户/业务身份映射仍锚定同一证件号: ['ID01']"
+        ],
+        "old_identity": {
+          "cust_id": 1,
+          "name": "陈安",
+          "id_no": "ID01",
+          "phone": "138-0001",
+          "dept": "A",
+          "status": "active"
+        },
+        "new_identity": {
+          "cust_id": 1,
+          "name": "陈安",
+          "id_no": "ID01",
+          "phone": "138-0001",
+          "dept": "B",
+          "status": "active"
+        },
+        "viable_explanations": [],
+        "order_numbers": [
+          "O1001"
+        ]
+      },
+      {
+        "cust_id": 2,
+        "classification": "可确认延续",
+        "reasons": [
+          "phone 发生变化: '138-0002' -> '138-9002'",
+          "客户主表证件号一致(ID02), 自然人身份延续可确认",
+          "活跃账户/业务身份映射仍锚定同一证件号: ['ID02']"
+        ],
+        "old_identity": {
+          "cust_id": 2,
+          "name": "白璐",
+          "id_no": "ID02",
+          "phone": "138-0002",
+          "dept": "A",
+          "status": "active"
+        },
+        "new_identity": {
+          "cust_id": 2,
+          "name": "白璐",
+          "id_no": "ID02",
+          "phone": "138-9002",
+          "dept": "A",
+          "status": "active"
+        },
+        "viable_explanations": [],
+        "order_numbers": [
+          "O2001"
+        ]
+      },
+      {
+        "cust_id": 40,
+        "classification": "可确认延续",
+        "reasons": [
+          "客户主表证件号一致(ID40), 自然人身份延续可确认",
+          "活跃账户/业务身份映射仍锚定同一证件号: ['ID40']"
+        ],
+        "old_identity": {
+          "cust_id": 40,
+          "name": "孟宁",
+          "id_no": "ID40",
+          "phone": "135-0040",
+          "dept": "B",
+          "status": "active"
+        },
+        "new_identity": {
+          "cust_id": 40,
+          "name": "孟宁",
+          "id_no": "ID40",
+          "phone": "135-0040",
+          "dept": "B",
+          "status": "active"
+        },
+        "viable_explanations": [],
+        "order_numbers": [
+          "O6001"
+        ]
+      },
+      {
+        "cust_id": 41,
+        "classification": "可确认延续",
+        "reasons": [
+          "客户主表证件号一致(ID41), 自然人身份延续可确认",
+          "活跃账户/业务身份映射仍锚定同一证件号: ['ID41']"
+        ],
+        "old_identity": {
+          "cust_id": 41,
+          "name": "祁镇",
+          "id_no": "ID41",
+          "phone": "135-0041",
+          "dept": "B",
+          "status": "active"
+        },
+        "new_identity": {
+          "cust_id": 41,
+          "name": "祁镇",
+          "id_no": "ID41",
+          "phone": "135-0041",
+          "dept": "B",
+          "status": "active"
+        },
+        "viable_explanations": [],
+        "order_numbers": [
+          "O6001"
+        ]
+      }
+    ],
+    "可确认更替": [
+      {
+        "cust_id": 30,
+        "classification": "可确认更替",
+        "reasons": [
+          "phone 发生变化: '136-0030' -> '136-9030'",
+          "name 发生变化: '麦琪' -> '卓然'",
+          "客户主表证件号由 ID30A 变为 ID30B, 活跃账户与业务身份映射均不再锚定旧证件号",
+          "旧证件号仅残留在已关闭账户 ['A3001'](残留不作延续依据)",
+          "已按新证件号 ID30B 重新开户: ['A3099']",
+          "业务身份映射中旧证件号已与编号 30 解绑: ['B30-OLD']",
+          "新证件号已建立业务身份映射: ['B30-NEW']"
+        ],
+        "old_identity": {
+          "cust_id": 30,
+          "name": "麦琪",
+          "id_no": "ID30A",
+          "phone": "136-0030",
+          "dept": "C",
+          "status": "active"
+        },
+        "new_identity": {
+          "cust_id": 30,
+          "name": "卓然",
+          "id_no": "ID30B",
+          "phone": "136-9030",
+          "dept": "C",
+          "status": "active"
+        },
+        "viable_explanations": [],
+        "order_numbers": [
+          "O7002",
+          "O7003"
+        ]
+      },
+      {
+        "cust_id": 50,
+        "classification": "可确认更替",
+        "reasons": [
+          "v2 中该编号消失, 旧客户身份终止(删除/离任可确认, 编号未见重用)"
+        ],
+        "old_identity": {
+          "cust_id": 50,
+          "name": "离任老客户",
+          "id_no": "ID50",
+          "phone": "135-0050",
+          "dept": "C",
+          "status": "active"
+        },
+        "new_identity": null,
+        "viable_explanations": [],
+        "order_numbers": [
+          "O8001"
+        ]
+      },
+      {
+        "cust_id": 52,
+        "classification": "可确认更替",
+        "reasons": [
+          "v1 无此编号, v2 新建, 属新增编号而非旧号延续"
+        ],
+        "old_identity": null,
+        "new_identity": {
+          "cust_id": 52,
+          "name": "全新客户",
+          "id_no": "ID52",
+          "phone": "135-0052",
+          "dept": "A",
+          "status": "active"
+        },
+        "viable_explanations": [],
+        "order_numbers": []
+      }
+    ],
+    "待确认": [
+      {
+        "cust_id": 17,
+        "classification": "待确认",
+        "reasons": [
+          "部门由 A 调整为 B(部门变动本身不改变自然人身份)",
+          "phone 发生变化: '137-0001' -> '137-9002'",
+          "v2 客户主表证件号为空, 无法在主表层面锁定自然人",
+          "旧证件号 ID17 仅见于已关闭账户 ['A1701']; 历史业务身份映射 ['B17-OLD'], 均为关闭/历史态, 不能单独证明当前仍为同一自然人",
+          "边界时间新开证件号为空的账户 ['A1799'], 不能证明与旧客户为同一人",
+          "新业务身份映射 ['B17-NEW'] 证件号为空, 身份尚未登记"
+        ],
+        "old_identity": {
+          "cust_id": 17,
+          "name": "韩冰",
+          "id_no": "ID17",
+          "phone": "137-0001",
+          "dept": "A",
+          "status": "active"
+        },
+        "new_identity": {
+          "cust_id": 17,
+          "name": "韩冰",
+          "id_no": null,
+          "phone": "137-9002",
+          "dept": "B",
+          "status": "active"
+        },
+        "viable_explanations": [
+          "解释一(部门调动/同一人延续): 编号 17 仍是同一自然人, 仅由原部门调整部门, 旧账户关停后重开, 历史订单应归本人; 需补齐 v2 证件号, 使其与旧证件号一致方可确认",
+          "解释二(删号重用/新旧更替): 旧客户删除后编号 17 被分配给新自然人, 旧证件号只留在已关闭账户与历史映射, 新账户/新映射尚未登记证件; 需提供新客户开户证件, 证明与旧客户为不同人"
+        ],
+        "order_numbers": [
+          "O5001",
+          "O5002"
+        ]
+      }
+    ]
+  },
+  "customer_verdicts": [
+    {
+      "cust_id": 1,
+      "classification": "可确认延续",
+      "reasons": [
+        "部门由 A 调整为 B(部门变动本身不改变自然人身份)",
+        "客户主表证件号一致(ID01), 自然人身份延续可确认",
+        "活跃账户/业务身份映射仍锚定同一证件号: ['ID01']"
+      ],
+      "old_identity": {
+        "cust_id": 1,
+        "name": "陈安",
+        "id_no": "ID01",
+        "phone": "138-0001",
+        "dept": "A",
+        "status": "active"
+      },
+      "new_identity": {
+        "cust_id": 1,
+        "name": "陈安",
+        "id_no": "ID01",
+        "phone": "138-0001",
+        "dept": "B",
+        "status": "active"
+      },
+      "viable_explanations": [],
+      "order_numbers": [
+        "O1001"
+      ]
+    },
+    {
+      "cust_id": 2,
+      "classification": "可确认延续",
+      "reasons": [
+        "phone 发生变化: '138-0002' -> '138-9002'",
+        "客户主表证件号一致(ID02), 自然人身份延续可确认",
+        "活跃账户/业务身份映射仍锚定同一证件号: ['ID02']"
+      ],
+      "old_identity": {
+        "cust_id": 2,
+        "name": "白璐",
+        "id_no": "ID02",
+        "phone": "138-0002",
+        "dept": "A",
+        "status": "active"
+      },
+      "new_identity": {
+        "cust_id": 2,
+        "name": "白璐",
+        "id_no": "ID02",
+        "phone": "138-9002",
+        "dept": "A",
+        "status": "active"
+      },
+      "viable_explanations": [],
+      "order_numbers": [
+        "O2001"
+      ]
+    },
+    {
+      "cust_id": 17,
+      "classification": "待确认",
+      "reasons": [
+        "部门由 A 调整为 B(部门变动本身不改变自然人身份)",
+        "phone 发生变化: '137-0001' -> '137-9002'",
+        "v2 客户主表证件号为空, 无法在主表层面锁定自然人",
+        "旧证件号 ID17 仅见于已关闭账户 ['A1701']; 历史业务身份映射 ['B17-OLD'], 均为关闭/历史态, 不能单独证明当前仍为同一自然人",
+        "边界时间新开证件号为空的账户 ['A1799'], 不能证明与旧客户为同一人",
+        "新业务身份映射 ['B17-NEW'] 证件号为空, 身份尚未登记"
+      ],
+      "old_identity": {
+        "cust_id": 17,
+        "name": "韩冰",
+        "id_no": "ID17",
+        "phone": "137-0001",
+        "dept": "A",
+        "status": "active"
+      },
+      "new_identity": {
+        "cust_id": 17,
+        "name": "韩冰",
+        "id_no": null,
+        "phone": "137-9002",
+        "dept": "B",
+        "status": "active"
+      },
+      "viable_explanations": [
+        "解释一(部门调动/同一人延续): 编号 17 仍是同一自然人, 仅由原部门调整部门, 旧账户关停后重开, 历史订单应归本人; 需补齐 v2 证件号, 使其与旧证件号一致方可确认",
+        "解释二(删号重用/新旧更替): 旧客户删除后编号 17 被分配给新自然人, 旧证件号只留在已关闭账户与历史映射, 新账户/新映射尚未登记证件; 需提供新客户开户证件, 证明与旧客户为不同人"
+      ],
+      "order_numbers": [
+        "O5001",
+        "O5002"
+      ]
+    },
+    {
+      "cust_id": 30,
+      "classification": "可确认更替",
+      "reasons": [
+        "phone 发生变化: '136-0030' -> '136-9030'",
+        "name 发生变化: '麦琪' -> '卓然'",
+        "客户主表证件号由 ID30A 变为 ID30B, 活跃账户与业务身份映射均不再锚定旧证件号",
+        "旧证件号仅残留在已关闭账户 ['A3001'](残留不作延续依据)",
+        "已按新证件号 ID30B 重新开户: ['A3099']",
+        "业务身份映射中旧证件号已与编号 30 解绑: ['B30-OLD']",
+        "新证件号已建立业务身份映射: ['B30-NEW']"
+      ],
+      "old_identity": {
+        "cust_id": 30,
+        "name": "麦琪",
+        "id_no": "ID30A",
+        "phone": "136-0030",
+        "dept": "C",
+        "status": "active"
+      },
+      "new_identity": {
+        "cust_id": 30,
+        "name": "卓然",
+        "id_no": "ID30B",
+        "phone": "136-9030",
+        "dept": "C",
+        "status": "active"
+      },
+      "viable_explanations": [],
+      "order_numbers": [
+        "O7002",
+        "O7003"
+      ]
+    },
+    {
+      "cust_id": 40,
+      "classification": "可确认延续",
+      "reasons": [
+        "客户主表证件号一致(ID40), 自然人身份延续可确认",
+        "活跃账户/业务身份映射仍锚定同一证件号: ['ID40']"
+      ],
+      "old_identity": {
+        "cust_id": 40,
+        "name": "孟宁",
+        "id_no": "ID40",
+        "phone": "135-0040",
+        "dept": "B",
+        "status": "active"
+      },
+      "new_identity": {
+        "cust_id": 40,
+        "name": "孟宁",
+        "id_no": "ID40",
+        "phone": "135-0040",
+        "dept": "B",
+        "status": "active"
+      },
+      "viable_explanations": [],
+      "order_numbers": [
+        "O6001"
+      ]
+    },
+    {
+      "cust_id": 41,
+      "classification": "可确认延续",
+      "reasons": [
+        "客户主表证件号一致(ID41), 自然人身份延续可确认",
+        "活跃账户/业务身份映射仍锚定同一证件号: ['ID41']"
+      ],
+      "old_identity": {
+        "cust_id": 41,
+        "name": "祁镇",
+        "id_no": "ID41",
+        "phone": "135-0041",
+        "dept": "B",
+        "status": "active"
+      },
+      "new_identity": {
+        "cust_id": 41,
+        "name": "祁镇",
+        "id_no": "ID41",
+        "phone": "135-0041",
+        "dept": "B",
+        "status": "active"
+      },
+      "viable_explanations": [],
+      "order_numbers": [
+        "O6001"
+      ]
+    },
+    {
+      "cust_id": 50,
+      "classification": "可确认更替",
+      "reasons": [
+        "v2 中该编号消失, 旧客户身份终止(删除/离任可确认, 编号未见重用)"
+      ],
+      "old_identity": {
+        "cust_id": 50,
+        "name": "离任老客户",
+        "id_no": "ID50",
+        "phone": "135-0050",
+        "dept": "C",
+        "status": "active"
+      },
+      "new_identity": null,
+      "viable_explanations": [],
+      "order_numbers": [
+        "O8001"
+      ]
+    },
+    {
+      "cust_id": 52,
+      "classification": "可确认更替",
+      "reasons": [
+        "v1 无此编号, v2 新建, 属新增编号而非旧号延续"
+      ],
+      "old_identity": null,
+      "new_identity": {
+        "cust_id": 52,
+        "name": "全新客户",
+        "id_no": "ID52",
+        "phone": "135-0052",
+        "dept": "A",
+        "status": "active"
+      },
+      "viable_explanations": [],
+      "order_numbers": []
+    }
+  ],
+  "order_verdicts": [
+    {
+      "order_no": "O1001",
+      "status": "归属一致",
+      "detail": "账户锚定证件号 ID01, 身份链单一",
+      "v1_cust_id": 1,
+      "v2_cust_id": 1,
+      "v1_account": "A1001",
+      "v2_account": "A1001",
+      "evidenced_id_numbers": [
+        "ID01"
+      ],
+      "account_anchor_id": "ID01",
+      "recommendation": "可按账户锚定证件号 ID01 出具归属"
+    },
+    {
+      "order_no": "O2001",
+      "status": "归属一致",
+      "detail": "账户锚定证件号 ID02, 身份链单一",
+      "v1_cust_id": 2,
+      "v2_cust_id": 2,
+      "v1_account": "A2001",
+      "v2_account": "A2001",
+      "evidenced_id_numbers": [
+        "ID02"
+      ],
+      "account_anchor_id": "ID02",
+      "recommendation": "可按账户锚定证件号 ID02 出具归属"
+    },
+    {
+      "order_no": "O5001",
+      "status": "归属一致",
+      "detail": "账户锚定证件号 ID17, 身份链单一",
+      "v1_cust_id": 17,
+      "v2_cust_id": 17,
+      "v1_account": "A1701",
+      "v2_account": "A1701",
+      "evidenced_id_numbers": [
+        "ID17"
+      ],
+      "account_anchor_id": "ID17",
+      "recommendation": "可按账户锚定证件号 ID17 出具归属"
+    },
+    {
+      "order_no": "O5002",
+      "status": "归属一致",
+      "detail": "两版客户编号与账户归属一致, 但缺有效证件锚点",
+      "v1_cust_id": null,
+      "v2_cust_id": 17,
+      "v1_account": null,
+      "v2_account": "A1799",
+      "evidenced_id_numbers": [],
+      "account_anchor_id": null,
+      "recommendation": "归属编号一致, 但证件缺失, 出具身份证明前需补证件"
+    },
+    {
+      "order_no": "O6001",
+      "status": "订单客户编号变更",
+      "detail": "同一订单客户编号由 40 改为 41, 两侧归属不同; 该订单经账户/客户链路指向多个证件号 ['ID40', 'ID41'], 不能同时用来给两个客户证明身份",
+      "v1_cust_id": 40,
+      "v2_cust_id": 41,
+      "v1_account": "A4001",
+      "v2_account": "A4101",
+      "evidenced_id_numbers": [
+        "ID40",
+        "ID41"
+      ],
+      "account_anchor_id": null,
+      "recommendation": "两版挂账账户本身已换人, 数据无法判定归属, 冻结该订单的对外证明, 凭原始开户/下单凭证人工裁定后再归位"
+    },
+    {
+      "order_no": "O7002",
+      "status": "同一订单指向两个自然人身份",
+      "detail": "该订单经账户/客户链路指向多个证件号 ['ID30A', 'ID30B'], 不能同时用来给两个客户证明身份",
+      "v1_cust_id": 30,
+      "v2_cust_id": 30,
+      "v1_account": "A3001",
+      "v2_account": "A3001",
+      "evidenced_id_numbers": [
+        "ID30A",
+        "ID30B"
+      ],
+      "account_anchor_id": "ID30A",
+      "recommendation": "订单实际挂在锚定 ID30A 的账户上, 应归 ID30A 对应客户; 不得据此向 ['ID30B'] 对应的新身份作证, 需先剥离错误的客户链路"
+    },
+    {
+      "order_no": "O7003",
+      "status": "归属一致",
+      "detail": "账户锚定证件号 ID30B, 身份链单一",
+      "v1_cust_id": null,
+      "v2_cust_id": 30,
+      "v1_account": null,
+      "v2_account": "A3099",
+      "evidenced_id_numbers": [
+        "ID30B"
+      ],
+      "account_anchor_id": "ID30B",
+      "recommendation": "可按账户锚定证件号 ID30B 出具归属"
+    },
+    {
+      "order_no": "O8001",
+      "status": "归属一致",
+      "detail": "账户锚定证件号 ID50, 身份链单一",
+      "v1_cust_id": 50,
+      "v2_cust_id": null,
+      "v1_account": "A5001",
+      "v2_account": null,
+      "evidenced_id_numbers": [
+        "ID50"
+      ],
+      "account_anchor_id": "ID50",
+      "recommendation": "可按账户锚定证件号 ID50 出具归属"
+    }
+  ]
+}

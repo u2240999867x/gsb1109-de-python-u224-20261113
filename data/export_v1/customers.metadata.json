@@ -1,0 +1,12 @@
+{
+    "name": "customers",
+    "columns": [
+        "cust_id",
+        "name",
+        "id_no",
+        "phone",
+        "dept",
+        "status"
+    ],
+    "schema": "CREATE TABLE [customers] (\n   [cust_id] INTEGER PRIMARY KEY,\n   [name] TEXT,\n   [id_no] TEXT,\n   [phone] TEXT,\n   [dept] TEXT,\n   [status] TEXT\n)"
+}

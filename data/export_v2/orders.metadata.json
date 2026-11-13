@@ -1,0 +1,11 @@
+{
+    "name": "orders",
+    "columns": [
+        "order_no",
+        "cust_id",
+        "account_no",
+        "amount",
+        "created_at"
+    ],
+    "schema": "CREATE TABLE [orders] (\n   [order_no] TEXT PRIMARY KEY,\n   [cust_id] INTEGER,\n   [account_no] TEXT,\n   [amount] FLOAT,\n   [created_at] TEXT\n)"
+}
