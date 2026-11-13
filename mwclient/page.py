@@ -126,6 +126,22 @@ class Page:
         else:
             return target_page
 
+    def resolve_link(self, link: str, include_text: bool = True) -> Any:
+        """Resolve a legacy link such as ``Old name#Material``.
+
+        The original link is preserved in the returned object, and only the
+        referenced section is fetched when the fragment identifies one.
+
+        Args:
+            link: The link to resolve.
+            include_text: Fetch the wikitext of the referenced section.
+
+        Returns:
+            mwclient.links.ResolvedLink: The resolved target and its section.
+        """
+        from mwclient.links import LinkResolver
+        return LinkResolver(self.site).resolve(link, include_text=include_text)
+
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__} object '{self.name}' for {self.site}>"
 
@@ -184,8 +200,13 @@ class Page:
             cache: Use in-memory caching (default: `True`)
         """
 
-        # Try to use text from info if already supplied
-        if 'revisions' in self._info and len(self._info['revisions']) > 0:
+        # Try to use text from info if already supplied.  Prefetched content
+        # is a whole-page snapshot, so it cannot answer a section request.
+        if (
+            section is None
+            and 'revisions' in self._info
+            and len(self._info['revisions']) > 0
+        ):
             if '*' in self._info['revisions'][0]:
                 return self._info['revisions'][0]['*']
 

@@ -66,6 +66,41 @@ is handled under the hood so you don't have to worry about it.
     ...     dt = datetime.fromtimestamp(mktime(revision['timestamp']))
     ...     print(dt.strftime('%F %T'))
 
+Outdated links and sections
+---------------------------
+
+A legacy link can point at a section of a page that has since been renamed:
+
+    >>> result = site.resolve_link('Old name#Material')
+    >>> result.status
+    'resolved'
+    >>> result.target
+    'New entry#Material'
+    >>> result.text
+    '== Material ==\nMaterial text.\n'
+
+The original link remains available as ``result.original``.  Redirects are
+followed as reported by the wiki, including a fragment added by the redirect
+itself; if the redirect names no fragment, the link's fragment is kept.
+
+Only the referenced section is fetched: ``result.text`` never silently
+contains the whole page.  Repeated headings are handled as well.  If a page
+contains two sections titled ``Material``, ``Old name#Material`` is ambiguous
+and ``result.candidates`` (plus ``result.texts``) holds every section that
+shares that displayed heading.  The second one is addressed by MediaWiki's
+numbered anchor::
+
+    >>> result = site.resolve_link('Entry#Material_2')
+    >>> result.status
+    'section_numbered'
+    >>> result.section.index
+    3
+
+The status also distinguishes a target section that no longer exists
+(``section_deleted``), a missing page (``page_missing``), an invalid link
+(``invalid``) and a redirect cycle (``redirect_loop``), so those outcomes do
+not have to be guessed from empty text.
+
 Categories
 ----------
 

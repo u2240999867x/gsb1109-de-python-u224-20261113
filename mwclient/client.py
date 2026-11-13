@@ -1245,6 +1245,30 @@ class Site:
         params['text'] = text
         return self.post('upload', **params)
 
+    def resolve_link(self, link: str, include_text: bool = True) -> Any:
+        """Resolve a legacy link such as ``Old name#Material``.
+
+        Redirects are followed using the source site's response, including a
+        fragment supplied by the redirect itself.  Only the referenced section
+        is fetched.
+
+        Args:
+            link: The link to resolve.  It is preserved verbatim on the result.
+            include_text: Fetch the wikitext of the referenced section.
+
+        Returns:
+            mwclient.links.ResolvedLink: The resolved target and its section.
+        """
+        from mwclient.links import LinkResolver
+        return LinkResolver(self).resolve(link, include_text=include_text)
+
+    def resolve_links(
+        self, links: Iterable[str], include_text: bool = True
+    ) -> List[Any]:
+        """Resolve several legacy links with one shared resolver."""
+        from mwclient.links import LinkResolver
+        return LinkResolver(self).resolve_many(links, include_text=include_text)
+
     def parse(
         self,
         text: Optional[str] = None,
