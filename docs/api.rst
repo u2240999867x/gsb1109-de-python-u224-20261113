@@ -194,6 +194,48 @@ Standard MIDI Files
 .. todo: Expose more of the internal API? (meta, tracks, units…)
 
 
+Karaoke
+^^^^^^^
+
+.. module:: mido.karaoke
+
+.. autofunction:: build_lyric_index
+
+.. autofunction:: extract_notes
+
+.. autofunction:: extract_lyric_events
+
+.. autoclass:: LyricIndex
+   :members:
+   :inherited-members:
+   :undoc-members:
+
+.. autoclass:: LyricSegment
+   :members:
+   :inherited-members:
+   :undoc-members:
+
+.. autoclass:: SyllableEntry
+   :members:
+   :inherited-members:
+   :undoc-members:
+
+.. autoclass:: LookupResult
+   :members:
+   :inherited-members:
+   :undoc-members:
+
+.. autoclass:: Note
+   :members:
+   :inherited-members:
+   :undoc-members:
+
+.. autoclass:: LyricEvent
+   :members:
+   :inherited-members:
+   :undoc-members:
+
+
 SYX
 ^^^
 

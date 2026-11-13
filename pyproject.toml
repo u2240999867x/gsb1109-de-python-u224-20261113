@@ -98,6 +98,7 @@ mido-connect = "mido.scripts.mido_connect:main"
 packages = [
     "mido",
     "mido.backends",
+    "mido.karaoke",
     "mido.messages",
     "mido.midifiles",
     "mido.scripts",
