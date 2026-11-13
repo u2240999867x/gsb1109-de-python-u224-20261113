@@ -5,8 +5,10 @@ Module containing the DatabaseULog class.
 import sqlite3
 import hashlib
 import contextlib
+import json
 import numpy as np
 from pyulog import ULog
+from pyulog import device_segments
 
 # pylint: disable=too-many-instance-attributes
 class DatabaseULog(ULog):
@@ -49,7 +51,7 @@ class DatabaseULog(ULog):
     contsructor will throw an exception. See the documentation of
     "ulog_migratedb" for more information.
     '''
-    SCHEMA_VERSION = 5
+    SCHEMA_VERSION = 6
 
     @staticmethod
     def get_db_handle(db_path):
@@ -488,7 +490,7 @@ class DatabaseULog(ULog):
             )
         return dataset
 
-    def save(self, append_json=False):
+    def save(self, append_json=False, device_registry=None):
         '''
         Save the DatabaseULog to the database. Throws a KeyError if the primary
         key is already in the database.
@@ -497,6 +499,11 @@ class DatabaseULog(ULog):
         append_json=True, then datasets are additionally stored in a JSON
         field. This allows them to be directly queried using the sqlite
         function json_each, but increases the writing time and database size.
+
+        If a device_registry (a device_segments.DeviceRegistry) is supplied,
+        the datasets are additionally segmented by device identity and the
+        resulting segments, including their rationale, are stored in the
+        ULogDeviceSegment table. See save_device_segments for details.
         '''
 
         if self._pk is not None:
@@ -727,6 +734,169 @@ class DatabaseULog(ULog):
                 ) for timestamp, key, value in self.changed_parameters])
 
             cur.close()
+
+        if device_registry is not None:
+            self.save_device_segments(device_registry)
+
+    def segment_devices(self, registry=None,
+                        gap_threshold_us=device_segments.DEFAULT_GAP_THRESHOLD_US,
+                        serial_field=device_segments.DEFAULT_SERIAL_FIELD):
+        '''
+        Segment all datasets of this log by device identity and return the
+        list of device_segments.DeviceSegment. If the log was lazy-loaded,
+        the dataset series are read from the database on demand.
+
+        See the device_segments module for the segmentation rules.
+        '''
+        if self._lazy_loaded:
+            for dataset in self._data_list:
+                self.get_dataset(dataset.name, multi_instance=dataset.multi_id)
+        return device_segments.segment_ulog(self, registry=registry,
+                                            gap_threshold_us=gap_threshold_us,
+                                            serial_field=serial_field)
+
+    def save_device_segments(self, registry,
+                             gap_threshold_us=device_segments.DEFAULT_GAP_THRESHOLD_US,
+                             serial_field=device_segments.DEFAULT_SERIAL_FIELD):
+        '''
+        Segment the datasets by device identity and store the segments,
+        including candidates and rationale, in the ULogDeviceSegment table.
+        Existing segments of this log are replaced. Requires the log itself
+        to be saved first.
+        '''
+        if self._pk is None:
+            raise KeyError('Cannot save device segments of logs that are not in the database')
+
+        segments = self.segment_devices(registry, gap_threshold_us=gap_threshold_us,
+                                        serial_field=serial_field)
+        with self._db() as con:
+            cur = con.cursor()
+            cur.execute('''
+                DELETE FROM ULogDeviceSegment
+                WHERE ULogId = ?
+                ''', (self._pk,))
+            cur.executemany('''
+                INSERT INTO ULogDeviceSegment
+                (DatasetName, MultiId, StartTimestamp, EndTimestamp, Serial,
+                 Confirmed, Candidates, Rationale, ULogId)
+                VALUES
+                (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', [(
+                    segment.topic,
+                    segment.instance,
+                    segment.start_timestamp,
+                    segment.end_timestamp,
+                    segment.serial,
+                    segment.confirmed,
+                    json.dumps(segment.candidates),
+                    json.dumps(segment.rationale),
+                    self._pk,
+                ) for segment in segments])
+            cur.close()
+        return segments
+
+    def load_device_segments(self):
+        '''
+        Load the device segments previously stored with save_device_segments
+        and return them as a list of device_segments.DeviceSegment, ordered
+        by topic, instance and start timestamp.
+        '''
+        if self._pk is None:
+            raise KeyError('Cannot load device segments of logs that are not in the database')
+
+        segments = []
+        with self._db() as con:
+            cur = con.cursor()
+            cur.execute('''
+                SELECT DatasetName, MultiId, StartTimestamp, EndTimestamp, Serial,
+                       Confirmed, Candidates, Rationale
+                FROM ULogDeviceSegment
+                WHERE ULogId = ?
+                ORDER BY DatasetName, MultiId, StartTimestamp
+                ''', (self._pk,))
+            for (name, multi_id, start, end, serial, confirmed,
+                 candidates, rationale) in cur.fetchall():
+                segments.append(device_segments.DeviceSegment(
+                    topic=name,
+                    instance=multi_id,
+                    start_timestamp=start,
+                    end_timestamp=end,
+                    serial=serial,
+                    confirmed=bool(confirmed),
+                    candidates=json.loads(candidates),
+                    rationale=json.loads(rationale),
+                ))
+            cur.close()
+        return segments
+
+    def compute_drift(self, segment, field):
+        '''
+        Compute the single-device drift of "field" over the given device
+        segment. Raises a ValueError if the segment is not confirmed.
+        '''
+        dataset = self.get_dataset(segment.topic, multi_instance=segment.instance)
+        return device_segments.compute_segment_drift(dataset, segment, field)
+
+    @staticmethod
+    def save_device_registry(db_handle, registry):
+        '''
+        Store a device_segments.DeviceRegistry (known serial numbers and
+        replacement records) in the database, replacing the previously
+        stored registry. The registry is global bench knowledge and not tied
+        to a specific ULog.
+        '''
+        with db_handle() as con:
+            cur = con.cursor()
+            cur.execute('DELETE FROM DeviceReplacement')
+            cur.execute('DELETE FROM Device')
+            cur.executemany('''
+                INSERT INTO Device
+                (Serial, Topic, Notes)
+                VALUES
+                (?, ?, ?)
+                ''', [(
+                    serial,
+                    info['topic'],
+                    info['notes'],
+                ) for serial, info in registry.devices.items()])
+            cur.executemany('''
+                INSERT INTO DeviceReplacement
+                (Timestamp, Topic, Instance, OldSerial, NewSerial, Note)
+                VALUES
+                (?, ?, ?, ?, ?, ?)
+                ''', [(
+                    record.timestamp,
+                    record.topic,
+                    record.instance,
+                    record.old_serial,
+                    record.new_serial,
+                    record.note,
+                ) for record in registry.replacements])
+            cur.close()
+
+    @staticmethod
+    def load_device_registry(db_handle):
+        '''
+        Load the device registry stored with save_device_registry and return
+        it as a device_segments.DeviceRegistry.
+        '''
+        registry = device_segments.DeviceRegistry()
+        with db_handle() as con:
+            cur = con.cursor()
+            cur.execute('SELECT Serial, Topic, Notes FROM Device')
+            for serial, topic, notes in cur.fetchall():
+                registry.register_device(serial, topic=topic, notes=notes)
+            cur.execute('''
+                SELECT Timestamp, Topic, Instance, OldSerial, NewSerial, Note
+                FROM DeviceReplacement
+                ORDER BY Timestamp
+                ''')
+            for timestamp, topic, instance, old_serial, new_serial, note in cur.fetchall():
+                registry.add_replacement(timestamp, topic, new_serial,
+                                         old_serial=old_serial, instance=instance,
+                                         note=note)
+            cur.close()
+        return registry
 
     def delete(self):
         '''
