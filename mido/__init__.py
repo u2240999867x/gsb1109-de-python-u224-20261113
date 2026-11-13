@@ -55,6 +55,7 @@ Parsing objects serialized with str(message):
 Sub modules:
 
     ports -- useful tools for working with ports
+    velocity_calibration -- velocity-to-force calibration tables
 
 For more on MIDI, see:
 
@@ -95,7 +96,7 @@ Getting started:
 
 from typing import TYPE_CHECKING
 
-from . import ports, sockets
+from . import ports, sockets, velocity_calibration
 from .backends.backend import Backend
 from .messages import (
     MAX_PITCHWHEEL,
@@ -151,6 +152,7 @@ __all__ = [
     "sockets",
     "tempo2bpm",
     "tick2second",
+    "velocity_calibration",
     "version_info",
     "write_syx_file",
 ]

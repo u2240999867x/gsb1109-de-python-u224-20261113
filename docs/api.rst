@@ -39,6 +39,28 @@ Frozen Messages
 .. autoclass:: FrozenUnknownMetaMessage
 
 
+Velocity Calibration
+^^^^^^^^^^^^^^^^^^^^
+
+.. module:: mido.velocity_calibration
+
+.. autoclass:: ForceRange
+   :members:
+   :undoc-members:
+
+.. autoclass:: CalibrationRecord
+
+.. autoclass:: VelocityTable
+   :members:
+   :undoc-members:
+
+.. autoclass:: CalibrationConflict
+   :members:
+   :undoc-members:
+
+.. autofunction:: compare_velocity
+
+
 Parsing
 -------
 
