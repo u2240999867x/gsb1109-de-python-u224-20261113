@@ -92,6 +92,37 @@ For example, `latitude` and `longitude` properties exist as helpers to access th
 Sentence types that pynmea2 has no definition for are still parsed: a talker sentence is returned as a plain `TalkerSentence` and a proprietary sentence as a plain `ProprietarySentence`, with the raw field values in `data`. Input that is not an NMEA sentence still raises `ParseError`.
 
 
+## Archiving: resolving UTC dates
+
+Most sentences only carry an UTC time of day; full dates arrive occasionally in RMC/ZDA sentences.  `pynmea2.archive.DateResolver` walks one voyage in arrival order and, given the out-of-order `max_delay` tolerated by the archive, returns every sentence with the set of UTC dates that are still possible for it.
+
+Two adjacent sentences are assumed less than a day apart, so the clock may fall back by at most `max_delay` and cross at most one midnight per step.  A `23:59` record arriving *after* a `00:01` record therefore keeps the earlier date instead of being pushed a day forward.
+
+```python
+import datetime
+import pynmea2
+from pynmea2.archive import DateResolver
+
+voyage = [
+    pynmea2.parse('$GPGGA,000100,3926.276,N,07739.361,W,1,04,2.6,100.0,M,-33.9,M,,*77'),
+    pynmea2.parse('$GPGGA,235900,3926.276,N,07739.361,W,1,04,2.6,100.0,M,-33.9,M,,*7B'),
+    pynmea2.parse('$GPRMC,000200,A,3926.276,N,07739.361,W,0.0,0.0,100326,,E*4D'),
+]
+
+resolver = DateResolver(datetime.timedelta(minutes=5))
+for resolution in resolver.resolve(voyage):
+    print(resolution.possible_dates)
+# [datetime.date(2026, 3, 9), datetime.date(2026, 3, 10)]
+# [datetime.date(2026, 3, 9)]
+# [datetime.date(2026, 3, 10)]
+```
+
+The late `23:59` record stays on 9 March rather than being pushed forward.  The `00:01` record is genuinely ambiguous inside the five-minute window, so both feasible dates are returned; a strict `DateResolver()` (zero delay) pins it to 9 March alone.
+
+When the truth is ambiguous every feasible date is returned; a single-element list means the date is pinned (also available via `resolution.date` and `resolution.datetime`).  A voyage without any RMC/ZDA anchor cannot be dated and returns empty lists rather than guessing.
+
+Adjacent date anchors that contradict each other (for example the second anchor dates backwards) cannot be reconciled.  `resolve()` raises a `DateConflict` whose `sentences` attribute holds the raw NMEA strings of the affected segment.  Use `inspect()` to keep the resolvable records and collect the conflicts instead, or `resolve_voyages()` to process several voyages so a contradiction in one voyage never blocks the others.  The conflicting RMC/ZDA anchors themselves remain fully dated (their own date is factual); only the time-only records between them lose their date and are flagged.
+
 ## Checksums
 
 parse has an optional argument:
