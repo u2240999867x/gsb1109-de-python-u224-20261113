@@ -373,6 +373,7 @@ class Site:
         action: str,
         http_method: str = 'POST',
         *args: Tuple[str, Any],
+        deadline: Optional[float] = None,
         **kwargs: Any
     ) -> Dict[str, Any]:
         """Perform a generic API call and handle errors.
@@ -386,6 +387,10 @@ class Site:
                 as data. In most cases, it is preferable to pass these as
                 keyword arguments instead. This can be useful when the
                 parameter name is a reserved Python keyword (e.g. `from`).
+            deadline: An absolute point in time (in `time.monotonic` clock) by
+                which the request must be sent. If a required retry wait cannot
+                finish before the deadline, :class:`errors.DeadlineExceeded` is
+                raised and the request is not re-issued.
             **kwargs: Arguments to be passed to the API call.
 
         Example:
@@ -421,10 +426,14 @@ class Site:
             else:
                 kwargs['uiprop'] = 'blockinfo|hasmsg'
 
-        sleeper = self.sleepers.make()
+        sleeper = self.sleepers.make(deadline=deadline)
+
+        # Only forward the deadline when one was given, so that callers
+        # mocking raw_api keep seeing the same call signature.
+        extra = {'deadline': deadline} if deadline is not None else {}
 
         while True:
-            info = self.raw_api(action, http_method, **kwargs)
+            info = self.raw_api(action, http_method, **extra, **kwargs)
             if not info:
                 info = {}
             if self.handle_api_result(info, sleeper=sleeper):
@@ -512,7 +521,8 @@ class Site:
         data: Mapping[str, Any],
         files: Optional[Mapping[str, Union[BinaryIO, Tuple[str, BinaryIO]]]] = None,
         retry_on_error: bool = True,
-        http_method: str = 'POST'
+        http_method: str = 'POST',
+        deadline: Optional[float] = None
     ) -> str:
         """
         Perform a generic request and return the raw text.
@@ -531,6 +541,10 @@ class Site:
             files: Files to upload
             retry_on_error: Retry on connection error
             http_method: The HTTP method, defaults to 'POST'
+            deadline: An absolute point in time (in `time.monotonic` clock) by
+                which the request must be sent. If a required retry wait cannot
+                finish before the deadline, :class:`errors.DeadlineExceeded` is
+                raised and the request is not re-issued.
 
         Returns:
             The raw text response.
@@ -538,6 +552,8 @@ class Site:
         Raises:
             errors.MaximumRetriesExceeded: The API request failed and the maximum number
                 of retries was exceeded.
+            errors.DeadlineExceeded: The request could not be sent before the
+                given deadline and was aborted without being re-issued.
             requests.exceptions.HTTPError: Received an invalid HTTP response, or a status
                 code in the 4xx range.
             requests.exceptions.ConnectionError: Encountered an unexpected error while
@@ -547,7 +563,7 @@ class Site:
         headers = {}
         if self.compress:
             headers['Accept-Encoding'] = 'gzip'
-        sleeper = self.sleepers.make((script, data))
+        sleeper = self.sleepers.make((script, data), deadline=deadline)
 
         scheme = self.scheme
         host = self.host
@@ -625,6 +641,7 @@ class Site:
         action: str,
         http_method: str = 'POST',
         retry_on_error: bool = True,
+        deadline: Optional[float] = None,
         *args: Tuple[str, Any],
         **kwargs: Any
     ) -> Dict[str, Any]:
@@ -634,6 +651,10 @@ class Site:
             action: The MediaWiki API action to perform.
             http_method: The HTTP method to use in the request.
             retry_on_error: Whether to retry API call on connection errors.
+            deadline: An absolute point in time (in `time.monotonic` clock) by
+                which the request must be sent. If a required retry wait cannot
+                finish before the deadline, :class:`errors.DeadlineExceeded` is
+                raised and the request is not re-issued.
             *args: Tupled key-value pairs to be passed to the `api.php` script
                 as data. In most cases, it is preferable to pass these as
                 keyword arguments instead. This can be useful when the
@@ -658,7 +679,7 @@ class Site:
         kwargs['format'] = 'json'
         data = self._query_string(*args, **kwargs)
         res = self.raw_call('api', data, retry_on_error=retry_on_error,
-                            http_method=http_method)
+                            http_method=http_method, deadline=deadline)
 
         try:
             return cast(Dict[str, Any], json.loads(res, object_pairs_hook=OrderedDict))

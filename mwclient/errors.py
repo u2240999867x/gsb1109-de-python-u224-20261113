@@ -24,6 +24,29 @@ class MaximumRetriesExceeded(MwClientError):
     pass
 
 
+class DeadlineExceeded(MwClientError):
+    """A request was aborted because it could not be sent before its deadline.
+
+    The request was not (re-)issued, so no data was fetched for it. This gives
+    callers of deadline-aware requests a clear "not fetched" signal instead of
+    an indefinitely delayed response.
+
+    Attributes:
+        deadline (float): The deadline that could not be met, in the same clock
+            as the one used by the sleeper (``time.monotonic`` by default).
+        retry_at (float): The earliest point in time at which the request could
+            have been (re-)issued, in that same clock.
+    """
+
+    def __init__(self, deadline: float, retry_at: float) -> None:
+        self.deadline = deadline
+        self.retry_at = retry_at
+        super().__init__(
+            f'Request could not be sent before its deadline: earliest possible '
+            f'retry at {retry_at} is past the deadline {deadline}.'
+        )
+
+
 class APIError(MwClientError):
     """Base class for errors returned by the MediaWiki API.
 
